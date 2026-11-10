@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="380" viewBox="0 0 600 380" fill="none">
+<defs><radialGradient id="halo"><stop stop-color="#9f7dff" stop-opacity=".25"/><stop offset="1" stop-color="#8e70ff" stop-opacity="0"/></radialGradient><radialGradient id="planet" cx=".26" cy=".22" r=".85"><stop stop-color="#d7d2ff"/><stop offset=".28" stop-color="#9d95e2"/><stop offset=".6" stop-color="#514c96"/><stop offset="1" stop-color="#12162f"/></radialGradient><linearGradient id="ring" x1="145" y1="260" x2="430" y2="110" gradientUnits="userSpaceOnUse"><stop stop-color="#6b649b" stop-opacity=".1"/><stop offset=".5" stop-color="#cfbdff" stop-opacity=".9"/><stop offset="1" stop-color="#717cae" stop-opacity=".15"/></linearGradient><filter id="glow"><feGaussianBlur stdDeviation="3"/></filter></defs>
+<circle cx="310" cy="190" r="185" fill="url(#halo)"/>
+<g stroke="#7f8cbe" stroke-opacity=".17"><ellipse cx="310" cy="190" rx="240" ry="118" transform="rotate(-24 310 190)"/><ellipse cx="310" cy="190" rx="199" ry="93" transform="rotate(-24 310 190)"/><circle cx="310" cy="190" r="156" stroke-dasharray="2 9"/></g>
+<path d="M112 288 190 250M432 122l58-24M310 16v19M310 345v19M133 190h15M470 190h15" stroke="#a8aad7" stroke-opacity=".35"/>
+<circle cx="310" cy="190" r="74" fill="url(#planet)"/>
+<ellipse cx="310" cy="190" rx="119" ry="21" transform="rotate(-24 310 190)" stroke="url(#ring)" stroke-width="10"/>
+<path d="M244 156a74 74 0 0 1 134 0" stroke="#c9c4ff" stroke-opacity=".15"/>
+<circle cx="150" cy="159" r="4" fill="#83e3e7"/><circle cx="150" cy="159" r="9" stroke="#83e3e7" stroke-opacity=".3"/>
+<circle cx="472" cy="100" r="5" fill="#c7b0ff"/><circle cx="472" cy="100" r="11" stroke="#c7b0ff" stroke-opacity=".25"/>
+<circle cx="399" cy="287" r="3" fill="#92a7ef"/><circle cx="107" cy="246" r="2" fill="#b8bcdf"/>
+<circle cx="150" cy="159" r="5" fill="#83e3e7" opacity=".5" filter="url(#glow)"/>
+<g fill="#919cbd" font-family="monospace" font-size="8" letter-spacing="1.7"><text x="85" y="135">AGENT / 01</text><text x="486" y="88">02</text><text x="418" y="304">03</text><text x="246" y="349">ORBITAL NETWORK</text></g>
+</svg>

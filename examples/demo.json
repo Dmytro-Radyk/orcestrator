@@ -1,0 +1,15 @@
+{
+  "name": "Демонстрація команди агентів",
+  "goal": "Спроєктувати оркестратор AI-агентів",
+  "agents": [
+    { "id": "architect", "name": "Архітектор", "provider": "demo", "role": "architect", "skills": ["architecture", "backend"] },
+    { "id": "developer", "name": "Розробник", "provider": "demo", "role": "developer", "skills": ["backend", "frontend"] },
+    { "id": "tester", "name": "Тестувальник", "provider": "demo", "role": "qa", "skills": ["testing", "backend"] }
+  ],
+  "tasks": [
+    { "id": "design", "title": "Архітектура", "prompt": "Запропонуй модулі оркестратора.", "skills": ["architecture"] },
+    { "id": "backend", "title": "Сервер", "prompt": "Спроєктуй серверне API.", "skills": ["backend"], "teamSize": 2, "dependsOn": ["design"] },
+    { "id": "frontend", "title": "Інтерфейс", "prompt": "Опиши екран керування командою.", "skills": ["frontend"], "dependsOn": ["design"] },
+    { "id": "verify", "title": "Перевірка", "prompt": "Підготуй план інтеграційного тестування.", "skills": ["testing"], "dependsOn": ["backend", "frontend"] }
+  ]
+}

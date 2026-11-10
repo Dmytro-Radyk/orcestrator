@@ -1,0 +1,14 @@
+{
+  "name": "orcestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "ui": "node scripts/ui-server.js",
+    "start": "node src/cli.js serve",
+    "demo": "node src/cli.js demo",
+    "test": "node --test",
+    "check": "node --check src/engine.js && node --check src/providers.js && node --check src/server.js"
+  }
+}

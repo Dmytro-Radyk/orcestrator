@@ -1,0 +1,16 @@
+{
+  "name": "API + CLI team",
+  "goal": "Analyze a repository and propose improvements",
+  "workspace": ".",
+  "limits": { "concurrency": 3, "maxCalls": 12 },
+  "agents": [
+    { "id": "codex", "provider": "codex", "role": "code analyst", "skills": ["code", "architecture"], "access": "read-only" },
+    { "id": "claude", "provider": "claude", "role": "reviewer", "skills": ["code", "review"], "access": "read-only", "enabled": false },
+    { "id": "api", "provider": "responses", "baseUrl": "https://api.openai.com/v1", "apiKeyEnv": "OPENAI_API_KEY", "model": "REPLACE_WITH_AVAILABLE_MODEL", "role": "architect", "skills": ["architecture", "review"] },
+    { "id": "local", "provider": "chat", "baseUrl": "http://127.0.0.1:11434/v1", "model": "REPLACE_WITH_INSTALLED_MODEL", "role": "assistant", "skills": ["docs"], "enabled": false }
+  ],
+  "tasks": [
+    { "id": "analyze", "title": "Analyze repository", "prompt": "Read the repository and report its structure, key risks, and possible improvements. Do not edit files.", "agentIds": ["codex"] },
+    { "id": "plan", "title": "Implementation plan", "prompt": "Use the analysis to propose a prioritized implementation plan.", "agentIds": ["api"], "dependsOn": ["analyze"] }
+  ]
+}
