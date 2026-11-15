@@ -1,0 +1,13 @@
+{
+  "type":"object", "additionalProperties":false,
+  "required":["status","summary","files","checks"],
+  "properties":{
+    "status":{"type":"string","enum":["completed","blocked","failed"]},
+    "summary":{"type":"string"},
+    "files":{"type":"array","items":{"type":"string"}},
+    "checks":{"type":"array","items":{"type":"object","additionalProperties":false,
+      "required":["command","status","required","details"],
+      "properties":{"command":{"type":"string"},"status":{"type":"string","enum":["passed","failed","not_run"]},"required":{"type":"boolean"},"details":{"type":"string"}}
+    }}
+  }
+}

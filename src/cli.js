@@ -3,11 +3,14 @@ import { Store } from './store.js';
 import { Engine } from './engine.js';
 import { createApi } from './server.js';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createModelRegistry,withModelPolicy } from '../scripts/model-registry.js';
+
+const createEngine=()=>{const store=new Store(process.env.ORCHESTRATOR_DATA);return new Engine(store,withModelPolicy(createModelRegistry({store})));};
 
 const [command = 'help', file] = process.argv.slice(2);
 try {
   if (command === 'serve') {
-    const engine = new Engine(new Store(process.env.ORCHESTRATOR_DATA));
+    const engine = createEngine();
     const { server, token } = createApi(engine, process.env.ORCHESTRATOR_TOKEN);
     const port = Number(process.env.PORT ?? 4310);
     server.on('error', error => { console.error(error.message); process.exitCode = 1; });
@@ -22,7 +25,7 @@ try {
   } else if (command === 'demo' || command === 'run') {
     const path = command === 'demo' ? new URL('../examples/demo.json', import.meta.url) : file;
     if (!path) throw new Error('Usage: node src/cli.js run project.json');
-    const engine = new Engine(new Store(process.env.ORCHESTRATOR_DATA));
+    const engine = createEngine();
     const project = engine.createProject(JSON.parse(readFileSync(path, 'utf8')));
     const run = engine.start(project.id);
     process.on('SIGINT', () => { if (['running', 'paused'].includes(run.status)) engine.cancel(run.id); });

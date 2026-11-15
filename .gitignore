@@ -24,3 +24,5 @@ test-results/
 playwright-report/
 docs/TOOLING-REVIEW.md
 docs/ui-preview.jpg
+docs/model-registry.jpg
+docs/ui-real-execution.jpg

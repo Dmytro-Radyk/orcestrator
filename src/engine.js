@@ -113,7 +113,8 @@ export class Engine {
     try {
       const output = await this.provider(agent, {
         prompt: `Role: ${agent.role ?? agent.id}\nInstructions: ${agent.instructions ?? ''}\n\n${prompt}`,
-        cwd: resolve(run.project.workspace ?? process.cwd()), signal, maxOutputTokens: run.project.limits.maxOutputTokens
+        cwd: resolve(run.project.workspace ?? process.cwd()), signal, maxOutputTokens: run.project.limits.maxOutputTokens,
+        onEvent: progress => this.event(run, 'agent.progress', { taskId: task.id, agentId: agent.id, ...progress })
       });
       signal.throwIfAborted();
       assert(typeof output.text === 'string' && output.text.length > 0, 'Empty agent result');
@@ -122,7 +123,7 @@ export class Engine {
       this.event(run, 'agent.completed', { taskId: task.id, agentId: agent.id, usage: output.usage });
       return result;
     } catch (error) {
-      this.event(run, 'agent.failed', { taskId: task.id, agentId: agent.id, message: error.message });
+      this.event(run, 'agent.failed', { taskId: task.id, agentId: agent.id, message: error.message, usage:error.usage });
       throw error;
     } finally { release(); }
   }
@@ -146,7 +147,7 @@ export class Engine {
     task.assignedAgentIds = team.map(a => a.id);
     const dependencies = run.tasks.filter(t => task.dependsOn.includes(t.id)).map(t => ({ title: t.title, result: t.result }));
     const children = run.tasks.filter(t => t.parentId === task.id);
-    const prompt = `Project: ${run.project.name}\nGoal: ${run.project.goal ?? ''}\nTask: ${task.title}\n${task.prompt}\nDependency results:\n${JSON.stringify(dependencies)}\n${task.review ? `Previous review feedback: ${JSON.stringify(task.review)}\n` : ''}`;
+    const prompt = `Project: ${run.project.name}\nGoal: ${run.project.goal ?? ''}\nTask: ${task.title}\n${task.prompt}\nAcceptance criteria:\n${JSON.stringify(task.acceptanceCriteria ?? [])}\nDependency results:\n${JSON.stringify(dependencies)}\n${task.review ? `Previous review feedback: ${JSON.stringify(task.review)}\n` : ''}`;
     if (children.length) {
       const output = await this.invoke(run, task, team[0], `${prompt}\nCombine child results into a final answer:\n${JSON.stringify(children.map(t => ({ title: t.title, result: t.result })))}`);
       task.result = output.text;

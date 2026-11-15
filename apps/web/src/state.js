@@ -1,5 +1,5 @@
 export const uid = () => crypto.randomUUID();
-export const labels = { pending: 'У черзі', running: 'Виконується', done: 'Завершено', cancelled: 'Скасовано', blocked: 'Заблоковано', idle: 'Готовий до запуску', paused: 'На паузі', completed: 'Завершено' };
+export const labels = { pending: 'У черзі', running: 'Виконується', done: 'Завершено', cancelled: 'Скасовано', blocked: 'Заблоковано', idle: 'Готовий до запуску', paused: 'На паузі', completed: 'Завершено', failed:'Помилка', interrupted:'Перервано', awaiting_approval:'Очікує дозволу', waiting_children:'Очікує субагентів' };
 export function initialTasks(goal, team, agents) {
   const candidates = agents.filter(a => team.includes(a.id));
   const pick = skills => candidates.find(a => a.skills.some(s => skills.includes(s)))?.id ?? team[0];

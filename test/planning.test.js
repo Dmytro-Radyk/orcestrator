@@ -41,3 +41,17 @@ test('unconfigured or malformed AI responses fail without silent demo fallback',
   await assert.rejects(generatePlanning('plan',brief,{configured:false}),/налаштуйте/);
   await assert.rejects(generatePlanning('plan',brief,config,async()=>({text:'not JSON'})),SyntaxError);
 });
+
+test('Codex planner uses server-owned schemas, isolated cwd and reasoning provenance',async()=>{
+  const cli=plannerConfig({ORCHESTRATOR_PLANNER_PROVIDER:'codex',ORCHESTRATOR_PLANNER_MODEL:'test-model'});
+  const result=await generatePlanning('idea',{...brief,outputSchema:'untrusted.json'},cli,async(agent,ctx)=>{
+    assert.match(agent.outputSchema,/[\\/]scripts[\\/]schemas[\\/]idea\.json$/);
+    assert.match(ctx.cwd,/[\\/]\.orchestrator[\\/]planner[\\/]?$/);
+    assert.equal(agent.access,'read-only'); assert.equal(agent.reasoningEffort,'high');
+    assert.equal(agent.ephemeral,true); assert.equal(agent.ignoreUserConfig,true);
+    return {text:JSON.stringify(demoIdea(brief))};
+  });
+  assert.equal(result.provenance.reasoningEffort,'high');
+  assert.equal(cli.agent.outputSchema,undefined);
+  assert.throws(()=>plannerConfig({ORCHESTRATOR_PLANNER_REASONING:'unknown'}),/REASONING/);
+});
