@@ -55,3 +55,18 @@ test('director bounds worker fan-out instead of assigning several models to ever
   await assert.rejects(f.director.propose({plan:plan()}),/ліміт кількості виконавців/);
   for(const value of [0,7,1.5,'2'])await assert.rejects(f.director.propose({plan:plan(),maxAgentsPerTask:value}),/від 1 до 6/);
 });
+
+test('worker billing requirements keep subscription directors separate from exclusively free workers',async()=>{
+  const f=fixture(async(agent,ctx)=>{
+    assert.equal(agent.provider,'codex');assert.ok(!ctx.prompt.includes('codex:manager'));
+    return{text:JSON.stringify({assignments:selection().assignments.map(a=>({...a,routeIds:['opencode:opencode/a']}))})};
+  });
+  f.routes.unshift(route('codex:manager',{backend:'codex',model:'manager',billing:'subscription_included',subscriptionConfirmed:true,includedAccessConfirmed:true,capabilities:{structuredOutput:true}}));
+  const proposal=await f.director.propose({plan:plan(),managerRouteId:'codex:manager',requirements:{a:{billing:'free_tier'},b:{billing:'free_tier'}}});
+  assert.equal(proposal.provenance.provider,'codex');assert.ok(proposal.routes.every(r=>r.billing==='free_tier'));
+  assert.throws(()=>routingCandidates(plan(),f.routes,{a:{billing:'metered'}}),/Некоректні/);
+  const onlyFree=f.routes.filter(r=>r.backend==='opencode');assert.throws(()=>routingCandidates(plan(),onlyFree,{a:{billing:'subscription_included'}}),/Немає дозволеної/);
+  const filtered=routingCandidates(plan(),f.routes,{a:{billing:'free_tier',excludeRouteIds:['opencode:opencode/a']}});
+  assert.deepEqual(filtered.get('a').map(r=>r.id),['opencode:opencode/b']);
+  for(const excludeRouteIds of ['bad',[null],['duplicate','duplicate']])assert.throws(()=>routingCandidates(plan(),f.routes,{a:{excludeRouteIds}}),/Некоректні/);
+});

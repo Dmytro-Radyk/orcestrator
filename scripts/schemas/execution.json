@@ -2,7 +2,8 @@
   "type":"object", "additionalProperties":false,
   "required":["status","summary","files","checks"],
   "properties":{
-    "status":{"type":"string","enum":["completed","blocked","failed"]},
+    "status":{"type":"string","enum":["completed","blocked","failed","delegated"]},
+    "subtasks":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["title","prompt","skills"],"properties":{"title":{"type":"string"},"prompt":{"type":"string"},"skills":{"type":"array","items":{"type":"string"}},"agentIds":{"type":"array","items":{"type":"string"}}}}},
     "summary":{"type":"string"},
     "files":{"type":"array","items":{"type":"string"}},
     "checks":{"type":"array","items":{"type":"object","additionalProperties":false,

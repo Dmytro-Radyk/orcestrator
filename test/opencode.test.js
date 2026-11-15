@@ -19,7 +19,7 @@ test('OpenCode free entitlement requires anonymous isolation and zero prices for
     {cost:[tier,{...tier,input:1,tier:{type:'context',size:10000}}]},{cost:[]},{cost:[{input:0,output:0}]},{providerID:'custom'}];
   const good=normalizeOpenCodeMetadata([model()],{isolated:true});
   assert.equal(routeDecision(good.routes[0]).allowed,true);assert.equal(chooseManager(good.routes).id,good.routes[0].id);
-  assert.equal(good.routes[0].capabilities.workspaceWrite,false);assert.equal(good.connection.requiresAuth,false);
+  assert.equal(good.routes[0].capabilities.workspaceWrite,true);assert.equal(good.routes[0].capabilities.managedFileChanges,true);assert.equal(good.connection.requiresAuth,false);
   for(const change of changes)assert.equal(routeDecision(normalizeOpenCodeMetadata([model(change)],{isolated:true}).routes[0]).allowed,false,JSON.stringify(change));
   assert.equal(routeDecision(normalizeOpenCodeMetadata([model()],{isolated:false}).routes[0]).allowed,false);
   assert.equal(routeDecision(normalizeOpenCodeMetadata([model({enabled:false})],{isolated:true}).routes[0]).allowed,false);
@@ -72,6 +72,8 @@ test('OpenCode execution pins the exact model, uses stdin and requires complete 
     await assert.rejects(executeOpenCode(agent,{prompt:'test',signal:AbortSignal.timeout(1000)},{home,env:{},run:async(c,a,o)=>{bad.forEach(e=>o.onLine(JSON.stringify(e)));return '';}}));
   }
   await assert.rejects(executeOpenCode({...agent,access:'workspace-write'},{prompt:'test'}),/без інструментів/);
+  await assert.rejects(executeOpenCode(agent,{prompt:'test',signal:AbortSignal.timeout(1000)},{home,env:{},run:async(c,a,o)=>{o.onLine(JSON.stringify({type:'tool_use'}));}}),
+    error=>error.code==='MODEL_ACCESS_BLOCKED'&&error.decisionCode==='tools_not_supported'&&error.routeId==='opencode:opencode/test-free');
 });
 
 test('registry discovers OpenCode routes and guards trusted executables and file-write capability',async()=>{

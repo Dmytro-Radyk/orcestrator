@@ -5,8 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { metadataRpc } from '../src/metadata-rpc.js';
 import { runProcess } from '../src/providers.js';
 import { execute } from '../src/providers.js';
-import { routeDecision,chooseManager,CATALOG_TTL_MS,DEFAULT_MODEL_POLICY } from '../src/model-policy.js';
+import { routeDecision,chooseManager,CATALOG_TTL_MS,DEFAULT_MODEL_POLICY,modelAccessError } from '../src/model-policy.js';
 import { inspectOpenCode,executeOpenCode,OPENCODE_BINARY } from './opencode-service.js';
+import { executeFileWorker } from './file-worker.js';
+import { SubscriptionGuard } from './subscription-guard.js';
 
 const cwd=fileURLToPath(new URL('../',import.meta.url));
 const names={codex:'Codex',claude:'Claude Code',opencode:'OpenCode',ollama:'Ollama'};
@@ -27,7 +29,7 @@ export async function locateCli(name,{env=process.env,platform=process.platform,
 }
 const windowSummary=v=>v&&typeof v.usedPercent==='number'?{usedPercent:v.usedPercent,resetsAt:v.resetsAt??null,windowDurationMins:v.windowDurationMins??null}:null;
 
-export function normalizeCodexMetadata({account,models,limits,checkedAt=new Date().toISOString()}) {
+export function normalizeCodexMetadata({account,models,limits,checkedAt=new Date().toISOString()},{autoReloadDisabled=false}={}) {
   const plan=account?.account?.planType??null,authType=account?.account?.type??null;
   const confirmed=authType==='chatgpt'&&paidPlans.has(plan);
   const billing=meteredPlans.has(plan)||authType==='apiKey'?'metered':plan==='free'?'free_tier':confirmed?'subscription_included':'unknown';
@@ -36,25 +38,29 @@ export function normalizeCodexMetadata({account,models,limits,checkedAt=new Date
   const quotaKnown=windows.some(w=>Number.isFinite(w.usedPercent));
   const exhausted=windows.some(w=>w.usedPercent>=100)||Boolean(quota?.rateLimitReachedType);
   const checked=Date.parse(checkedAt),expiresAt=new Date(checked+CATALOG_TTL_MS).toISOString();
+  const credits=quota?.credits;
+  const paidCreditsAbsent=credits?.hasCredits===false&&credits?.unlimited===false&&typeof credits.balance==='string'&&Number(credits.balance)===0&&credits.balance.trim()!=='';
+  const subscriptionGuard={authType,autoReloadDisabled:autoReloadDisabled===true,paidCreditsAbsent};
+  const billingBoundary=confirmed&&autoReloadDisabled===true?'subscription_quota_guarded':'unknown';
   const connection={id:'codex',name:names.codex,installed:true,authenticated:Boolean(authType),authType,plan,
     subscriptionConfirmed:confirmed,checkedAt,source:'Codex account/read + model/list + account/rateLimits/read',
     quota:{primary:windowSummary(quota?.primary),secondary:windowSummary(quota?.secondary),known:quotaKnown},
-    billingBoundary:'unknown',note:'Тариф і каталог отримані. CLI не надав гарантії лише включеного використання; додаткові списання не дозволені.'};
+    billingBoundary,subscriptionGuard,note:!confirmed?'Включений доступ підписки не підтверджено.':autoReloadDisabled!==true?'Підписку підтверджено. Для контрольованого запуску потрібне підтвердження вимкненого Automatic reload.':!paidCreditsAbsent?'Запуск підписки заблокований: додаткові кредити доступні або їхній стан невідомий.':'Підписка ChatGPT: без API-ключа; послідовні виклики з перевіркою квоти й відсутності додаткових кредитів. Це контроль квоти, а не серверний ліміт вартості.'};
   const routes=(models??[]).filter(m=>!m.hidden&&typeof m.model==='string').map(m=>({
     id:`codex:${m.model}`,connectionId:'codex',backend:'codex',model:m.model,name:m.displayName??m.model,
     description:m.description??'',specialty:m.modelSpecialty??null,isDefault:m.isDefault===true,
     reasoningEfforts:(m.supportedReasoningEfforts??[]).map(e=>e.reasoningEffort).filter(e=>typeof e==='string'),
     inputModalities:m.inputModalities??['text'],capabilities:{structuredOutput:true,code:true,tools:true,workspaceWrite:true},runtimeSupported:true,
     checkedAt,expiresAt,billing,subscriptionConfirmed:confirmed,
-    includedAccessConfirmed:confirmed&&quotaKnown,freeConfirmed:false,billingBoundary:'unknown',
+    includedAccessConfirmed:confirmed&&quotaKnown,freeConfirmed:false,billingBoundary,subscriptionGuard,
     availability:!authType?'unauthenticated':exhausted?'quota_exhausted':quotaKnown?'ready':'unknown',
     source:'Codex model/list',quota:connection.quota
   }));
   return {connection,routes};
 }
-export async function inspectCodex(command,{rpcFactory=metadataRpc}={}) {
-  const rpc=rpcFactory(command,['app-server','--listen','stdio://'],{cwd,timeoutMs:15000});
-  const deadline=setTimeout(()=>{void rpc.close();},45000);
+export async function inspectCodex(command,{rpcFactory=metadataRpc,autoReloadDisabled=false,timeoutMs=45000}={}) {
+  const rpc=rpcFactory(command,['app-server','--listen','stdio://'],{cwd,timeoutMs:Math.min(timeoutMs,15000)});
+  const deadline=setTimeout(()=>{void rpc.close();},timeoutMs);
   try {
     await rpc.request('initialize',{clientInfo:{name:'orcestrator_metadata',title:'Orcestrator read-only discovery',version:'0.1.0'}});rpc.initialized();
     const account=await rpc.request('account/read',{refreshToken:false});
@@ -66,16 +72,19 @@ export async function inspectCodex(command,{rpcFactory=metadataRpc}={}) {
       if(page===19)throw new Error('Каталог перевищив ліміт discovery');
     }
     const limits=await rpc.request('account/rateLimits/read',{}).catch(()=>null);
-    return normalizeCodexMetadata({account,models,limits});
+    return normalizeCodexMetadata({account,models,limits},{autoReloadDisabled});
   }finally{clearTimeout(deadline);await rpc.close();}
 }
 
 export function createModelRegistry({store,env=process.env,find=locateCli,inspect=inspectCodex,inspectOpen=inspectOpenCode,run=runProcess}={}) {
   let scanning,internalCommands=new Map();
+  const subscriptionGuard=new SubscriptionGuard();
+  const currentRoute=r=>r?.backend==='codex'&&r.subscriptionGuard?{...r,subscriptionGuard:{...r.subscriptionGuard,autoReloadDisabled:r.subscriptionGuard.autoReloadDisabled===true&&env.ORCHESTRATOR_CODEX_AUTO_RELOAD_DISABLED==='1'}}:r;
   const snapshot=()=>{
     const value=store.data.catalog??{version:1,checkedAt:null,connections:[],routes:[]};
-    return {...value,policy:DEFAULT_MODEL_POLICY,scanning:Boolean(scanning),routes:value.routes.map(r=>({...r,decision:routeDecision(r)})),
-      manager:chooseManager(value.routes)?.id??null};
+    const routes=value.routes.map(currentRoute);
+    return {...value,policy:DEFAULT_MODEL_POLICY,scanning:Boolean(scanning),routes:routes.map(r=>({...r,decision:routeDecision(r)})),
+      manager:chooseManager(routes)?.id??null};
   };
   async function scan(){
     if(scanning){await scanning;return {...snapshot(),scanning:false};}
@@ -86,7 +95,7 @@ export function createModelRegistry({store,env=process.env,find=locateCli,inspec
         if(!path){connections.push({id:name,name:names[name],installed:false,authenticated:null,checkedAt,note:'Не знайдено native CLI у PATH або стандартних каталогах'});continue;}
         commands.set(name,path);
         if(name==='codex') {
-          try{const normalized=await inspect(path);connections.push(normalized.connection);routes.push(...normalized.routes);}catch{connections.push({id:name,name:names[name],installed:true,authenticated:null,checkedAt,note:'Metadata-перевірка не завершилась. Авторизація, підписка та тариф залишаються невідомими.'});}
+          try{const normalized=await inspect(path,{autoReloadDisabled:env.ORCHESTRATOR_CODEX_AUTO_RELOAD_DISABLED==='1'});connections.push(normalized.connection);routes.push(...normalized.routes);}catch{connections.push({id:name,name:names[name],installed:true,authenticated:null,checkedAt,note:'Metadata-перевірка не завершилась. Авторизація, підписка та тариф залишаються невідомими.'});}
         } else if(name==='opencode') {
           try{const normalized=await inspectOpen(path,{run,env});connections.push(normalized.connection);routes.push(...normalized.routes);}
           catch{connections.push({id:name,name:names[name],installed:true,authenticated:null,checkedAt,note:'Не вдалося перевірити ізольований metadata-каталог OpenCode V2; виклики заблоковані.'});}
@@ -109,23 +118,33 @@ export function createModelRegistry({store,env=process.env,find=locateCli,inspec
     })();
     try{await scanning;return {...snapshot(),scanning:false};}finally{scanning=null;}
   }
-  return {snapshot,scan,async requireRoute(id,{refresh=true}={}) {
+  return {snapshot,scan,guardSubscription:options=>subscriptionGuard.run(options),async requireRoute(id,{refresh=true}={}) {
     // Every billable operation gets fresh entitlement metadata; persisted records never authorize calls alone.
-    if(refresh)await scan();const route=store.data.catalog?.routes.find(r=>r.id===id),decision=routeDecision(route);
-    if(!decision.allowed)throw new Error(decision.reason);
+    if(refresh==='subscription') {
+      const command=internalCommands.get('codex');if(!command)throw Error('Повторно перевірте Codex CLI');
+      const normalized=await inspect(command,{autoReloadDisabled:env.ORCHESTRATOR_CODEX_AUTO_RELOAD_DISABLED==='1',timeoutMs:8000});
+      const previous=store.data.catalog;
+      store.data.catalog={...previous,connections:[...previous.connections.filter(c=>c.id!=='codex'),normalized.connection],routes:[...normalized.routes,...previous.routes.filter(r=>r.connectionId!=='codex')]};store.save();
+    }else if(refresh)await scan();const route=currentRoute(store.data.catalog?.routes.find(r=>r.id===id)),decision=routeDecision(route);
+    if(!decision.allowed)throw modelAccessError(decision);
     const command=internalCommands.get(route.connectionId);if(!command)throw new Error('Повторно перевірте CLI');
     return {...route,command};
   }};
 }
 
 export function withModelPolicy(registry,provider) {
-  const invoke=provider??((agent,context)=>agent.provider==='opencode'?executeOpenCode(agent,context):execute(agent,context));
+  const invoke=provider??((agent,context)=>agent.provider==='opencode'?(agent.fileWorker?executeFileWorker(agent,context):executeOpenCode(agent,context)):execute(agent,context));
   return async(agent,context)=>{
     if(agent.provider==='demo')return invoke(agent,context);
     if(!['codex','opencode'].includes(agent.provider))throw new Error('Маршрут цього провайдера ще не має підтверджених умов без додаткових списань');
     const route=await registry.requireRoute(`${agent.provider}:${agent.model}`);
     if(route.backend!==agent.provider||route.model!==agent.model)throw new Error('Маршрут не відповідає обраній моделі');
-    if(agent.provider==='opencode'&&agent.access!=='read-only')throw new Error('OpenCode не має дозволу на запис файлів');
+    if(agent.provider==='opencode'&&agent.access!=='read-only'&&!(agent.fileWorker===true&&route.capabilities?.workspaceWrite===true))throw new Error('OpenCode не має дозволу на запис файлів');
+    if(route.billingBoundary==='subscription_quota_guarded') {
+      if(typeof registry.guardSubscription!=='function')throw Error('Контроль виконання підписки не підключений');
+      return registry.guardSubscription({authorize:()=>registry.requireRoute(route.id,{refresh:'subscription'}),signal:context.signal,onEvent:context.onEvent,
+        invoke:(current,signal)=>invoke({...agent,command:current.command,model:current.model,subscriptionOnly:true,ignoreUserConfig:true},{...context,signal})});
+    }
     return invoke({...agent,command:route.command,model:route.model},context);
   };
 }

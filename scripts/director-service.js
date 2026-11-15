@@ -5,6 +5,8 @@ import { withModelPolicy } from './model-registry.js';
 
 export const planFingerprint=plan=>createHash('sha256').update(JSON.stringify(plan)).digest('hex');
 const suits=(route,need={})=>routeDecision(route).allowed&&
+  (!need.billing||route.billing===need.billing)&&
+  (!need.excludeRouteIds?.includes(route.id))&&
   (!need.workspaceWrite||route.capabilities?.workspaceWrite===true)&&
   (!need.tools||route.capabilities?.tools===true)&&
   (!need.contextTokens||(Number.isFinite(route.limit?.context)&&route.limit.context>=need.contextTokens));
@@ -15,7 +17,9 @@ export function routingCandidates(plan,routes,requirements={}) {
   if(!requirements||typeof requirements!=='object'||Array.isArray(requirements))throw new Error('Некоректні вимоги до маршрутів');
   for(const [id,need] of Object.entries(requirements)) {
     if(!plan.tasks.some(t=>t.id===id)||!need||typeof need!=='object'||Array.isArray(need))throw new Error('Невідома задача у вимогах');
-    if(Object.keys(need).some(k=>!['workspaceWrite','tools','contextTokens'].includes(k))||
+    if(Object.keys(need).some(k=>!['workspaceWrite','tools','contextTokens','billing','excludeRouteIds'].includes(k))||
+      (need.billing!==undefined&&!['free_tier','subscription_included'].includes(need.billing))||
+      (need.excludeRouteIds!==undefined&&(!Array.isArray(need.excludeRouteIds)||need.excludeRouteIds.length>100||new Set(need.excludeRouteIds).size!==need.excludeRouteIds.length||need.excludeRouteIds.some(id=>typeof id!=='string'||!id||id.length>300)))||
       ['workspaceWrite','tools'].some(k=>need[k]!==undefined&&typeof need[k]!=='boolean')||
       (need.contextTokens!==undefined&&(!Number.isSafeInteger(need.contextTokens)||need.contextTokens<0)))throw new Error('Некоректні можливості маршруту');
   }
@@ -52,7 +56,7 @@ export function createDirector({registry,provider,preferredId=process.env.ORCHES
     return {configured:true,label:manager.model,provider:manager.backend,routeId:manager.id,agent:{provider:manager.backend,model:manager.model,
       access:'read-only',...(manager.backend==='codex'?{reasoningEffort:'high',ephemeral:true,ignoreUserConfig:true}:{})}};
   }
-  async function propose({plan,requirements={},managerRouteId=preferredId,priority='quality',maxAgentsPerTask=1},signal=AbortSignal.timeout(120000)) {
+  async function propose({plan,requirements={},managerRouteId=preferredId,priority='quality',maxAgentsPerTask=1},signal=AbortSignal.timeout(120000),{onInvoke,onResult}={}) {
     if(!['quality','balanced','economy'].includes(priority))throw new Error('Невідомий пріоритет підбору');
     if(!Number.isInteger(maxAgentsPerTask)||maxAgentsPerTask<1||maxAgentsPerTask>6)throw new Error('Ліміт виконавців має бути від 1 до 6');
     // Detach request data before awaiting discovery or a model.
@@ -74,7 +78,9 @@ export function createDirector({registry,provider,preferredId=process.env.ORCHES
 Поверни ТІЛЬКИ JSON: {"assignments":[{"taskId":"...","routeIds":["..."],"reason":"..."}]}.
 Каталог: ${JSON.stringify(catalog)}
 TaskBrief: ${JSON.stringify(brief)}`;
+    await onInvoke?.();signal.throwIfAborted();
     const output=await invoke(config.agent,{prompt,signal,maxOutputTokens:8000});
+    await onResult?.({routeId:config.routeId,model:config.label,provider:config.provider,usage:output.usage??null});
     const parsed=JSON.parse(output.text.trim().replace(/^```(?:json)?\s*|\s*```$/g,''));
     const assignments=validateRouteAssignments(parsed,plan,before,{maxAgentsPerTask});
     // Availability/prices may have changed while the director was thinking.

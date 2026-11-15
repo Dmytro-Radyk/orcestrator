@@ -30,7 +30,7 @@ const server = createServer(async (req, res) => {
 });
 server.on('error', error => { console.error(error.message); process.exitCode = 1; });
 server.listen(Number(process.env.UI_PORT ?? 4311), '127.0.0.1', () => console.log(
-  `Orcestrator UI: http://127.0.0.1:${server.address().port}\nPlanner: ${process.env.ORCHESTRATOR_DIRECTOR_ROUTE?'pinned verified route':'automatic verified route'}\nExecution: Codex CLI; workspace and model are shown before each run.`));
+  `Orcestrator UI: http://127.0.0.1:${server.address().port}\nPlanner: ${process.env.ORCHESTRATOR_DIRECTOR_ROUTE?'pinned verified route':'automatic verified route'}\nExecution: verified AI routes in isolated worktrees; models are shown before each run.`));
 const shutdown = () => { execution.close(); server.close(); };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

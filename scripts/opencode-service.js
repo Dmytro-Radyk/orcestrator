@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { join,resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runProcess } from '../src/providers.js';
-import { CATALOG_TTL_MS } from '../src/model-policy.js';
+import { CATALOG_TTL_MS,modelAccessError } from '../src/model-policy.js';
 
 export const OPENCODE_HOME=fileURLToPath(new URL('../.orchestrator/opencode/',import.meta.url));
 export const OPENCODE_BINARY=fileURLToPath(new URL('../.orchestrator/tools/opencode-2.3.0/package/bin/opencode.exe',import.meta.url));
@@ -42,12 +42,12 @@ export function normalizeOpenCodeMetadata(models,{checkedAt=new Date().toISOStri
     const free=isolated&&m.providerID==='opencode'&&zero;
     const metered=tiers.some(t=>[t?.input,t?.output,t?.cache?.read,t?.cache?.write].some(n=>typeof n==='number'&&n>0));
     routes.push({id,connectionId:'opencode',backend:'opencode',model,name:typeof m.name==='string'?m.name:model,
-      description:'Текстовий маршрут без інструментів у відокремленому anonymous runtime',
+      description:'Anonymous free runtime; керовані зміни файлів застосовує оркестратор у worktree',
       checkedAt,expiresAt,source:'OpenCode V2 model.list (isolated anonymous runtime)',
       billing:free?'free_tier':metered?'metered':'unknown',freeConfirmed:free,subscriptionConfirmed:false,includedAccessConfirmed:false,
       billingBoundary:free?'included_only':'unknown',runtimeSupported:free,
       availability:m.enabled===true&&m.status!=='deprecated'?'ready':'unavailable',
-      capabilities:{code:true,tools:false,workspaceWrite:false,jsonOutput:'prompt_validated',structuredOutput:false},
+      capabilities:{code:true,tools:false,workspaceWrite:true,managedFileChanges:true,jsonOutput:'prompt_validated',structuredOutput:false},
       inputModalities:Array.isArray(m.capabilities?.input)?m.capabilities.input.filter(v=>typeof v==='string'):[],
       limit:{context:m.limit?.context??null,input:m.limit?.input??null,output:m.limit?.output??null},
       // Copy only documented numeric tariff fields; never provider headers/settings/body.
@@ -86,7 +86,7 @@ export async function executeOpenCode(agent,{prompt,signal,onEvent}, {run=runPro
     cwd:join(home,'workspace'),env:isolatedEnv,prompt,signal,onLine:line=>{
       let event;try{event=JSON.parse(line);}catch{throw new Error('OpenCode повернув некоректний JSONL');}
       if(event.type==='error')throw new Error('OpenCode не завершив запит: перевірте доступність безкоштовної квоти');
-      if(event.type==='tool_use')throw new Error('Інструменти заборонені для текстового маршруту OpenCode');
+      if(event.type==='tool_use')throw Object.assign(modelAccessError({code:'tools_not_supported',reason:`Інструменти заборонені для текстового маршруту OpenCode · ${agent.model}`}),{routeId:`opencode:${agent.model}`});
       if(event.type==='step_start'){steps++;onEvent?.({kind:'model',message:`OpenCode · ${agent.model}`});}
       if(event.type==='text'&&typeof event.part?.text==='string') {
         const id=event.part.id;if(!id||!parts.has(id)){text.push(event.part.text);if(id)parts.add(id);}

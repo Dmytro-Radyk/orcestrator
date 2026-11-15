@@ -31,7 +31,7 @@ test('Codex normalization omits account identity and never infers safe billing f
   const result=normalizeCodexMetadata(source);
   assert.equal(result.connection.subscriptionConfirmed,true);assert.equal(result.routes.length,1);
   assert.equal(result.routes[0].billing,'subscription_included');assert.equal(result.routes[0].billingBoundary,'unknown');
-  assert.equal(routeDecision(result.routes[0]).code,'billing_boundary_unknown');assert.ok(!JSON.stringify(result).includes('PRIVATE'));
+  assert.equal(routeDecision(result.routes[0]).code,'credit_reload_unknown');assert.ok(!JSON.stringify(result).includes('PRIVATE'));
   const exhausted=normalizeCodexMetadata({...source,limits:{rateLimits:{primary:{usedPercent:100}}}});
   assert.equal(exhausted.routes[0].availability,'quota_exhausted');
   const api=normalizeCodexMetadata({...source,account:{account:{type:'apiKey'}}});assert.equal(api.routes[0].billing,'metered');
@@ -63,7 +63,7 @@ test('scan coalesces concurrent requests, persists sanitized data and does not t
   assert.equal(probes,1);assert.equal(finds,4);assert.equal(a.scanning,false);assert.equal(b.scanning,false);
   assert.equal(store.data.catalog.connections.length,4);assert.ok(!JSON.stringify(store.data).includes('PRIVATE'));
   assert.ok(!JSON.stringify(store.data).includes('/trusted/codex'));
-  await assert.rejects(registry.requireRoute('codex:model'),/додатковими списаннями/);assert.equal(probes,2);
+  await assert.rejects(registry.requireRoute('codex:model'),/Automatic reload/);assert.equal(probes,2);
 });
 
 test('provider and planner guards stop disallowed calls before invoking a model',async()=>{

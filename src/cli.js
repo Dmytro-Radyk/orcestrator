@@ -4,8 +4,12 @@ import { Engine } from './engine.js';
 import { createApi } from './server.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createModelRegistry,withModelPolicy } from '../scripts/model-registry.js';
+import { join } from 'node:path';
+import { WorkspaceManager } from './workspaces.js';
+import { createDirector } from '../scripts/director-service.js';
+import { createRecoveryHandler } from '../scripts/recovery-service.js';
 
-const createEngine=()=>{const store=new Store(process.env.ORCHESTRATOR_DATA);return new Engine(store,withModelPolicy(createModelRegistry({store})));};
+const createEngine=()=>{const store=new Store(process.env.ORCHESTRATOR_DATA),registry=createModelRegistry({store});const engine=new Engine(store,withModelPolicy(registry),{workspaces:new WorkspaceManager(join(store.directory,'runtime-worktrees'))});engine.recover=createRecoveryHandler({engine,registry,director:createDirector({registry})});return engine;};
 
 const [command = 'help', file] = process.argv.slice(2);
 try {

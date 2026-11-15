@@ -11,6 +11,13 @@ export function validateProject(project) {
   assert(typeof project.name === 'string' && project.name.trim(), 'Project name is required');
   assert(Array.isArray(project.agents) && project.agents.length, 'At least one agent is required');
   assert(Array.isArray(project.tasks) && project.tasks.length, 'At least one task is required');
+  if(project.workspaceMode!==undefined)assert(['shared','isolated'].includes(project.workspaceMode),'Invalid workspace mode');
+  if(project.workspaceMode==='isolated')assert(typeof project.workspace==='string'&&project.workspace,'Isolated execution requires a workspace');
+  if(project.recovery!==undefined){
+    assert(project.recovery&&typeof project.recovery==='object'&&!Array.isArray(project.recovery)&&typeof project.recovery.enabled==='boolean','Invalid recovery policy');
+    integer(project.recovery.maxAttempts??2,1,3,'recovery.maxAttempts');
+    if(project.recovery.managerRouteId!==undefined)assert(typeof project.recovery.managerRouteId==='string'&&project.recovery.managerRouteId.length>0,'Invalid recovery manager');
+  }
   integer(project.limits.concurrency, 1, 32, 'concurrency');
   integer(project.limits.maxCalls, 1, 10000, 'maxCalls');
   integer(project.limits.maxDepth, 0, 8, 'maxDepth');
@@ -23,7 +30,7 @@ export function validateProject(project) {
     assert(typeof a.id === 'string' && a.id && !agents.has(a.id), 'Agent IDs must be unique');
     agents.add(a.id);
     assert(Array.isArray(a.skills) && a.skills.every(s => typeof s === 'string'), `Invalid skills: ${a.id}`);
-    assert(['demo', 'responses', 'chat', 'codex', 'claude', 'cli'].includes(a.provider), `Unknown provider: ${a.provider}`);
+    assert(['demo', 'responses', 'chat', 'codex', 'claude', 'cli','opencode'].includes(a.provider), `Unknown provider: ${a.provider}`);
     if (['responses', 'chat'].includes(a.provider)) {
       assert(typeof a.model === 'string' && a.model, `Model is required: ${a.id}`);
       const url = new URL(a.baseUrl);

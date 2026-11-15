@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { streamRun } from './run-stream.js';
 
 async function body(req) {
   let data = '';
@@ -29,9 +30,11 @@ export function createApi(engine, token = randomBytes(32).toString('hex')) {
         if (req.method === 'GET') {
           if (!key) return send(200, Object.values(engine.store.data.runs).map(({ id, projectId, revision, status, calls, createdAt }) => ({ id, projectId, revision, status, calls, createdAt })));
           const run = engine.run(key);
+          if(action==='events'&&req.headers.accept?.includes('text/event-stream'))return streamRun(engine,run,req,res);
           return send(200, action === 'events' ? run.events : run);
         }
         if (req.method === 'POST' && ['pause', 'resume', 'cancel'].includes(action)) return send(200, engine[action](key));
+        if (req.method === 'POST' && action === 'recover') return send(202,engine.requestRecovery(key));
         if (req.method === 'POST' && action === 'approve') return send(200, engine.approve(key, taskId));
         if (req.method === 'POST' && action === 'cancel-task') return send(200, engine.cancelTask(key, taskId));
       }

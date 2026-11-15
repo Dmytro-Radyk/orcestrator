@@ -3,6 +3,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const OUTPUT_LIMIT = 4 * 1024 * 1024;
 
+export function subscriptionEnvironment(env=process.env) {
+  return Object.fromEntries(Object.entries(env).filter(([key])=>/^(?:path|pathext|systemroot|windir|comspec|temp|tmp|localappdata|appdata|programfiles|programfiles\(x86\)|programdata|userprofile|home|codex_home|lang|lc_all)$/i.test(key)));
+}
+
 export function terminate(child) {
   if (process.platform === 'win32') {
     const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
@@ -39,7 +43,7 @@ export function runProcess(command, args, { prompt, cwd, signal, onLine, env }) 
       if (onLine && pending && !failure) { try { onLine(pending); } catch(error) { failure=error; } }
       signal.removeEventListener('abort', abort);
       if (failure) reject(failure);
-      else if (code !== 0) reject(new Error(`CLI exited with code ${code}: ${stderr.slice(-2000)}`));
+      else if (code !== 0) { const error=new Error(`CLI exited with code ${code}: ${stderr.slice(-2000)}`);error.stdout=stdout;error.exitCode=code;reject(error); }
       else resolve(stdout.trim());
     });
     child.stdin.end(prompt);
@@ -71,7 +75,7 @@ async function api(agent, prompt, signal, maxOutputTokens) {
   return { text, usage: data.usage ?? null };
 }
 
-export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onEvent }) {
+export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onEvent,canDelegate }) {
   if (agent.provider === 'demo') {
     await delay(30, undefined, { signal });
     return { text: `[DEMO — no model called] ${agent.name ?? agent.id}: ${prompt.slice(0, 180)}`, usage: null };
@@ -81,11 +85,12 @@ export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onE
   if (agent.provider === 'codex') {
     command = agent.command ?? 'codex';
     args = ['exec', '--json', '--sandbox', agent.access ?? 'read-only', '--skip-git-repo-check', '--color', 'never',
+      ...(agent.subscriptionOnly?['-c','forced_login_method="chatgpt"','-c','model_provider="openai"']:[]),
       ...(agent.model ? ['--model', agent.model] : []),
       ...(agent.reasoningEffort ? ['-c', `model_reasoning_effort=${JSON.stringify(agent.reasoningEffort)}`] : []),
       ...(agent.outputSchema ? ['--output-schema', agent.outputSchema] : []),
       ...(agent.ephemeral ? ['--ephemeral'] : []),
-      ...(agent.ignoreUserConfig ? ['--ignore-user-config'] : []),
+      ...(agent.ignoreUserConfig||agent.subscriptionOnly ? ['--ignore-user-config'] : []),
       ...(agent.windowsSandbox ? ['-c', `windows.sandbox=${JSON.stringify(agent.windowsSandbox)}`, '--enable', 'prefer_mxc'] : []), '-'];
   } else if (agent.provider === 'claude') {
     command = agent.command ?? 'claude';
@@ -103,7 +108,7 @@ export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onE
     else if(item.type==='agent_message') message=item.text;
     if(message) onEvent({kind:item.type,message:message.slice(0,8000)});
   } : undefined;
-  const text = await runProcess(command, args, { prompt, cwd, signal, onLine });
+  const text = await runProcess(command, args, { prompt, cwd, signal, onLine,...(agent.provider==='codex'&&agent.subscriptionOnly?{env:subscriptionEnvironment()}:{} ) });
   if (agent.provider === 'codex') {
     const events = text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
     const failed = events.find(e => e.type === 'turn.failed' || e.type === 'error');
@@ -113,6 +118,10 @@ export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onE
     const usage = events.findLast(e => e.type === 'turn.completed')?.usage ?? null;
     if(agent.executionReport) {
       const report=JSON.parse(answer);
+      if(report.status==='delegated') {
+        if(!canDelegate||!Array.isArray(report.subtasks)||!report.subtasks.length||report.files?.length||report.checks?.length)throw new Error('Недопустимий звіт делегування');
+        return {text:answer,delegation:report.subtasks,report,usage};
+      }
       if(!['completed','blocked','failed'].includes(report.status)||typeof report.summary!=='string'||!Array.isArray(report.files)||!Array.isArray(report.checks))throw new Error('Codex повернув некоректний звіт виконання');
       if(report.status!=='completed'||report.checks.some(c=>c.required!==false&&c.status!=='passed')) {
         const error=new Error(`Codex ${report.status==='completed'?'blocked':report.status}: ${report.summary}\n${report.checks.map(c=>`${c.command}: ${c.status} — ${c.details}`).join('\n')}`);error.usage=usage;throw error;

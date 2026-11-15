@@ -29,7 +29,7 @@ async function fixture(t,provider) {
   await call('/api/workspace','PUT',{revision:0,workspace});
   return {service,call,workspace,p,dir,trusted};
 }
-async function until(predicate){for(let i=0;i<150;i++){if(await predicate())return;await delay(10);}throw Error('Timed out');}
+async function until(predicate){for(let i=0;i<1500;i++){if(await predicate())return;await delay(10);}throw Error('Timed out');}
 
 test('browser execution persists snapshots, uses trusted bindings and exposes real files, usage and progress',async t=>{
   let calls=0;
@@ -118,4 +118,36 @@ test('routing API refuses duplicate requests and discards a decision if the plan
   f.p.tasks[0].title='Changed during selection';await f.call('/api/workspace','PUT',{revision:1,workspace:f.workspace});finish();
   const rejected=await pending;assert.equal(rejected.status,400);assert.match(rejected.value.error,/План змінився/);
   assert.equal(f.service.store.data.routing?.[f.p.id],undefined);
+});
+
+test('execution binds the saved AI proposal to exact runtime models and rejects forged or stale proposals',async t=>{
+  let workers=0;
+  const f=await fixture(t,async(agent,ctx)=>{
+    if(ctx.prompt.includes('TaskBrief:'))return{text:JSON.stringify({assignments:f.p.tasks.map(task=>({taskId:task.id,routeIds:[f.trusted.id],reason:'Verified fixture route'}))})};
+    workers++;assert.equal(agent.model,f.trusted.model);assert.equal(agent.id.startsWith('route-'),true);assert.equal(ctx.canDelegate,true);
+    await writeFile(join(ctx.cwd,'verified.txt'),String(workers));return{text:'done'};
+  });
+  const input={projectId:f.p.id,revision:f.p.revision};
+  const proposal=(await f.call('/api/routing','POST',input)).value;
+  assert.equal((await f.call('/api/execution/runs','POST',{...input,proposalId:'forged'})).status,400);
+  assert.equal((await f.call('/api/execution/preview','POST',{projectId:f.p.id})).value.proposal.id,proposal.id);
+  const launched=await f.call('/api/execution/runs','POST',{...input,proposalId:proposal.id,bindings:{backend:'forged'}});
+  assert.equal(launched.status,202);const run=f.service.engine.run(launched.value.id);await until(()=>run.status==='completed');
+  assert.equal(workers,2);assert.equal(run.project.routingProposalId,proposal.id);assert.equal(run.project.workspaceMode,'isolated');
+  const view=structuredClone(f.p);applyExecutionRun(view,run);assert.deepEqual(view.tasks[0].agentIds,['backend']);assert.ok(view.execution.tasks[0].assignedAgentIds[0].startsWith('route-'));
+  f.p.tasks[0].prompt='Changed prompt';await f.call('/api/workspace','PUT',{revision:1,workspace:f.workspace});
+  assert.equal((await f.call('/api/execution/runs','POST',{...input,proposalId:proposal.id})).status,400);
+});
+
+test('launch revalidates a free-only proposal even if its route changes to an otherwise allowed subscription',async t=>{
+  let workers=0;const f=await fixture(t,async(agent,ctx)=>{
+    if(ctx.prompt.includes('TaskBrief:'))return{text:JSON.stringify({assignments:f.p.tasks.map(task=>({taskId:task.id,routeIds:[f.trusted.id],reason:'Free-only fixture route'}))})};
+    workers++;return{text:'must not execute'};
+  });
+  const input={projectId:f.p.id,revision:f.p.revision};
+  const result=await f.call('/api/routing','POST',{...input,requirements:Object.fromEntries(f.p.tasks.map(t=>[t.id,{billing:'free_tier',workspaceWrite:true}]))});
+  assert.equal(result.status,200);
+  Object.assign(f.trusted,{billing:'subscription_included',subscriptionConfirmed:true,includedAccessConfirmed:true});
+  const blocked=await f.call('/api/execution/runs','POST',{...input,proposalId:result.value.id});
+  assert.equal(blocked.status,400);assert.match(blocked.value.error,/Немає дозволеної/);assert.equal(workers,0);assert.equal(Object.keys(f.service.store.data.runs).length,0);
 });

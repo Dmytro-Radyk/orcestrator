@@ -1,15 +1,18 @@
 import { buildSolarSystemModel } from './solar-model.js';
 import { createSolarGL, mat4LookAt, mat4Multiply, mat4Perspective, projectWorldToScreen } from './solar-gl.js';
+import { patchLiveDom } from './live-dom.js';
+import { formatBillingBadge } from './routing-ui.js';
 
 const h = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 const uiState = {
+  lastProjectId: null,
   yaw: 0.56,
   pitch: 0.42,
   zoom: 0.96,
   focusRef: null,
   camTarget: [0, 0, 0],
-  motionPaused: false,
+  motionPaused: globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
   showGrid: true,
   showLabels: true,
   fullscreen: false,
@@ -68,7 +71,16 @@ function resolveSelectedEntity(model) {
   if (!model || !uiState.selected) return null;
   if (uiState.selected.kind === 'sun') return model.sun;
   if (uiState.selected.kind === 'planet') {
-    const idx = model.planets.findIndex(p => p.id === uiState.selected.id);
+    let idx = model.planets.findIndex(p => p.id === uiState.selected.id);
+    if (idx === -1 && uiState.selected.agentIds?.length) {
+      idx = model.planets.findIndex(p => p.agentIds?.some(id => uiState.selected.agentIds.includes(id)));
+      if (idx !== -1) {
+        uiState.selected = { ...uiState.selected, id: model.planets[idx].id };
+        if (uiState.focusRef?.kind === 'planet') {
+          uiState.focusRef = { ...uiState.focusRef, id: model.planets[idx].id };
+        }
+      }
+    }
     if (idx === -1) return null;
     const p = model.planets[idx];
     return { ...p, tex: archetypeForPlanet(p, idx).tex };
@@ -80,6 +92,44 @@ function resolveSelectedEntity(model) {
     }
   }
   return null;
+}
+
+function billingBadgeHtml(billing, billingBoundary) {
+  if (!billing && !billingBoundary) return '';
+  const b = formatBillingBadge(billing, billingBoundary);
+  return `<span class="billing-pill ${h(b.tone)}" title="${h(b.label)}">${h(b.shortLabel)}</span>`;
+}
+
+function solarRunControlsHtml(model, callbacks) {
+  if (!callbacks.onRunAction) return '';
+  const st = model.sun.status;
+  const draining = Boolean(model.sun.draining);
+  const btns = [];
+  if (draining) {
+    // A cancelled run can still own active calls; do not offer a new launch yet.
+  } else if (st === 'running') {
+    if (!draining) btns.push('<button type="button" class="solar-ctrl-btn" data-solar-control="pause">Пауза</button>');
+    btns.push('<button type="button" class="solar-ctrl-btn danger" data-solar-control="cancel">Скасувати запуск</button>');
+  } else if (st === 'paused') {
+    btns.push('<button type="button" class="solar-ctrl-btn primary" data-solar-control="resume">Продовжити</button>');
+    btns.push('<button type="button" class="solar-ctrl-btn danger" data-solar-control="cancel">Скасувати запуск</button>');
+  } else {
+    if (callbacks.canRealStart) {
+      btns.push('<button type="button" class="solar-ctrl-btn primary" data-solar-control="real-start">Запустити AI</button>');
+    }
+    btns.push('<button type="button" class="solar-ctrl-btn" data-solar-control="start">Демо</button>');
+  }
+  if (model.sun.isReal) {
+    btns.push('<button type="button" class="solar-ctrl-btn" data-solar-control="view-artifacts">Звіт / Артефакти</button>');
+  }
+  if (!btns.length) return '';
+  return `
+    <div class="solar-block">
+      <h4>Дії керування</h4>
+      ${draining ? '<p class="solar-event-note">Очікуємо завершення активних викликів…</p>' : ''}
+      <div class="solar-inspector-actions">${btns.join('')}</div>
+    </div>
+  `;
 }
 
 function renderInspectorHtml(model, callbacks) {
@@ -98,7 +148,7 @@ function renderInspectorHtml(model, callbacks) {
       ? entity.runningTasks.map(t => `<button type="button" class="solar-chip-btn" data-solar-task="${h(t.id)}">${h(t.title)}</button>`).join('')
       : '<span class="solar-muted">Немає активних задач</span>';
     return `
-      <aside class="solar-inspector" aria-label="Інспектор оркестратора">
+      <aside class="solar-inspector" data-live-key="solar-inspector-sun" aria-label="Інспектор оркестратора">
         <div class="solar-inspector-head">
           <span class="solar-eyebrow">ОРКЕСТРАТОР · СОНЦЕ</span>
           <button type="button" class="solar-close" data-solar-action="close-inspector" aria-label="Закрити">×</button>
@@ -122,10 +172,21 @@ function renderInspectorHtml(model, callbacks) {
           <h4>Що виконує зараз</h4>
           <p>${h(entity.currentAction)}</p>
         </div>
+        ${entity.failedTasks?.length ? `
+          <div class="solar-block solar-error-block">
+            <h4>Помилки задач (${entity.failedTasks.length})</h4>
+            ${entity.failedTasks.slice(0, 3).map(f => `<p class="solar-detail-text"><strong>${h(f.title)}:</strong> ${h(f.error)}</p>`).join('')}
+          </div>` : ''}
+        ${entity.latestResult ? `
+          <div class="solar-block">
+            <h4>Останній результат</h4>
+            <p class="solar-result-preview">${h(entity.latestResult.text)}</p>
+          </div>` : ''}
         <div class="solar-block">
           <h4>Активні задачі (${entity.runningTasks.length})</h4>
           <div class="solar-chips">${runningList}</div>
         </div>
+        ${solarRunControlsHtml(model, callbacks)}
         ${entity.recentEvents.length ? `
           <div class="solar-block">
             <h4>Останні події</h4>
@@ -138,8 +199,10 @@ function renderInspectorHtml(model, callbacks) {
   }
 
   if (entity.kind === 'planet') {
+    const primaryTask = entity.tasks.find(t => t.status === 'running' || t.status === 'waiting_children') || entity.tasks[0] || null;
+    const latestResultTask = entity.tasks.find(t => t.result || t.error);
     return `
-      <aside class="solar-inspector" aria-label="Інспектор моделі">
+      <aside class="solar-inspector" data-live-key="solar-inspector-planet-${h(entity.id)}" aria-label="Інспектор моделі">
         <div class="solar-inspector-head">
           <span class="solar-eyebrow">МОДЕЛЬ · ПЛАНЕТА</span>
           <button type="button" class="solar-close" data-solar-action="close-inspector" aria-label="Закрити">×</button>
@@ -153,76 +216,114 @@ function renderInspectorHtml(model, callbacks) {
         </div>
         <div class="solar-status-row">
           <span class="badge ${h(entity.status)}"><i></i>${h(entity.statusLabel)}</span>
+          ${billingBadgeHtml(entity.billing, entity.billingBoundary)}
           ${focusBtn}
+        </div>
+        <div class="solar-block">
+          <h4>Походження моделі</h4>
+          <p><strong>${h(entity.sourceLabel ?? 'Профіль ролі')}</strong></p>
+          ${entity.recommendedModels?.length ? `<p class="solar-detail-text">Профіль ролі: ${h(entity.recommendedModels.join(', '))}</p>` : ''}
+          ${entity.routedModels?.length ? `<p class="solar-detail-text">AI-пропозиція (/api/routing): ${h(entity.routedModels.join(', '))}</p>` : ''}
+          ${entity.actualModels?.length ? `<p class="solar-detail-text">Фактичний виконавець: ${h(entity.actualModels.join(', '))}</p>` : '<p class="solar-detail-text">Фактичний виконавець запуску ще не зафіксований</p>'}
         </div>
         <div class="solar-block">
           <h4>Роль моделі</h4>
           <p>${h(entity.description)}</p>
         </div>
         <div class="solar-block solar-live-block">
-          <h4>Що виконує зараз</h4>
+          <h4>Задача і поточний стан</h4>
           <p><strong>${h(entity.currentAction)}</strong></p>
-          <p class="solar-detail-text">${h(entity.currentDetail)}</p>
+          <p class="solar-detail-text">${h(primaryTask?.prompt || entity.currentDetail)}</p>
           ${entity.eventNote ? `<p class="solar-event-note">${h(entity.eventNote)}</p>` : ''}
         </div>
+        ${latestResultTask?.error ? `
+          <div class="solar-block solar-error-block">
+            <h4>Помилка виконання</h4>
+            <p class="solar-result-preview">${h(latestResultTask.error)}</p>
+          </div>` : ''}
+        ${latestResultTask?.result ? `
+          <div class="solar-block">
+            <h4>Результат</h4>
+            <p class="solar-result-preview">${h(latestResultTask.result)}</p>
+          </div>` : ''}
         ${entity.moons.length ? `
           <div class="solar-block">
-            <h4>Субагенти (супутники)</h4>
+            <h4>Субагенти · супутники (${entity.moons.length})</h4>
             <div class="solar-list">
               ${entity.moons.map(m => `
                 <button type="button" class="solar-list-item" data-solar-moon="${h(m.key)}">
-                  <span><strong>${h(m.name)}</strong><small>${h(m.role)}</small></span>
+                  <span><strong>${h(m.name)}</strong><small>${h(m.model || m.role)}</small></span>
                   <span class="badge ${h(m.status)}"><i></i>${h(m.statusLabel)}</span>
                 </button>`).join('')}
             </div>
           </div>` : ''}
         <div class="solar-block">
-          <h4>Призначені задачі</h4>
+          <h4>Призначені задачі (${entity.tasks.length})</h4>
           <div class="solar-list">
             ${entity.tasks.length ? entity.tasks.map(t => `
-              <button type="button" class="solar-list-item" data-solar-task="${h(t.id)}" ${callbacks.onSelectTask ? '' : 'disabled'}>
-                <span><strong>${h(t.title)}</strong></span>
-                <span class="badge ${h(t.status)}"><i></i>${h(t.statusLabel)}</span>
-              </button>`).join('') : '<span class="solar-muted">Немає призначених задач</span>'}
+              <div class="solar-task-card">
+                <button type="button" class="solar-list-item" data-solar-task="${h(t.id)}" ${callbacks.onSelectTask ? '' : 'disabled'}>
+                  <span><strong>${h(t.title)}</strong>${t.result ? `<small>${h(t.result)}</small>` : t.error ? `<small class="solar-text-err">${h(t.error)}</small>` : ''}</span>
+                  <span class="badge ${h(t.status)}"><i></i>${h(t.statusLabel)}</span>
+                </button>
+                ${t.cancellable && callbacks.onCancelTask ? `<div class="solar-task-mini-actions"><button type="button" class="solar-ctrl-btn danger" data-solar-cancel-task="${h(t.id)}">Скасувати задачу</button></div>` : ''}
+              </div>`).join('') : '<span class="solar-muted">Немає призначених задач</span>'}
           </div>
         </div>
+        ${solarRunControlsHtml(model, callbacks)}
       </aside>
     `;
   }
 
   return `
-    <aside class="solar-inspector" aria-label="Інспектор субагента">
+    <aside class="solar-inspector" data-live-key="solar-inspector-moon-${h(entity.key)}" aria-label="Інспектор субагента">
       <div class="solar-inspector-head">
-        <span class="solar-eyebrow">СУБАГЕНТ · СУПУТНИК</span>
+        <span class="solar-eyebrow">ДОЧІРНЯ ЗАДАЧА · СУПУТНИК</span>
         <button type="button" class="solar-close" data-solar-action="close-inspector" aria-label="Закрити">×</button>
       </div>
       <div class="solar-inspector-title">
         <span class="solar-orb" style="background:url('/textures/moon.jpg') center/cover;box-shadow:inset -6px -4px 10px rgba(0,0,0,.75)"></span>
         <div>
           <h3>${h(entity.name)}</h3>
-          <small>${h(entity.role)}</small>
+          <small>${h(entity.model || entity.role)}${entity.provider ? ` · ${h(entity.provider)}` : ''}</small>
         </div>
       </div>
       <div class="solar-status-row">
         <span class="badge ${h(entity.status)}"><i></i>${h(entity.statusLabel)}</span>
+        ${billingBadgeHtml(entity.billing, entity.billingBoundary)}
         ${focusBtn}
       </div>
       <div class="solar-block">
-        <h4>Батьківська планета</h4>
-        <button type="button" class="solar-link-btn" data-solar-planet="${h(entity.parentPlanetId)}">${h(entity.parentPlanetName)} · ${h(entity.parentPlanetModel)}</button>
+        <h4>Модель і походження</h4>
+        <p><strong>${h(entity.model || entity.parentPlanetModel || 'Модель плану')}</strong> · ${h(entity.source === 'execution' ? 'Фактичний виконавець' : 'План проєкту')}</p>
+        <p class="solar-detail-text">Батьківська планета: <button type="button" class="solar-link-btn" data-solar-planet="${h(entity.parentPlanetId)}">${h(entity.parentPlanetName)}</button></p>
       </div>
       <div class="solar-block">
-        <h4>Короткий опис</h4>
-        <p>${h(entity.description)}</p>
+        <h4>Задача субагента</h4>
+        <p>${h(entity.prompt || entity.description)}</p>
       </div>
       <div class="solar-block solar-live-block">
-        <h4>Що виконує зараз</h4>
+        <h4>Поточний статус</h4>
         <p>${h(entity.currentAction)}</p>
       </div>
+      ${entity.error ? `
+        <div class="solar-block solar-error-block">
+          <h4>Помилка</h4>
+          <p class="solar-result-preview">${h(entity.error)}</p>
+        </div>` : ''}
       <div class="solar-block">
-        <h4>Батьківська задача</h4>
-        <button type="button" class="solar-chip-btn" data-solar-task="${h(entity.parentTaskId)}">${h(entity.parentTaskTitle)}</button>
+        <h4>Результат</h4>
+        <p class="solar-result-preview">${h(entity.result || 'Результат з’явиться після завершення дочірньої задачі.')}</p>
       </div>
+      <div class="solar-block">
+        <h4>Дії керування</h4>
+        <div class="solar-inspector-actions">
+          ${entity.id ? `<button type="button" class="solar-ctrl-btn" data-solar-task="${h(entity.id)}">Відкрити картку</button>` : ''}
+          <button type="button" class="solar-ctrl-btn" data-solar-task="${h(entity.parentTaskId)}">Батьківська задача</button>
+          ${entity.cancellable && callbacks.onCancelTask ? `<button type="button" class="solar-ctrl-btn danger" data-solar-cancel-task="${h(entity.id)}">Скасувати підзадачу</button>` : ''}
+        </div>
+      </div>
+      ${solarRunControlsHtml(model, callbacks)}
     </aside>
   `;
 }
@@ -292,14 +393,23 @@ function buildGridAndOrbitLines(planetPositions, maxOrbit) {
 }
 
 const activeControllers = new WeakMap();
+const viewportControllers = new WeakMap();
 
 export function renderSolarStage(container, project, agents, labels, callbacks = {}) {
   if (!container || !project) return;
-  const model = buildSolarSystemModel(project, agents, labels);
+  if (uiState.lastProjectId && uiState.lastProjectId !== project.id) {
+    uiState.selected = null;
+    uiState.focusRef = null;
+  }
+  uiState.lastProjectId = project.id;
+
+  const model = buildSolarSystemModel(project, agents, labels, callbacks.routing ?? null);
   if (!model) return;
 
-  let ctrl = activeControllers.get(container);
-  if (ctrl && container.querySelector('.solar-viewport')) {
+  const existingViewport = container.querySelector('.solar-viewport');
+  let ctrl = (existingViewport && viewportControllers.get(existingViewport)) || activeControllers.get(container);
+  if (ctrl && existingViewport) {
+    activeControllers.set(container, ctrl);
     ctrl.update(model, callbacks);
     return;
   }
@@ -360,8 +470,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
         <span class="solar-rate-tag">${uiState.motionPaused ? 'PAUSED' : 'REAL RATE'}</span>
         <span class="solar-time-readout solar-clock-readout">${h(tb.timeStr)}</span>
         ${callbacks.onRunAction ? `
-          <button type="button" class="solar-sim-btn" data-solar-action="run-control">
-            ${model.sun.status === 'running' ? 'Пауза' : model.sun.status === 'paused' ? 'Продовжити' : 'Запустити демо'}
+          <button type="button" class="solar-sim-btn" data-solar-action="run-control" ${model.sun.draining ? 'disabled' : ''}>
+            ${model.sun.draining ? 'Зупиняється…' : model.sun.status === 'running' ? 'Пауза' : model.sun.status === 'paused' ? 'Продовжити' : callbacks.canRealStart ? 'Запустити AI' : 'Запустити демо'}
           </button>` : ''}
       </div>
     </div>
@@ -399,14 +509,18 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     if (clockEl) clockEl.textContent = nextTb.timeStr;
     if (rateEl) rateEl.textContent = uiState.motionPaused ? 'PAUSED' : 'REAL RATE';
     if (simBtn) {
-      simBtn.textContent = currentModel.sun.status === 'running' ? 'Пауза' : currentModel.sun.status === 'paused' ? 'Продовжити' : 'Запустити демо';
+      simBtn.disabled = Boolean(currentModel.sun.draining);
+      simBtn.textContent = currentModel.sun.draining ? 'Зупиняється…' : currentModel.sun.status === 'running' ? 'Пауза' : currentModel.sun.status === 'paused' ? 'Продовжити' : currentCallbacks.canRealStart ? 'Запустити AI' : 'Запустити демо';
     }
     const motionBtn = viewport.querySelector('[data-solar-action="toggle-motion"]');
-    if (motionBtn) motionBtn.textContent = uiState.motionPaused ? '▶' : '❚❚';
+    if (motionBtn) {
+      motionBtn.textContent = uiState.motionPaused ? '▶' : '❚❚';
+      motionBtn.title = uiState.motionPaused ? 'Відновити рух' : 'Пауза руху';
+    }
     viewport.querySelector('[data-solar-action="toggle-grid"]')?.classList.toggle('active', uiState.showGrid);
     viewport.querySelector('[data-solar-action="toggle-labels"]')?.classList.toggle('active', uiState.showLabels);
     viewport.querySelector('[data-solar-action="toggle-fullscreen"]')?.classList.toggle('active', uiState.fullscreen);
-    inspectorSlot.innerHTML = renderInspectorHtml(currentModel, currentCallbacks);
+    patchLiveDom(inspectorSlot, renderInspectorHtml(currentModel, currentCallbacks));
   }
 
   function findHit(cx, cy) {
@@ -494,8 +608,22 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       else if (act === 'toggle-fullscreen') uiState.fullscreen = !uiState.fullscreen;
       else if (act === 'toggle-motion') uiState.motionPaused = !uiState.motionPaused;
       else if (act === 'close-inspector') { uiState.selected = null; uiState.focusRef = null; }
-      else if (act === 'run-control') currentCallbacks.onRunAction?.(currentModel.sun.status);
+      else if (act === 'run-control') {
+        if (currentModel.sun.draining) return;
+        const nextAct = currentModel.sun.status === 'running' ? 'pause' : currentModel.sun.status === 'paused' ? 'resume' : (currentCallbacks.canRealStart ? 'real-start' : 'start');
+        currentCallbacks.onRunAction?.(nextAct);
+      }
       syncHud();
+      return;
+    }
+    const ctrlBtn = e.target.closest('[data-solar-control]');
+    if (ctrlBtn && currentCallbacks.onRunAction) {
+      currentCallbacks.onRunAction(ctrlBtn.dataset.solarControl);
+      return;
+    }
+    const cancelTaskBtn = e.target.closest('[data-solar-cancel-task]');
+    if (cancelTaskBtn && currentCallbacks.onCancelTask) {
+      currentCallbacks.onCancelTask(cancelTaskBtn.dataset.solarCancelTask);
       return;
     }
     const moonBtn = e.target.closest('[data-solar-moon]');
@@ -712,7 +840,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       const pScreen = projectWorldToScreen(ps.center, viewProj, width, height);
       if (pScreen) {
         const approxR = (ps.radius / pScreen.depth) * (height * 1.18);
-        nextHits.push({ sx: pScreen.sx, sy: pScreen.sy, r: Math.max(18, approxR + 8), depth: pScreen.depth, ref: { kind: 'planet', id: ps.planet.id } });
+        nextHits.push({ sx: pScreen.sx, sy: pScreen.sy, r: Math.max(18, approxR + 8), depth: pScreen.depth, ref: { kind: 'planet', id: ps.planet.id, agentIds: ps.planet.agentIds } });
 
         // Crisp NASA Eyes orbital marker circle when zoomed out
         if (approxR < 18) {
@@ -808,5 +936,6 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       syncHud();
     }
   };
+  viewportControllers.set(viewport, ctrl);
   activeControllers.set(container, ctrl);
 }

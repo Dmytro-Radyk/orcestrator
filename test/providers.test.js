@@ -60,7 +60,7 @@ test('Codex subprocess gets planning controls and returns final JSON without com
     });
   `);
   const result = await execute({provider:'codex',command:process.execPath,model:'test-model',access:'read-only',
-    reasoningEffort:'high',outputSchema:'plan schema.json',ephemeral:true,ignoreUserConfig:true,windowsSandbox:'elevated'}, {...context(),cwd});
+    reasoningEffort:'high',outputSchema:'plan schema.json',ephemeral:true,ignoreUserConfig:true,windowsSandbox:'elevated',subscriptionOnly:true}, {...context(),cwd});
   const answer = JSON.parse(result.text);
   assert.equal(answer.prompt, context().prompt);
   for (const flag of ['--ephemeral','--ignore-user-config','--output-schema']) assert.ok(answer.args.includes(flag));
@@ -68,6 +68,8 @@ test('Codex subprocess gets planning controls and returns final JSON without com
   assert.equal(answer.args[answer.args.indexOf('--output-schema')+1], 'plan schema.json');
   assert.ok(answer.args.includes('model_reasoning_effort="high"'));
   assert.ok(answer.args.includes('windows.sandbox="elevated"'));assert.ok(answer.args.includes('prefer_mxc'));
+  assert.ok(answer.args.includes('forced_login_method="chatgpt"'));assert.ok(answer.args.includes('model_provider="openai"'));
+  assert.equal(answer.args.filter(a=>a==='--ignore-user-config').length,1);
   assert.equal(answer.args.at(-1), '-');
   assert.equal(result.usage.output_tokens,5);
 });
