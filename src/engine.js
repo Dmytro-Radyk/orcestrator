@@ -146,7 +146,7 @@ export class Engine {
       return result;
     } catch (error) {
       error.agentId??=agent.id;
-      if(['codex','opencode'].includes(agent.provider))error.routeId??=`${agent.provider}:${agent.model}`;
+      if(['codex','opencode','antigravity'].includes(agent.provider))error.routeId??=`${agent.provider}:${agent.model}`;
       this.event(run, 'agent.failed', { taskId: task.id, agentId: agent.id, message: error.message, usage:error.usage,code:error.code,decisionCode:error.decisionCode,routeId:error.routeId });
       throw error;
     } finally { release(); }

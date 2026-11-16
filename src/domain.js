@@ -30,7 +30,7 @@ export function validateProject(project) {
     assert(typeof a.id === 'string' && a.id && !agents.has(a.id), 'Agent IDs must be unique');
     agents.add(a.id);
     assert(Array.isArray(a.skills) && a.skills.every(s => typeof s === 'string'), `Invalid skills: ${a.id}`);
-    assert(['demo', 'responses', 'chat', 'codex', 'claude', 'cli','opencode'].includes(a.provider), `Unknown provider: ${a.provider}`);
+    assert(['demo', 'responses', 'chat', 'codex', 'claude', 'cli','opencode','antigravity'].includes(a.provider), `Unknown provider: ${a.provider}`);
     if (['responses', 'chat'].includes(a.provider)) {
       assert(typeof a.model === 'string' && a.model, `Model is required: ${a.id}`);
       const url = new URL(a.baseUrl);

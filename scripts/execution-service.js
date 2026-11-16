@@ -13,7 +13,7 @@ import { executionAgent } from './execution-agent.js';
 import { createRecoveryHandler } from './recovery-service.js';
 
 const inside = (root, path) => { const rel=relative(root,path); return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel); };
-const excluded = name => /^(?:\.git|\.env(?:\..*)?|node_modules|\.codex|\.aws)$/i.test(name) || /\.(?:pem|key|p12|pfx)$/i.test(name);
+const excluded = name => /^(?:\.git|\.env(?:\..*)?|node_modules|\.codex|\.gemini|\.aws)$/i.test(name) || /\.(?:pem|key|p12|pfx)$/i.test(name);
 const root = fileURLToPath(new URL('../.orchestrator/', import.meta.url));
 
 export function executorConfig(env=process.env) {
@@ -54,7 +54,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     return Boolean(p&&p.revision===run.project.uiRevision&&planFingerprint(routingPlan(p))===run.project.uiPlanFingerprint);
   };
   engine.recover=createRecoveryHandler({engine,registry,director,config,isCurrent:isCurrentRun});
-  const runtimes=()=>registry.snapshot().routes.filter(r=>['codex','opencode'].includes(r.backend)).flatMap(r=>[
+  const runtimes=()=>registry.snapshot().routes.filter(r=>['codex','opencode','antigravity'].includes(r.backend)).flatMap(r=>[
     ...(r.capabilities?.workspaceWrite?[{id:`${r.id}#write`,name:`${r.backend} · розробка`,provider:r.backend,model:r.model,routeId:r.id,billing:r.billing,billingBoundary:r.billingBoundary,access:'workspace-write',allowed:r.decision.allowed,reason:r.decision.reason}]:[]),
     {id:`${r.id}#read`,name:`${r.backend} · перевірка`,provider:r.backend,model:r.model,routeId:r.id,billing:r.billing,billingBoundary:r.billingBoundary,access:'read-only',allowed:r.decision.allowed,reason:r.decision.reason}]);
   function uiProject(key) {
@@ -112,7 +112,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       if(!runtime.allowed)throw new Error(runtime.reason);
       const id=proposal?`route-${createHash('sha256').update(runtime.id).digest('hex').slice(0,16)}`:a.id;
       if(seen.has(id))return id;seen.set(id,true);
-      agents.push(executionAgent(registry.snapshot().routes.find(r=>r.id===runtime.routeId),{id,name:proposal?runtime.model:a.name,role:a.role,skills:a.skills??[],access:runtime.access,config}));return id;
+      agents.push(executionAgent(registry.snapshot().routes.find(r=>r.id===runtime.routeId),{id,name:proposal?runtime.model:a.name,role:a.role,skills:a.skills??[],access:runtime.access,config,...(runtime.provider==='codex'&&a.reasoningEffort!==undefined?{reasoningEffort:a.reasoningEffort}:{})}));return id;
     }
     for(const t of p.tasks.filter(t=>!t.parentId)) {
       let ids;
@@ -131,9 +131,10 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         acceptanceCriteria:t.acceptanceCriteria??[],mode:t.mode??'pipeline',allowDelegation:p.allowDelegation!==false&&t.allowDelegation!==false});
     }
     const dir=await workspace(p.id);
+    const recoveryManager=p.recovery?.managerRouteId??proposal?.managerRouteId;
     const inputProject={name:p.name,goal:p.description,uiProjectId:p.id,uiRevision:p.revision,planning:p.planning,
       uiPlanFingerprint:planFingerprint(routingPlan(p)),routingRequirements:structuredClone(proposal?.requirements??{}),
-      recovery:{enabled:p.recovery?.enabled??true,maxAttempts:p.recovery?.maxAttempts??2,...(p.recovery?.managerRouteId?{managerRouteId:p.recovery.managerRouteId}:{})},
+      recovery:{enabled:p.recovery?.enabled??true,maxAttempts:p.recovery?.maxAttempts??2,...(recoveryManager?{managerRouteId:recoveryManager}:{})},
       workspace:dir,workspaceMode:'isolated',agents,tasks,...(proposal?{routingProposalId:proposal.id}:{}),
       limits:{concurrency:p.concurrency,maxCalls:p.maxCalls,timeoutMs:240000,maxOutputTokens:12000,maxDepth:p.allowDelegation===false?0:p.maxDepth??2,maxTasks:p.maxTasks??100}};
     const previous=Object.values(store.data.projects).find(v=>v.uiProjectId===p.id);

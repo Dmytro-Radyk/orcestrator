@@ -3,7 +3,7 @@ import {executionAgent} from './execution-agent.js';
 import {planFingerprint,routingCandidates,validateRouteAssignments} from './director-service.js';
 
 const unsafe=new Set(['WORKSPACE_CONFLICT','CHECKS_BLOCKED']);
-const routeId=agent=>agent&&['codex','opencode'].includes(agent.provider)?`${agent.provider}:${agent.model}`:null;
+const routeId=agent=>agent&&['codex','opencode','antigravity'].includes(agent.provider)?`${agent.provider}:${agent.model}`:null;
 
 export function createRecoveryHandler({engine,registry,director,config={},isCurrent=()=>true}={}) {
   return async run=>{

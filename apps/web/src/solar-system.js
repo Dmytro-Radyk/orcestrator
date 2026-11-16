@@ -2,17 +2,32 @@ import { buildSolarSystemModel } from './solar-model.js';
 import { createSolarGL, mat4LookAt, mat4Multiply, mat4Perspective, projectWorldToScreen } from './solar-gl.js';
 import { patchLiveDom } from './live-dom.js';
 import { formatBillingBadge } from './routing-ui.js';
+import {
+  createCameraState,
+  reconcileTargetWithModel,
+  resolveTargetPositionAndBounds,
+  setCameraFocus,
+  resetCameraToSun,
+  applyCameraOrbitDelta,
+  applyCameraZoomFactor,
+  stepCameraFrame,
+  stepTargetCycle,
+  buildFocusableTargetList,
+  clamp
+} from './solar-camera.js';
 
 const h = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
+const motionMedia = typeof globalThis !== 'undefined' && globalThis.matchMedia
+  ? globalThis.matchMedia('(prefers-reduced-motion: reduce)')
+  : null;
+
 const uiState = {
   lastProjectId: null,
-  yaw: 0.56,
-  pitch: 0.42,
-  zoom: 0.96,
-  focusRef: null,
-  camTarget: [0, 0, 0],
-  motionPaused: globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
+  camera: createCameraState(),
+  reducedMotion: Boolean(motionMedia?.matches),
+  motionPaused: Boolean(motionMedia?.matches),
+  userToggledMotion: false,
   showGrid: true,
   showLabels: true,
   fullscreen: false,
@@ -20,6 +35,13 @@ const uiState = {
   hovered: null,
   simTime: 0
 };
+
+motionMedia?.addEventListener?.('change', event => {
+  uiState.reducedMotion = Boolean(event.matches);
+  if (!uiState.userToggledMotion) {
+    uiState.motionPaused = uiState.reducedMotion;
+  }
+});
 
 // 1 = Gas Giant (rings), 2 = Earth, 3 = Ice Giant, 4 = Exoplanet
 const PLANET_ARCHETYPES = {
@@ -75,9 +97,9 @@ function resolveSelectedEntity(model) {
     if (idx === -1 && uiState.selected.agentIds?.length) {
       idx = model.planets.findIndex(p => p.agentIds?.some(id => uiState.selected.agentIds.includes(id)));
       if (idx !== -1) {
-        uiState.selected = { ...uiState.selected, id: model.planets[idx].id };
-        if (uiState.focusRef?.kind === 'planet') {
-          uiState.focusRef = { ...uiState.focusRef, id: model.planets[idx].id };
+        uiState.selected = { ...uiState.selected, id: model.planets[idx].id, agentIds: model.planets[idx].agentIds };
+        if (uiState.camera.focusRef?.kind === 'planet') {
+          uiState.camera.focusRef = { ...uiState.camera.focusRef, id: model.planets[idx].id, agentIds: model.planets[idx].agentIds };
         }
       }
     }
@@ -136,10 +158,11 @@ function renderInspectorHtml(model, callbacks) {
   const entity = resolveSelectedEntity(model);
   if (!entity) return '';
 
-  const isFocused = uiState.focusRef && (
-    (entity.kind === 'sun' && uiState.focusRef.kind === 'sun') ||
-    (entity.kind === 'planet' && uiState.focusRef.kind === 'planet' && uiState.focusRef.id === entity.id) ||
-    (entity.kind === 'moon' && uiState.focusRef.kind === 'moon' && uiState.focusRef.key === entity.key)
+  const fRef = uiState.camera.focusRef;
+  const isFocused = fRef && (
+    (entity.kind === 'sun' && fRef.kind === 'sun' && Boolean(fRef.focused)) ||
+    (entity.kind === 'planet' && fRef.kind === 'planet' && fRef.id === entity.id) ||
+    (entity.kind === 'moon' && fRef.kind === 'moon' && fRef.key === entity.key)
   );
   const focusBtn = `<button type="button" class="solar-link-btn" data-solar-action="${isFocused ? 'reset-camera' : 'focus-selected'}">${isFocused ? 'Загальний огляд' : 'Наблизити камеру'}</button>`;
 
@@ -395,11 +418,52 @@ function buildGridAndOrbitLines(planetPositions, maxOrbit) {
 const activeControllers = new WeakMap();
 const viewportControllers = new WeakMap();
 
+function computePlanetPositions(model, simTime) {
+  const totalPlanets = Math.max(1, model.planets.length);
+  return model.planets.map((planet, idx) => {
+    const arch = archetypeForPlanet(planet, idx);
+    const orbitR = 66 + idx * 44;
+    const speed = (planet.status === 'running' ? 0.22 : 0.085) / (1 + idx * 0.35);
+    const angle = (idx / totalPlanets) * Math.PI * 2 + 0.55 + simTime * speed;
+    const px = Math.cos(angle) * orbitR;
+    const pz = Math.sin(angle) * orbitR;
+    const moons = planet.moons.map((moon, mIdx) => {
+      const mOrbitR = arch.baseRadius * 2.8 + mIdx * 7;
+      const mAngle = mIdx * 2.1 + simTime * (moon.status === 'running' ? 0.95 : 0.42);
+      const inc = (mIdx % 2 === 0 ? 1 : -1) * 0.22;
+      return {
+        moon,
+        orbitR: mOrbitR,
+        radius: 2.5,
+        center: [px + Math.cos(mAngle) * mOrbitR, Math.sin(mAngle) * mOrbitR * inc, pz + Math.sin(mAngle) * mOrbitR]
+      };
+    });
+    return {
+      planet,
+      idx,
+      arch,
+      orbitR,
+      angle,
+      radius: arch.baseRadius,
+      center: [px, 0, pz],
+      moons
+    };
+  });
+}
+
+function targetOptionValue(ref) {
+  if (!ref || ref.kind === 'sun') return 'sun';
+  if (ref.kind === 'planet') return `planet:${ref.id}`;
+  if (ref.kind === 'moon') return `moon:${ref.key}`;
+  return 'sun';
+}
+
 export function renderSolarStage(container, project, agents, labels, callbacks = {}) {
   if (!container || !project) return;
-  if (uiState.lastProjectId && uiState.lastProjectId !== project.id) {
+  const projectChanged = Boolean(uiState.lastProjectId && uiState.lastProjectId !== project.id);
+  if (projectChanged) {
     uiState.selected = null;
-    uiState.focusRef = null;
+    resetCameraToSun(uiState.camera, { snap: true });
   }
   uiState.lastProjectId = project.id;
 
@@ -418,8 +482,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
 
   container.innerHTML = `
     <div class="solar-viewport ${uiState.fullscreen ? 'is-fullscreen' : ''} ${callbacks.compact ? 'is-compact' : ''}">
-      <canvas class="solar-canvas-gl"></canvas>
-      <canvas class="solar-canvas-hud"></canvas>
+      <canvas class="solar-canvas-gl" tabindex="0" aria-label="Інтерактивна 3D-сцена сонячної системи. Стрілки вліво і вправо перемикають об’єкт, пробіл призупиняє орбіти, R центрує на Сонці."></canvas>
+      <canvas class="solar-canvas-hud" aria-hidden="true"></canvas>
       <div class="solar-hud-top">
         <div class="solar-brand-pill">
           <span class="solar-beacon"></span>
@@ -428,46 +492,57 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
             <small class="solar-project-sub">${h(model.sun.name)} · ${model.planets.length} моделей · ${model.totalMoons} субагентів</small>
           </div>
         </div>
-        <div class="solar-legend-pills">
-          <span class="solar-pill sun"><i></i>Сонце: Оркестратор</span>
-          <span class="solar-pill planet"><i></i>Планети: Моделі</span>
-          <span class="solar-pill moon"><i></i>Супутники: Субагенти</span>
+        <div class="solar-hud-controls">
+          <label class="solar-sr-only" for="solar-target-picker">Ціль камери</label>
+          <select id="solar-target-picker" class="solar-target-select" aria-label="Обрати ціль камери у сонячній системі"></select>
+          <div class="solar-legend-pills">
+            <span class="solar-pill sun"><i></i>Сонце: Оркестратор</span>
+            <span class="solar-pill planet"><i></i>Планети: Моделі</span>
+            <span class="solar-pill moon"><i></i>Супутники: Субагенти</span>
+          </div>
         </div>
       </div>
+      <div class="solar-live-announce solar-sr-only" aria-live="polite"></div>
 
-      <div class="solar-dock" role="toolbar" aria-label="Керування картою">
-        <button type="button" class="solar-dock-btn" data-solar-action="select-sun" title="Інспектор оркестратора (Сонце)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+      <div class="solar-dock" role="toolbar" aria-label="Керування 3D-картою і камерою">
+        <button type="button" class="solar-dock-btn" data-solar-action="select-sun" aria-label="Інспектор оркестратора (Сонце)" title="Інспектор оркестратора (Сонце)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
         </button>
-        <button type="button" class="solar-dock-btn ${uiState.showGrid ? 'active' : ''}" data-solar-action="toggle-grid" title="Орбіти">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="9" ry="4"/></svg>
+        <button type="button" class="solar-dock-btn" data-solar-action="prev-target" aria-label="Попередній об’єкт" title="Попередній об’єкт (←)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
         </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="zoom-in" title="Наблизити">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 5v14M5 12h14"/></svg>
+        <button type="button" class="solar-dock-btn" data-solar-action="next-target" aria-label="Наступний об’єкт" title="Наступний об’єкт (→)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
         </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="zoom-out" title="Віддалити">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5 12h14"/></svg>
+        <button type="button" class="solar-dock-btn ${uiState.showGrid ? 'active' : ''}" data-solar-action="toggle-grid" aria-label="Показати або приховати орбіти" aria-pressed="${uiState.showGrid}" title="Орбіти">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="9" ry="4"/></svg>
         </button>
-        <button type="button" class="solar-dock-btn ${uiState.showLabels ? 'active' : ''}" data-solar-action="toggle-labels" title="Підписи">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>
+        <button type="button" class="solar-dock-btn" data-solar-action="zoom-in" aria-label="Наблизити камеру" title="Наблизити (+)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
         </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="reset-camera" title="Центрувати на Сонці">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg>
+        <button type="button" class="solar-dock-btn" data-solar-action="zoom-out" aria-label="Віддалити камеру" title="Віддалити (−)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M5 12h14"/></svg>
         </button>
-        <button type="button" class="solar-dock-btn ${uiState.fullscreen ? 'active' : ''}" data-solar-action="toggle-fullscreen" title="На весь екран">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 3H3v5m18-5h-5m5 0v5M3 16v5h5m13-5v5h-5"/></svg>
+        <button type="button" class="solar-dock-btn ${uiState.showLabels ? 'active' : ''}" data-solar-action="toggle-labels" aria-label="Показати або приховати підписи" aria-pressed="${uiState.showLabels}" title="Підписи">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>
+        </button>
+        <button type="button" class="solar-dock-btn" data-solar-action="reset-camera" aria-label="Центрувати камеру на Сонці" title="Центрувати на Сонці (Home / R)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg>
+        </button>
+        <button type="button" class="solar-dock-btn ${uiState.fullscreen ? 'active' : ''}" data-solar-action="toggle-fullscreen" aria-label="Повноекранний режим" aria-pressed="${uiState.fullscreen}" title="На весь екран">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 3H3v5m18-5h-5m5 0v5M3 16v5h5m13-5v5h-5"/></svg>
         </button>
       </div>
 
       <div class="solar-inspector-slot"></div>
 
       <div class="solar-bottom-bar">
-        <button type="button" class="solar-play-btn" data-solar-action="toggle-motion" title="${uiState.motionPaused ? 'Відновити рух' : 'Пауза руху'}">
+        <button type="button" class="solar-play-btn" data-solar-action="toggle-motion" aria-label="${uiState.motionPaused ? 'Відновити рух орбіт' : 'Пауза руху орбіт'}" aria-pressed="${uiState.motionPaused}" title="${uiState.motionPaused ? 'Відновити рух орбіт' : 'Пауза руху орбіт'}">
           ${uiState.motionPaused ? '▶' : '❚❚'}
         </button>
         <span class="solar-live-tag ${tb.liveClass}"><i></i><span class="solar-live-text">${h(tb.liveLabel)}</span></span>
         <span class="solar-time-readout">${h(tb.dateStr)}</span>
-        <span class="solar-rate-tag">${uiState.motionPaused ? 'PAUSED' : 'REAL RATE'}</span>
+        <span class="solar-rate-tag">${uiState.motionPaused ? 'ORBITS PAUSED' : 'REAL RATE'}</span>
         <span class="solar-time-readout solar-clock-readout">${h(tb.timeStr)}</span>
         ${callbacks.onRunAction ? `
           <button type="button" class="solar-sim-btn" data-solar-action="run-control" ${model.sun.draining ? 'disabled' : ''}>
@@ -482,13 +557,20 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
   const hudCanvas = container.querySelector('.solar-canvas-hud');
   const inspectorSlot = container.querySelector('.solar-inspector-slot');
   const subEl = container.querySelector('.solar-project-sub');
+  const targetPicker = container.querySelector('.solar-target-select');
+  const announceEl = container.querySelector('.solar-live-announce');
   const liveTagEl = container.querySelector('.solar-live-tag');
   const liveTextEl = container.querySelector('.solar-live-text');
   const clockEl = container.querySelector('.solar-clock-readout');
   const rateEl = container.querySelector('.solar-rate-tag');
   const simBtn = container.querySelector('[data-solar-action="run-control"]');
 
-  const glEngine = createSolarGL(glCanvas);
+  let glEngine = null;
+  try {
+    glEngine = createSolarGL(glCanvas);
+  } catch {
+    glEngine = null;
+  }
 
   let currentModel = model;
   let currentCallbacks = callbacks;
@@ -499,15 +581,48 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
   let lastY = 0;
   let rafId = 0;
   let lastFrame = performance.now();
+  let viewportW = viewport.clientWidth || 800;
+  let viewportH = viewport.clientHeight || 500;
+  let perfFrames = 0;
+  let perfSumMs = 0;
+  let perfMaxMs = 0;
+
+  const resizeObserver = typeof ResizeObserver === 'function'
+    ? new ResizeObserver(() => {
+      viewportW = viewport.clientWidth || 800;
+      viewportH = viewport.clientHeight || 500;
+    })
+    : null;
+  resizeObserver?.observe(viewport);
+
+  function syncTargetPicker() {
+    if (!targetPicker) return;
+    const targets = buildFocusableTargetList(currentModel);
+    const activeVal = targetOptionValue(uiState.camera.focusRef ?? uiState.selected);
+    const nextHtml = targets.map(t => {
+      const val = targetOptionValue(t);
+      const prefix = t.kind === 'sun' ? '☀ Сонце: ' : t.kind === 'planet' ? '● Модель: ' : '  ◦ Супутник: ';
+      return `<option value="${h(val)}" ${val === activeVal ? 'selected' : ''}>${h(prefix + t.label)}</option>`;
+    }).join('');
+    if (targetPicker.dataset.lastHtml !== nextHtml) {
+      targetPicker.innerHTML = nextHtml;
+      targetPicker.dataset.lastHtml = nextHtml;
+    }
+    if (targetPicker.value !== activeVal) targetPicker.value = activeVal;
+  }
 
   function syncHud() {
     viewport.classList.toggle('is-fullscreen', uiState.fullscreen);
-    if (subEl) subEl.textContent = `${currentModel.sun.name} · ${currentModel.planets.length} моделей · ${currentModel.totalMoons} субагентів`;
+    viewportW = viewport.clientWidth || 800;
+    viewportH = viewport.clientHeight || 500;
+    if (subEl) {
+      subEl.textContent = `${currentModel.sun.name} · ${currentModel.planets.length} моделей · ${currentModel.totalMoons} субагентів`;
+    }
     const nextTb = renderTimeBarData(currentModel);
     if (liveTagEl) liveTagEl.className = `solar-live-tag ${nextTb.liveClass}`;
     if (liveTextEl) liveTextEl.textContent = nextTb.liveLabel;
     if (clockEl) clockEl.textContent = nextTb.timeStr;
-    if (rateEl) rateEl.textContent = uiState.motionPaused ? 'PAUSED' : 'REAL RATE';
+    if (rateEl) rateEl.textContent = uiState.motionPaused ? 'ORBITS PAUSED' : 'REAL RATE';
     if (simBtn) {
       simBtn.disabled = Boolean(currentModel.sun.draining);
       simBtn.textContent = currentModel.sun.draining ? 'Зупиняється…' : currentModel.sun.status === 'running' ? 'Пауза' : currentModel.sun.status === 'paused' ? 'Продовжити' : currentCallbacks.canRealStart ? 'Запустити AI' : 'Запустити демо';
@@ -515,12 +630,47 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     const motionBtn = viewport.querySelector('[data-solar-action="toggle-motion"]');
     if (motionBtn) {
       motionBtn.textContent = uiState.motionPaused ? '▶' : '❚❚';
-      motionBtn.title = uiState.motionPaused ? 'Відновити рух' : 'Пауза руху';
+      motionBtn.title = uiState.motionPaused ? 'Відновити рух орбіт' : 'Пауза руху орбіт';
+      motionBtn.setAttribute('aria-label', motionBtn.title);
+      motionBtn.setAttribute('aria-pressed', String(uiState.motionPaused));
     }
-    viewport.querySelector('[data-solar-action="toggle-grid"]')?.classList.toggle('active', uiState.showGrid);
-    viewport.querySelector('[data-solar-action="toggle-labels"]')?.classList.toggle('active', uiState.showLabels);
-    viewport.querySelector('[data-solar-action="toggle-fullscreen"]')?.classList.toggle('active', uiState.fullscreen);
+    const gridBtn = viewport.querySelector('[data-solar-action="toggle-grid"]');
+    gridBtn?.classList.toggle('active', uiState.showGrid);
+    gridBtn?.setAttribute('aria-pressed', String(uiState.showGrid));
+    const lblBtn = viewport.querySelector('[data-solar-action="toggle-labels"]');
+    lblBtn?.classList.toggle('active', uiState.showLabels);
+    lblBtn?.setAttribute('aria-pressed', String(uiState.showLabels));
+    const fsBtn = viewport.querySelector('[data-solar-action="toggle-fullscreen"]');
+    fsBtn?.classList.toggle('active', uiState.fullscreen);
+    fsBtn?.setAttribute('aria-pressed', String(uiState.fullscreen));
+
+    syncTargetPicker();
     patchLiveDom(inspectorSlot, renderInspectorHtml(currentModel, currentCallbacks));
+
+    if (announceEl) {
+      const entity = resolveSelectedEntity(currentModel);
+      announceEl.textContent = entity ? `Вибрано ${entity.name} (${entity.statusLabel})` : 'Загальний огляд сонячної системи';
+    }
+  }
+
+  function selectEntity(ref, { focus = true, snap = uiState.reducedMotion, keepDistance = false, zoomMultiplier = 1.0 } = {}) {
+    uiState.selected = ref;
+    if (focus && ref) {
+      const nextFocusRef = ref.kind === 'sun' ? { kind: 'sun', focused: true } : ref;
+      const positions = computePlanetPositions(currentModel, uiState.simTime);
+      const { center, bounds } = resolveTargetPositionAndBounds(nextFocusRef, positions, 17);
+      setCameraFocus(uiState.camera, nextFocusRef, center, bounds, { snap, keepDistance });
+      if (zoomMultiplier !== 1.0) {
+        uiState.camera.desiredDistance = clamp(uiState.camera.desiredDistance * zoomMultiplier, bounds.minDistance, bounds.maxDistance);
+        if (snap) uiState.camera.distance = uiState.camera.desiredDistance;
+      }
+    }
+    syncHud();
+  }
+
+  function currentFocusBounds() {
+    const positions = computePlanetPositions(currentModel, uiState.simTime);
+    return resolveTargetPositionAndBounds(uiState.camera.focusRef, positions, 17).bounds;
   }
 
   function findHit(cx, cy) {
@@ -549,8 +699,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragMoved = true;
-      uiState.yaw += dx * 0.007;
-      uiState.pitch = Math.max(0.08, Math.min(1.45, uiState.pitch + dy * 0.006));
+      applyCameraOrbitDelta(uiState.camera, dx * 0.007, dy * 0.006);
       lastX = e.clientX;
       lastY = e.clientY;
       return;
@@ -566,8 +715,12 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     if (!dragMoved) {
       const rect = glCanvas.getBoundingClientRect();
       const hit = findHit(e.clientX - rect.left, e.clientY - rect.top);
-      uiState.selected = hit ? hit.ref : null;
-      syncHud();
+      if (hit) {
+        selectEntity(hit.ref, { focus: true });
+      } else {
+        uiState.selected = null;
+        syncHud();
+      }
     }
   });
 
@@ -575,45 +728,112 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     const rect = glCanvas.getBoundingClientRect();
     const hit = findHit(e.clientX - rect.left, e.clientY - rect.top);
     if (hit) {
-      uiState.selected = hit.ref;
-      uiState.focusRef = hit.ref;
-      uiState.zoom = hit.ref.kind === 'sun' ? 1.35 : hit.ref.kind === 'moon' ? 4.8 : 3.5;
+      selectEntity(hit.ref, { focus: true, zoomMultiplier: 0.65 });
     } else {
-      uiState.focusRef = null;
-      uiState.zoom = 0.96;
+      uiState.selected = null;
+      resetCameraToSun(uiState.camera, { snap: uiState.reducedMotion });
+      syncHud();
     }
-    syncHud();
   });
 
   glCanvas.addEventListener('wheel', e => {
     e.preventDefault();
-    const factor = e.deltaY > 0 ? 0.90 : 1.11;
-    uiState.zoom = Math.max(0.42, Math.min(7.0, uiState.zoom * factor));
+    const factor = e.deltaY > 0 ? 1.12 : 0.88;
+    applyCameraZoomFactor(uiState.camera, factor, currentFocusBounds());
   }, { passive: false });
+
+  glCanvas.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ']') {
+      e.preventDefault();
+      const next = stepTargetCycle(currentModel, uiState.selected, 1);
+      if (next) selectEntity(next, { focus: true });
+    } else if (e.key === 'ArrowLeft' || e.key === '[') {
+      e.preventDefault();
+      const prev = stepTargetCycle(currentModel, uiState.selected, -1);
+      if (prev) selectEntity(prev, { focus: true });
+    } else if (e.key === 'Home' || e.key === 'r' || e.key === 'R' || e.key === '0') {
+      e.preventDefault();
+      resetCameraToSun(uiState.camera, { snap: uiState.reducedMotion });
+      syncHud();
+    } else if (e.key === '+' || e.key === '=') {
+      e.preventDefault();
+      applyCameraZoomFactor(uiState.camera, 0.78, currentFocusBounds());
+    } else if (e.key === '-' || e.key === '_') {
+      e.preventDefault();
+      applyCameraZoomFactor(uiState.camera, 1.28, currentFocusBounds());
+    } else if (e.key === ' ') {
+      e.preventDefault();
+      uiState.userToggledMotion = true;
+      uiState.motionPaused = !uiState.motionPaused;
+      syncHud();
+    } else if (e.key === 'Escape' && uiState.selected) {
+      uiState.selected = null;
+      syncHud();
+    }
+  });
+
+  targetPicker?.addEventListener('change', () => {
+    const val = targetPicker.value;
+    if (val === 'sun') {
+      selectEntity({ kind: 'sun' }, { focus: true });
+    } else if (val.startsWith('planet:')) {
+      const id = val.slice(7);
+      const planet = currentModel.planets.find(p => p.id === id);
+      if (planet) selectEntity({ kind: 'planet', id: planet.id, agentIds: planet.agentIds }, { focus: true });
+    } else if (val.startsWith('moon:')) {
+      const key = val.slice(5);
+      for (const p of currentModel.planets) {
+        const m = p.moons.find(item => item.key === key);
+        if (m) {
+          selectEntity({ kind: 'moon', key: m.key, id: m.id }, { focus: true });
+          break;
+        }
+      }
+    }
+  });
 
   viewport.addEventListener('click', e => {
     const actionBtn = e.target.closest('[data-solar-action]');
     if (actionBtn) {
       const act = actionBtn.dataset.solarAction;
-      if (act === 'select-sun') uiState.selected = { kind: 'sun' };
-      else if (act === 'toggle-grid') uiState.showGrid = !uiState.showGrid;
-      else if (act === 'zoom-in') uiState.zoom = Math.min(7.0, uiState.zoom * 1.28);
-      else if (act === 'zoom-out') uiState.zoom = Math.max(0.42, uiState.zoom * 0.78);
-      else if (act === 'toggle-labels') uiState.showLabels = !uiState.showLabels;
-      else if (act === 'reset-camera') { uiState.yaw = 0.56; uiState.pitch = 0.42; uiState.zoom = 0.96; uiState.focusRef = null; }
-      else if (act === 'focus-selected' && uiState.selected) {
-        uiState.focusRef = uiState.selected;
-        uiState.zoom = uiState.selected.kind === 'sun' ? 1.35 : uiState.selected.kind === 'moon' ? 4.8 : 3.5;
-      }
-      else if (act === 'toggle-fullscreen') uiState.fullscreen = !uiState.fullscreen;
-      else if (act === 'toggle-motion') uiState.motionPaused = !uiState.motionPaused;
-      else if (act === 'close-inspector') { uiState.selected = null; uiState.focusRef = null; }
-      else if (act === 'run-control') {
+      if (act === 'select-sun') selectEntity({ kind: 'sun' }, { focus: true });
+      else if (act === 'prev-target') {
+        const prev = stepTargetCycle(currentModel, uiState.selected, -1);
+        if (prev) selectEntity(prev, { focus: true });
+      } else if (act === 'next-target') {
+        const next = stepTargetCycle(currentModel, uiState.selected, 1);
+        if (next) selectEntity(next, { focus: true });
+      } else if (act === 'toggle-grid') {
+        uiState.showGrid = !uiState.showGrid;
+        syncHud();
+      } else if (act === 'zoom-in') {
+        applyCameraZoomFactor(uiState.camera, 0.76, currentFocusBounds());
+      } else if (act === 'zoom-out') {
+        applyCameraZoomFactor(uiState.camera, 1.30, currentFocusBounds());
+      } else if (act === 'toggle-labels') {
+        uiState.showLabels = !uiState.showLabels;
+        syncHud();
+      } else if (act === 'reset-camera') {
+        resetCameraToSun(uiState.camera, { snap: uiState.reducedMotion });
+        syncHud();
+      } else if (act === 'focus-selected' && uiState.selected) {
+        selectEntity(uiState.selected, { focus: true, zoomMultiplier: 0.72 });
+      } else if (act === 'toggle-fullscreen') {
+        uiState.fullscreen = !uiState.fullscreen;
+        syncHud();
+      } else if (act === 'toggle-motion') {
+        uiState.userToggledMotion = true;
+        uiState.motionPaused = !uiState.motionPaused;
+        syncHud();
+      } else if (act === 'close-inspector') {
+        uiState.selected = null;
+        syncHud();
+      } else if (act === 'run-control') {
         if (currentModel.sun.draining) return;
         const nextAct = currentModel.sun.status === 'running' ? 'pause' : currentModel.sun.status === 'paused' ? 'resume' : (currentCallbacks.canRealStart ? 'real-start' : 'start');
         currentCallbacks.onRunAction?.(nextAct);
+        syncHud();
       }
-      syncHud();
       return;
     }
     const ctrlBtn = e.target.closest('[data-solar-control]');
@@ -628,14 +848,21 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     }
     const moonBtn = e.target.closest('[data-solar-moon]');
     if (moonBtn) {
-      uiState.selected = { kind: 'moon', key: moonBtn.dataset.solarMoon };
-      syncHud();
+      const key = moonBtn.dataset.solarMoon;
+      for (const p of currentModel.planets) {
+        const m = p.moons.find(item => item.key === key);
+        if (m) {
+          selectEntity({ kind: 'moon', key: m.key, id: m.id }, { focus: true });
+          break;
+        }
+      }
       return;
     }
     const planetBtn = e.target.closest('[data-solar-planet]');
     if (planetBtn) {
-      uiState.selected = { kind: 'planet', id: planetBtn.dataset.solarPlanet };
-      syncHud();
+      const pid = planetBtn.dataset.solarPlanet;
+      const planet = currentModel.planets.find(p => p.id === pid);
+      if (planet) selectEntity({ kind: 'planet', id: planet.id, agentIds: planet.agentIds }, { focus: true });
       return;
     }
     const taskBtn = e.target.closest('[data-solar-task]');
@@ -647,15 +874,18 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
   function drawFrame(now) {
     if (!document.body.contains(glCanvas)) {
       cancelAnimationFrame(rafId);
+      resizeObserver?.disconnect();
       return;
     }
-    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    const frameStart = performance.now();
+    const rawDt = Math.max(0.001, (now - lastFrame) / 1000);
+    const dt = Math.min(0.05, rawDt);
     lastFrame = now;
     if (!uiState.motionPaused) uiState.simTime += dt;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const width = viewport.clientWidth || 800;
-    const height = viewport.clientHeight || 500;
+    const width = viewportW || viewport.clientWidth || 800;
+    const height = viewportH || viewport.clientHeight || 500;
     const hudW = Math.round(width * dpr);
     const hudH = Math.round(height * dpr);
     if (hudCanvas.width !== hudW || hudCanvas.height !== hudH) {
@@ -664,83 +894,55 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     }
 
     const sunRadius = 17;
-    const totalPlanets = Math.max(1, currentModel.planets.length);
-    const planetPositions = currentModel.planets.map((planet, idx) => {
-      const arch = archetypeForPlanet(planet, idx);
-      const orbitR = 66 + idx * 44;
-      const speed = (planet.status === 'running' ? 0.22 : 0.085) / (1 + idx * 0.35);
-      const angle = (idx / totalPlanets) * Math.PI * 2 + 0.55 + uiState.simTime * speed;
-      const px = Math.cos(angle) * orbitR;
-      const pz = Math.sin(angle) * orbitR;
-      const moons = planet.moons.map((moon, mIdx) => {
-        const mOrbitR = arch.baseRadius * 2.8 + mIdx * 7;
-        const mAngle = mIdx * 2.1 + uiState.simTime * (moon.status === 'running' ? 0.95 : 0.42);
-        const inc = (mIdx % 2 === 0 ? 1 : -1) * 0.22;
-        return {
-          moon,
-          orbitR: mOrbitR,
-          radius: 2.5,
-          center: [px + Math.cos(mAngle) * mOrbitR, Math.sin(mAngle) * mOrbitR * inc, pz + Math.sin(mAngle) * mOrbitR]
-        };
-      });
-      return {
-        planet,
-        idx,
-        arch,
-        orbitR,
-        angle,
-        radius: arch.baseRadius,
-        center: [px, 0, pz],
-        moons
-      };
-    });
+    const planetPositions = computePlanetPositions(currentModel, uiState.simTime);
 
-    let desiredTarget = [0, 0, 0];
-    if (uiState.focusRef?.kind === 'planet') {
-      const found = planetPositions.find(p => p.planet.id === uiState.focusRef.id);
-      if (found) desiredTarget = found.center;
-    } else if (uiState.focusRef?.kind === 'moon') {
-      for (const ps of planetPositions) {
-        const foundM = ps.moons.find(m => m.moon.key === uiState.focusRef.key);
-        if (foundM) { desiredTarget = foundM.center; break; }
-      }
+    const targetRes = resolveTargetPositionAndBounds(uiState.camera.focusRef, planetPositions, sunRadius);
+    if (!targetRes.found && uiState.camera.focusRef?.kind !== 'sun') {
+      uiState.selected = null;
+      resetCameraToSun(uiState.camera, { snap: uiState.reducedMotion });
+      syncHud();
     }
-    const lerp = 1 - Math.exp(-6 * dt);
-    uiState.camTarget = [
-      uiState.camTarget[0] + (desiredTarget[0] - uiState.camTarget[0]) * lerp,
-      uiState.camTarget[1] + (desiredTarget[1] - uiState.camTarget[1]) * lerp,
-      uiState.camTarget[2] + (desiredTarget[2] - uiState.camTarget[2]) * lerp
-    ];
 
-    const camDist = 375 / uiState.zoom;
-    const eye = [
-      uiState.camTarget[0] + camDist * Math.cos(uiState.pitch) * Math.sin(uiState.yaw),
-      uiState.camTarget[1] + camDist * Math.sin(uiState.pitch),
-      uiState.camTarget[2] + camDist * Math.cos(uiState.pitch) * Math.cos(uiState.yaw)
-    ];
+    const activeTargetRes = targetRes.found
+      ? targetRes
+      : resolveTargetPositionAndBounds(uiState.camera.focusRef, planetPositions, sunRadius);
 
-    const proj = mat4Perspective((42 * Math.PI) / 180, width / Math.max(1, height), 2, 2400);
-    const view = mat4LookAt(eye, uiState.camTarget, [0, 1, 0]);
+    const { target, eye, nearPlane } = stepCameraFrame(
+      uiState.camera,
+      activeTargetRes.center,
+      activeTargetRes.bounds,
+      dt,
+      { reducedMotion: uiState.reducedMotion }
+    );
+
+    const proj = mat4Perspective((42 * Math.PI) / 180, width / Math.max(1, height), nearPlane, 2400);
+    const view = mat4LookAt(eye, target, [0, 1, 0]);
     const viewProj = mat4Multiply(proj, view);
 
+    const fRef = uiState.camera.focusRef;
     const bodies = [{
       center: [0, 0, 0],
       radius: sunRadius,
       spin: uiState.simTime * 0.08,
       tilt: 0.12,
       type: 0,
+      hasRing: false,
+      highDetail: fRef?.kind === 'sun' && Boolean(fRef.focused),
       active: currentModel.sun.status === 'running',
       atmoColor: [1.0, 0.72, 0.25]
     }];
     const rings = [];
 
     for (const ps of planetPositions) {
+      const isFocusedPlanet = fRef?.kind === 'planet' && fRef.id === ps.planet.id;
       bodies.push({
         center: ps.center,
         radius: ps.radius,
         spin: uiState.simTime * (0.28 + ps.idx * 0.06),
         tilt: ps.arch.tilt,
         type: ps.arch.type,
+        hasRing: ps.arch.hasRing,
+        highDetail: isFocusedPlanet,
         active: ps.planet.status === 'running',
         atmoColor: ps.arch.atmo
       });
@@ -759,6 +961,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
           spin: uiState.simTime * 0.3,
           tilt: 0.1,
           type: 5,
+          hasRing: false,
+          highDetail: fRef?.kind === 'moon' && (fRef.key === m.moon.key || fRef.id === m.moon.id),
           active: m.moon.status === 'running',
           atmoColor: [0.65, 0.85, 1.0]
         });
@@ -767,6 +971,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
 
     const maxOrbit = 66 + Math.max(0, currentModel.planets.length - 1) * 44;
     const beltBase = maxOrbit + 36;
+    const zoomScale = 275 / Math.max(12, uiState.camera.distance);
     const beltPoints = new Float32Array(BELT_ASTEROIDS.length * 5);
     for (let i = 0; i < BELT_ASTEROIDS.length; i++) {
       const a = BELT_ASTEROIDS[i];
@@ -775,7 +980,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       beltPoints[i * 5 + 0] = Math.cos(ang) * r;
       beltPoints[i * 5 + 1] = a.yOffset;
       beltPoints[i * 5 + 2] = Math.sin(ang) * r;
-      beltPoints[i * 5 + 3] = a.size * Math.min(1.5, uiState.zoom);
+      beltPoints[i * 5 + 3] = a.size * Math.min(1.5, zoomScale);
       beltPoints[i * 5 + 4] = a.alpha;
     }
 
@@ -784,7 +989,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     if (glEngine) {
       glEngine.render({
         width, height, dpr, eye, viewProj,
-        yaw: uiState.yaw, pitch: uiState.pitch, time: uiState.simTime,
+        yaw: uiState.camera.yaw, pitch: uiState.camera.pitch, time: uiState.simTime,
+        reducedMotion: uiState.reducedMotion,
         showGrid: uiState.showGrid, gridSegments, bodies, rings, beltPoints
       });
     }
@@ -793,6 +999,14 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     const hctx = hudCanvas.getContext('2d');
     hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     hctx.clearRect(0, 0, width, height);
+
+    if (!glEngine) {
+      hctx.fillStyle = '#040914';
+      hctx.fillRect(0, 0, width, height);
+      hctx.fillStyle = 'rgba(155, 194, 232, 0.72)';
+      hctx.font = '500 10px "Cascadia Code", Consolas, monospace';
+      hctx.fillText('2D РЕЗЕРВНИЙ РЕЖИМ (WEBGL НЕДОСТУПНИЙ)', 14, height - 14);
+    }
 
     const nextHits = [];
     const sunScreen = projectWorldToScreen([0, 0, 0], viewProj, width, height);
@@ -805,8 +1019,10 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
         hctx.save();
         hctx.strokeStyle = 'rgba(116, 232, 255, 0.24)';
         hctx.lineWidth = 1.0;
-        hctx.setLineDash([4, 6]);
-        hctx.lineDashOffset = -uiState.simTime * 34;
+        if (!uiState.reducedMotion) {
+          hctx.setLineDash([4, 6]);
+          hctx.lineDashOffset = -uiState.simTime * 34;
+        }
         hctx.beginPath();
         hctx.moveTo(sunScreen.sx, sunScreen.sy);
         hctx.lineTo(pScreen.sx, pScreen.sy);
@@ -819,6 +1035,12 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
 
     if (sunScreen) {
       const approxR = (sunRadius / sunScreen.depth) * (height * 1.18);
+      if (!glEngine) {
+        hctx.fillStyle = '#ffb84d';
+        hctx.beginPath();
+        hctx.arc(sunScreen.sx, sunScreen.sy, Math.max(10, approxR), 0, Math.PI * 2);
+        hctx.fill();
+      }
       nextHits.push({ sx: sunScreen.sx, sy: sunScreen.sy, r: Math.max(20, approxR + 8), depth: sunScreen.depth, ref: { kind: 'sun' } });
       if (uiState.selected?.kind === 'sun' || uiState.hovered?.kind === 'sun') {
         drawReticle(hctx, sunScreen.sx, sunScreen.sy, Math.max(22, approxR + 4), '#ffd97d');
@@ -840,9 +1062,16 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       const pScreen = projectWorldToScreen(ps.center, viewProj, width, height);
       if (pScreen) {
         const approxR = (ps.radius / pScreen.depth) * (height * 1.18);
+        if (!glEngine) {
+          const [cr, cg, cb] = ps.arch.orbitRgb;
+          hctx.fillStyle = `rgb(${Math.round(cr * 255)}, ${Math.round(cg * 255)}, ${Math.round(cb * 255)})`;
+          hctx.beginPath();
+          hctx.arc(pScreen.sx, pScreen.sy, Math.max(5, approxR), 0, Math.PI * 2);
+          hctx.fill();
+        }
         nextHits.push({ sx: pScreen.sx, sy: pScreen.sy, r: Math.max(18, approxR + 8), depth: pScreen.depth, ref: { kind: 'planet', id: ps.planet.id, agentIds: ps.planet.agentIds } });
 
-        // Crisp NASA Eyes orbital marker circle when zoomed out
+        // Crisp orbital marker circle when zoomed out
         if (approxR < 18) {
           const [cr, cg, cb] = ps.arch.orbitRgb;
           hctx.strokeStyle = `rgba(${Math.round(cr * 255)}, ${Math.round(cg * 255)}, ${Math.round(cb * 255)}, 0.72)`;
@@ -878,9 +1107,15 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
         const mScreen = projectWorldToScreen(m.center, viewProj, width, height);
         if (!mScreen) continue;
         const approxR = (m.radius / mScreen.depth) * (height * 1.18);
+        if (!glEngine) {
+          hctx.fillStyle = '#c8dff8';
+          hctx.beginPath();
+          hctx.arc(mScreen.sx, mScreen.sy, Math.max(2.5, approxR), 0, Math.PI * 2);
+          hctx.fill();
+        }
         nextHits.push({ sx: mScreen.sx, sy: mScreen.sy, r: Math.max(14, approxR + 7), depth: mScreen.depth, ref: { kind: 'moon', key: m.moon.key, id: m.moon.id } });
 
-        // Sleek NASA Eyes probe/satellite hex marker when zoomed out
+        // Hex satellite marker when zoomed out
         if (approxR < 10) {
           hctx.strokeStyle = m.moon.status === 'running' ? '#7cf0ff' : 'rgba(195, 222, 250, 0.7)';
           hctx.lineWidth = 1;
@@ -923,6 +1158,26 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     for (const item of labelQueue) item.draw();
     hctx.shadowBlur = 0;
 
+    const frameMs = performance.now() - frameStart;
+    perfFrames += 1;
+    perfSumMs += frameMs;
+    if (frameMs > perfMaxMs) perfMaxMs = frameMs;
+    if (typeof window !== 'undefined') {
+      window.__solarPerf = {
+        frames: perfFrames,
+        avgFrameMs: Number((perfSumMs / perfFrames).toFixed(3)),
+        maxFrameMs: Number(perfMaxMs.toFixed(3)),
+        approxFps: Number((1000 / Math.max(1, rawDt * 1000)).toFixed(1)),
+        targetKind: uiState.camera.focusRef?.kind ?? 'sun',
+        targetId: uiState.camera.focusRef?.id ?? uiState.camera.focusRef?.key ?? 'sun',
+        cameraTarget: target.map(n => Number(n.toFixed(3))),
+        desiredTarget: activeTargetRes.center.map(n => Number(n.toFixed(3))),
+        cameraDistance: Number(uiState.camera.distance.toFixed(2)),
+        simTime: Number(uiState.simTime.toFixed(3)),
+        glCaps: glEngine?.getCapabilities() ?? null
+      };
+    }
+
     rafId = requestAnimationFrame(drawFrame);
   }
 
@@ -933,6 +1188,13 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     update(nextModel, nextCallbacks) {
       currentModel = nextModel;
       currentCallbacks = nextCallbacks;
+      const rec = reconcileTargetWithModel(uiState.selected, uiState.camera.focusRef, nextModel);
+      uiState.selected = rec.selected;
+      if (rec.fellBack) {
+        resetCameraToSun(uiState.camera, { snap: uiState.reducedMotion });
+      } else {
+        uiState.camera.focusRef = { ...uiState.camera.focusRef, ...rec.focusRef };
+      }
       syncHud();
     }
   };

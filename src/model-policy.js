@@ -15,6 +15,11 @@ export function routeDecision(route,{now=Date.now(),policy=DEFAULT_MODEL_POLICY}
   if(!['free_tier','subscription_included'].includes(route.billing))return deny('billing_unknown','Допустимий тариф не підтверджено');
   if(route.billing==='free_tier'&&(!policy.allowFree||route.freeConfirmed!==true))return deny('free_unconfirmed','Безкоштовний тариф не підтверджено');
   if(route.billing==='subscription_included'&&(!policy.allowSubscriptions||route.subscriptionConfirmed!==true||route.includedAccessConfirmed!==true))return deny('subscription_unconfirmed','Включений доступ активної підписки не підтверджено');
+  if(route.backend==='antigravity') {
+    if(route.billingBoundary!=='included_only'||route.subscriptionGuard?.authType!=='google'||route.subscriptionGuard?.creditsDisabled!==true)return deny('antigravity_credits','Для Antigravity потрібен Google-вхід і примусове вимкнення додаткових кредитів');
+    const windows=[route.quota?.primary,route.quota?.secondary,...(route.quota?.extra??[])];
+    if(route.quota?.known!==true||windows.some(w=>!w||!Number.isFinite(w.usedPercent)||w.usedPercent<0||w.usedPercent>=100))return deny('antigravity_quota','Включена квота Antigravity не підтверджена або вичерпана');
+  }
   if(route.backend==='codex'&&route.billing==='subscription_included'&&route.subscriptionGuard?.autoReloadDisabled===false)return deny('credit_reload_unknown','Підписку підтверджено. Потрібне підтвердження вимкненого Automatic reload кредитів');
   if(route.billingBoundary==='subscription_quota_guarded') {
     const guard=route.subscriptionGuard,windows=[route.quota?.primary,route.quota?.secondary].filter(Boolean);

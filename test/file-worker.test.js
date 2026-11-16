@@ -9,7 +9,7 @@ async function folder(t){const root=resolve('.orchestrator/tests');await mkdir(r
 test('file worker rejects traversal, secrets, symlinks, stale hashes and mixed invalid batches before any writes',async t=>{
   const root=await folder(t);await writeFile(join(root,'source.txt'),'original');await writeFile(join(root,'.env'),'PRIVATE');
   const files=await workerContext(root);assert.ok(!JSON.stringify(files).includes('PRIVATE'));
-  for(const path of ['../outside.txt','/absolute','C:/outside','folder\\file','.git/config','.env','nested/.aws/secret'])await assert.rejects(applyWorkerChanges(root,[{path,baseHash:null,content:'bad'}]));
+  for(const path of ['../outside.txt','/absolute','C:/outside','folder\\file','.git/config','.env','nested/.aws/secret','.gemini/credentials.json'])await assert.rejects(applyWorkerChanges(root,[{path,baseHash:null,content:'bad'}]));
   await assert.rejects(applyWorkerChanges(root,[{path:'first.txt',baseHash:null,content:'first'},{path:'source.txt',baseHash:'wrong',content:'changed'}]));
   await assert.rejects(access(join(root,'first.txt')));assert.equal(await readFile(join(root,'source.txt'),'utf8'),'original');
   const outside=await folder(t);await symlink(outside,join(root,'link'),process.platform==='win32'?'junction':'dir');

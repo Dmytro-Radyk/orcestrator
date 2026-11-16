@@ -23,6 +23,7 @@ test('director receives only permitted task candidates and returns exact route I
   const proposal=await f.director.propose({plan:plan(),maxAgentsPerTask:2});
   assert.equal(proposal.assignments[1].routeIds.length,2);assert.equal(proposal.provenance.routeId,'opencode:opencode/a');
   assert.equal(proposal.planFingerprint,planFingerprint(plan()));assert.equal(proposal.provenance.usage.cost,0);
+  assert.equal(proposal.managerRouteId,undefined);
   assert.ok(!JSON.stringify(proposal).includes('UNTRUSTED'));assert.ok(!JSON.stringify(proposal).includes('trusted'));
   assert.ok(f.scans()>=3);
 });
@@ -32,6 +33,7 @@ test('director rejects unavailable capabilities before inference and honors a pi
   await assert.rejects(f.director.propose({plan:plan(),requirements:{a:{workspaceWrite:true}}}),/Немає дозволеної/);
   await assert.rejects(f.director.propose({plan:plan(),requirements:{a:{contextTokens:999999}}}),/Немає дозволеної/);
   const config=await f.director.plannerConfig({preferred:'paid:excluded'});assert.equal(config.configured,false);
+  await assert.rejects(f.director.propose({plan:plan(),managerRouteId:'paid:excluded'}),/Обраний маршрут керівника недоступний/);
   assert.equal(calls,0);
 });
 
@@ -64,6 +66,7 @@ test('worker billing requirements keep subscription directors separate from excl
   f.routes.unshift(route('codex:manager',{backend:'codex',model:'manager',billing:'subscription_included',subscriptionConfirmed:true,includedAccessConfirmed:true,capabilities:{structuredOutput:true}}));
   const proposal=await f.director.propose({plan:plan(),managerRouteId:'codex:manager',requirements:{a:{billing:'free_tier'},b:{billing:'free_tier'}}});
   assert.equal(proposal.provenance.provider,'codex');assert.ok(proposal.routes.every(r=>r.billing==='free_tier'));
+  assert.equal(proposal.managerRouteId,'codex:manager');
   assert.throws(()=>routingCandidates(plan(),f.routes,{a:{billing:'metered'}}),/Некоректні/);
   const onlyFree=f.routes.filter(r=>r.backend==='opencode');assert.throws(()=>routingCandidates(plan(),onlyFree,{a:{billing:'subscription_included'}}),/Немає дозволеної/);
   const filtered=routingCandidates(plan(),f.routes,{a:{billing:'free_tier',excludeRouteIds:['opencode:opencode/a']}});

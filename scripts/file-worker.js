@@ -5,7 +5,7 @@ import { runProcess } from '../src/providers.js';
 import { executeOpenCode,OPENCODE_HOME } from './opencode-service.js';
 
 const hash=b=>createHash('sha256').update(b).digest('hex');
-const denied=n=>/^(?:\.git|\.env(?:\..*)?|\.aws|\.codex|\.agents|node_modules)$/i.test(n)||/\.(?:pem|key|p12|pfx|db|sqlite|exe|dll)$/i.test(n);
+const denied=n=>/^(?:\.git|\.env(?:\..*)?|\.aws|\.codex|\.gemini|\.agents|node_modules)$/i.test(n)||/\.(?:pem|key|p12|pfx|db|sqlite|exe|dll)$/i.test(n);
 export function workerPath(root,path) {
   if(typeof path!=='string'||!path||path.length>240||/[\\\x00-\x1f:]/.test(path)||isAbsolute(path)||path.split('/').some(n=>!n||n==='.'||n==='..'||denied(n)))throw Error('Недопустимий шлях зміни');
   const actual=resolve(root,path),rel=relative(root,actual);if(!rel||rel.startsWith('..')||isAbsolute(rel))throw Error('Файл виходить за межі worktree');return actual;

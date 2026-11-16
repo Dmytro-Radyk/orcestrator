@@ -64,7 +64,15 @@ export function patchLiveDom(root, html) {
       if (isDetails && attribute.name === 'open') continue;
       if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
     }
-    if (current.id === 'solar-stage' || isFormControl) return;
+    if (current.id === 'solar-stage') return;
+    if (isFormControl) {
+      if (!preserveControl) {
+        if (current.tagName === 'SELECT') children(current, next);
+        current.value = next.value;
+        if (current.tagName === 'INPUT') current.checked = next.checked;
+      }
+      return;
+    }
     children(current, next);
   }
 

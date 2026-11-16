@@ -13,7 +13,7 @@ async function fixture(t,provider) {
   const base=resolve('.orchestrator/tests');await mkdir(base,{recursive:true});const dir=await mkdtemp(join(base,'execution-'));
   const trusted={id:'codex:fake-model',backend:'codex',model:'fake-model',decision:{allowed:true,reason:'Test-only verified route'},
     checkedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+300000).toISOString(),availability:'ready',
-    billing:'free_tier',freeConfirmed:true,billingBoundary:'included_only',runtimeSupported:true,capabilities:{structuredOutput:true,tools:true,workspaceWrite:true}};
+    billing:'free_tier',freeConfirmed:true,billingBoundary:'included_only',runtimeSupported:true,reasoningEfforts:['low','high'],capabilities:{structuredOutput:true,tools:true,workspaceWrite:true}};
   const registry={snapshot:()=>({routes:[trusted],connections:[]}),scan:async()=>registry.snapshot(),requireRoute:async id=>{
     assert.equal(id,trusted.id);return {...trusted,command:'trusted-executable'};
   }};
@@ -30,6 +30,20 @@ async function fixture(t,provider) {
   return {service,call,workspace,p,dir,trusted};
 }
 async function until(predicate){for(let i=0;i<1500;i++){if(await predicate())return;await delay(10);}throw Error('Timed out');}
+
+test('saved Codex reasoning reaches the executor and unsupported levels stop before model invocation',async t=>{
+  const observed=[];const f=await fixture(t,async agent=>{observed.push(agent.reasoningEffort);return {text:'Verified reasoning selection'};});
+  f.workspace.agents.find(a=>a.id==='backend').reasoningEffort='low';
+  assert.equal((await f.call('/api/workspace','PUT',{revision:1,workspace:f.workspace})).status,200);
+  const started=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-read'}});
+  assert.equal(started.status,202);const id=started.value.id;
+  await until(async()=>['completed','failed'].includes((await f.call(`/api/execution/runs/${id}`)).value.status));
+  assert.equal((await f.call(`/api/execution/runs/${id}`)).value.status,'completed');assert.deepEqual(observed,['low','low']);
+  f.workspace.agents.find(a=>a.id==='backend').reasoningEffort='unsupported';
+  await f.call('/api/workspace','PUT',{revision:2,workspace:f.workspace});
+  const denied=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-read'}});
+  assert.equal(denied.status,400);assert.match(denied.value.error,/рівень роздумів недоступний/);assert.equal(observed.length,2);
+});
 
 test('browser execution persists snapshots, uses trusted bindings and exposes real files, usage and progress',async t=>{
   let calls=0;
@@ -120,20 +134,21 @@ test('routing API refuses duplicate requests and discards a decision if the plan
   assert.equal(f.service.store.data.routing?.[f.p.id],undefined);
 });
 
-test('execution binds the saved AI proposal to exact runtime models and rejects forged or stale proposals',async t=>{
+test('execution binds saved AI worker models and the pinned recovery manager, rejecting forged or stale proposals',async t=>{
   let workers=0;
   const f=await fixture(t,async(agent,ctx)=>{
     if(ctx.prompt.includes('TaskBrief:'))return{text:JSON.stringify({assignments:f.p.tasks.map(task=>({taskId:task.id,routeIds:[f.trusted.id],reason:'Verified fixture route'}))})};
     workers++;assert.equal(agent.model,f.trusted.model);assert.equal(agent.id.startsWith('route-'),true);assert.equal(ctx.canDelegate,true);
     await writeFile(join(ctx.cwd,'verified.txt'),String(workers));return{text:'done'};
   });
-  const input={projectId:f.p.id,revision:f.p.revision};
+  const input={projectId:f.p.id,revision:f.p.revision,managerRouteId:f.trusted.id};
   const proposal=(await f.call('/api/routing','POST',input)).value;
   assert.equal((await f.call('/api/execution/runs','POST',{...input,proposalId:'forged'})).status,400);
   assert.equal((await f.call('/api/execution/preview','POST',{projectId:f.p.id})).value.proposal.id,proposal.id);
   const launched=await f.call('/api/execution/runs','POST',{...input,proposalId:proposal.id,bindings:{backend:'forged'}});
   assert.equal(launched.status,202);const run=f.service.engine.run(launched.value.id);await until(()=>run.status==='completed');
   assert.equal(workers,2);assert.equal(run.project.routingProposalId,proposal.id);assert.equal(run.project.workspaceMode,'isolated');
+  assert.equal(proposal.managerRouteId,f.trusted.id);assert.equal(run.project.recovery.managerRouteId,f.trusted.id);
   const view=structuredClone(f.p);applyExecutionRun(view,run);assert.deepEqual(view.tasks[0].agentIds,['backend']);assert.ok(view.execution.tasks[0].assignedAgentIds[0].startsWith('route-'));
   f.p.tasks[0].prompt='Changed prompt';await f.call('/api/workspace','PUT',{revision:1,workspace:f.workspace});
   assert.equal((await f.call('/api/execution/runs','POST',{...input,proposalId:proposal.id})).status,400);

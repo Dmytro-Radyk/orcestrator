@@ -88,8 +88,8 @@ TaskBrief: ${JSON.stringify(brief)}`;
     validateRouteAssignments({assignments},plan,after,{maxAgentsPerTask});
     const selected=registry.snapshot().routes.filter(r=>assignments.some(a=>a.routeIds.includes(r.id)));
     return {id:randomUUID(),planFingerprint:planFingerprint(plan),assignments,
-      policy:DEFAULT_MODEL_POLICY,requirements,priority,maxAgentsPerTask,
-      routes:selected.map(r=>({id:r.id,backend:r.backend,model:r.model,billing:r.billing,capabilities:r.capabilities,checkedAt:r.checkedAt,source:r.source})),
+      policy:DEFAULT_MODEL_POLICY,requirements,priority,maxAgentsPerTask,...(managerRouteId?{managerRouteId}:{}),
+      routes:selected.map(r=>({id:r.id,backend:r.backend,model:r.model,billing:r.billing,billingBoundary:r.billingBoundary,capabilities:r.capabilities,checkedAt:r.checkedAt,source:r.source})),
       provenance:{mode:'ai',routeId:config.routeId,model:config.label,provider:config.provider,at:new Date().toISOString(),usage:output.usage??null}};
   }
   return {invoke,plannerConfig,propose};

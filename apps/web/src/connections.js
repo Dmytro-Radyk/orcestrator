@@ -10,6 +10,7 @@ const billingNames = {
 
 const authNames = {
   anonymous: 'Анонімний доступ (без входу)',
+  google: 'Вхід через Google · квота підписки',
   chatgpt: 'Вхід через ChatGPT',
   apiKey: 'API-ключ · оплата окремо',
   'claude.ai': 'Вхід через Claude',
@@ -102,7 +103,7 @@ export function renderConnections(catalog, scanning, { h, button, heading, loadi
         <small class="muted">${h(authNames[c.authType] ?? c.authType ?? '')}${c.version ? ' · ' + h(c.version) : ''}</small>
         ${c.subscriptionConfirmed ? '<p class="source-label ai">Підписку підтверджено</p>' : auth.isAnonymous ? '<p class="source-label ai">Безкоштовний / анонімний режим</p>' : ''}
         <p>${h(c.note)}</p>
-        ${renderQuota(c.quota, h)}
+        ${c.quotaScope === 'model-group' || c.id === 'antigravity' ? '<small class="muted">Квоти різняться за групами — наведені біля моделей нижче.</small>' : renderQuota(c.quota, h)}
       </article>`;
     }).join('') || '<div class="empty panel">Запустіть пошук підтримуваних інтеграцій.</div>'}</div>
     <section class="panel model-catalog">

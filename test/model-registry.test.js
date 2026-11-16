@@ -60,8 +60,8 @@ test('scan coalesces concurrent requests, persists sanitized data and does not t
     probes++;await new Promise(resolve=>setTimeout(resolve,10));return normalizeCodexMetadata({account:{account:{type:'chatgpt',planType:'plus',email:'PRIVATE'}},models:[{model:'model'}],limits:{rateLimits:{primary:{usedPercent:5}}}});
   }});
   const [a,b]=await Promise.all([registry.scan(),registry.scan()]);
-  assert.equal(probes,1);assert.equal(finds,4);assert.equal(a.scanning,false);assert.equal(b.scanning,false);
-  assert.equal(store.data.catalog.connections.length,4);assert.ok(!JSON.stringify(store.data).includes('PRIVATE'));
+  assert.equal(probes,1);assert.equal(finds,5);assert.equal(a.scanning,false);assert.equal(b.scanning,false);
+  assert.equal(store.data.catalog.connections.length,5);assert.ok(!JSON.stringify(store.data).includes('PRIVATE'));
   assert.ok(!JSON.stringify(store.data).includes('/trusted/codex'));
   await assert.rejects(registry.requireRoute('codex:model'),/Automatic reload/);assert.equal(probes,2);
 });

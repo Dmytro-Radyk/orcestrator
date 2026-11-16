@@ -1,6 +1,6 @@
 import { demoIdea, demoPlan, demoAssignments, validateIdea, validatePlan, validateAssignments } from './planning.js';
 
-export function createProjectWizard({ modal, h, icon, button, agents, onCreate, notify }) {
+export function createProjectWizard({ modal, h, icon, button, agents, onCreate, notify, refreshCatalog }) {
   let draft, config, step = 1, busy = false, controller, generation = 0;
   const dialog = document.querySelector('#modal');
   dialog.addEventListener('close', () => { generation++; controller?.abort(); busy = false; });
@@ -37,6 +37,7 @@ export function createProjectWizard({ modal, h, icon, button, agents, onCreate, 
   async function generate(kind, demo=false) {
     capture(); const ownDraft=draft, version=++generation; controller?.abort(); controller=new AbortController(); busy=true; draft.error=null; show();
     try {
+      if(kind==='team'&&!demo){await refreshCatalog?.();if(draft!==ownDraft||version!==generation||!dialog.open)return;controller.signal.throwIfAborted();}
       const input={name:draft.name,description:draft.description,priority:draft.priority,idea:draft.idea,feedback:draft.feedback,plan:draft.plan,...(kind==='team'?{agents:agents().map(({id,name,model,provider,skills,role})=>({id,name,model,provider,skills,role}))}:{})};
       let result;
       if (demo) result={value:kind==='idea'?demoIdea(input):kind==='plan'?demoPlan(input):demoAssignments(draft.plan,agents()),provenance:{mode:'demo',at:new Date().toISOString()}};

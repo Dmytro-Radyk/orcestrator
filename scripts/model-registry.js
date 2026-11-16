@@ -9,9 +9,10 @@ import { routeDecision,chooseManager,CATALOG_TTL_MS,DEFAULT_MODEL_POLICY,modelAc
 import { inspectOpenCode,executeOpenCode,OPENCODE_BINARY } from './opencode-service.js';
 import { executeFileWorker } from './file-worker.js';
 import { SubscriptionGuard } from './subscription-guard.js';
+import { inspectAntigravity,executeAntigravity } from './antigravity-service.js';
 
 const cwd=fileURLToPath(new URL('../',import.meta.url));
-const names={codex:'Codex',claude:'Claude Code',opencode:'OpenCode',ollama:'Ollama'};
+const names={codex:'Codex',claude:'Claude Code',opencode:'OpenCode',ollama:'Ollama',antigravity:'Antigravity / Gemini'};
 const paidPlans=new Set(['go','plus','pro','prolite','promax','team','self_serve_business_prolite']);
 const meteredPlans=new Set(['self_serve_business_usage_based','enterprise_cbp_usage_based','enterprise_cbp_automation']);
 async function exists(path){try{await access(path);return true;}catch{return false;}}
@@ -19,7 +20,7 @@ export async function locateCli(name,{env=process.env,platform=process.platform,
   const windows=platform==='win32',ext=windows?'.exe':'';
   const known=windows?[
     join(env.LOCALAPPDATA??join(home,'AppData','Local'),'Programs','OpenAI','Codex','bin','codex.exe'),
-    join(home,'.local','bin',name+ext),join(home,'.opencode','bin',name+ext),join(home,'.ollama',name+ext)
+    join(home,'.local','bin',name+ext),join(home,'.opencode','bin',name+ext),join(home,'.ollama',name+ext),join(home,'.gemini','bin',name+ext)
   ]:[join(home,'.local','bin',name),join(home,'.opencode','bin',name),join(home,'.bun','bin',name)];
   const paths=[...hints.filter(Boolean).map(p=>isAbsolute(p)?p:resolve(p)),...(name==='opencode'?[OPENCODE_BINARY]:[]),
     ...(env.PATH??env.Path??'').split(delimiter).filter(Boolean).map(p=>join(p,name+ext)),
@@ -76,7 +77,7 @@ export async function inspectCodex(command,{rpcFactory=metadataRpc,autoReloadDis
   }finally{clearTimeout(deadline);await rpc.close();}
 }
 
-export function createModelRegistry({store,env=process.env,find=locateCli,inspect=inspectCodex,inspectOpen=inspectOpenCode,run=runProcess}={}) {
+export function createModelRegistry({store,env=process.env,find=locateCli,inspect=inspectCodex,inspectOpen=inspectOpenCode,inspectAgy=inspectAntigravity,run=runProcess}={}) {
   let scanning,internalCommands=new Map();
   const subscriptionGuard=new SubscriptionGuard();
   const currentRoute=r=>r?.backend==='codex'&&r.subscriptionGuard?{...r,subscriptionGuard:{...r.subscriptionGuard,autoReloadDisabled:r.subscriptionGuard.autoReloadDisabled===true&&env.ORCHESTRATOR_CODEX_AUTO_RELOAD_DISABLED==='1'}}:r;
@@ -90,7 +91,7 @@ export function createModelRegistry({store,env=process.env,find=locateCli,inspec
     if(scanning){await scanning;return {...snapshot(),scanning:false};}
     scanning=(async()=>{
       const checkedAt=new Date().toISOString(),connections=[],routes=[];const commands=new Map();
-      const found=await Promise.all(Object.keys(names).map(async name=>[name,await find(name,{env,hints:name==='codex'?[env.ORCHESTRATOR_EXECUTOR_COMMAND,env.ORCHESTRATOR_PLANNER_COMMAND]:name==='opencode'?[env.ORCHESTRATOR_OPENCODE_COMMAND]:[]})]));
+      const found=await Promise.all(Object.keys(names).map(async name=>[name,await find(name==='antigravity'?'agy':name,{env,hints:name==='codex'?[env.ORCHESTRATOR_EXECUTOR_COMMAND,env.ORCHESTRATOR_PLANNER_COMMAND]:name==='opencode'?[env.ORCHESTRATOR_OPENCODE_COMMAND]:name==='antigravity'?[env.ORCHESTRATOR_ANTIGRAVITY_COMMAND]:[]})]));
       for(const [name,path] of found) {
         if(!path){connections.push({id:name,name:names[name],installed:false,authenticated:null,checkedAt,note:'Не знайдено native CLI у PATH або стандартних каталогах'});continue;}
         commands.set(name,path);
@@ -99,6 +100,9 @@ export function createModelRegistry({store,env=process.env,find=locateCli,inspec
         } else if(name==='opencode') {
           try{const normalized=await inspectOpen(path,{run,env});connections.push(normalized.connection);routes.push(...normalized.routes);}
           catch{connections.push({id:name,name:names[name],installed:true,authenticated:null,checkedAt,note:'Не вдалося перевірити ізольований metadata-каталог OpenCode V2; виклики заблоковані.'});}
+        } else if(name==='antigravity') {
+          try{const normalized=await inspectAgy(path,{run,env});connections.push(normalized.connection);routes.push(...normalized.routes);}
+          catch{connections.push({id:name,name:names[name],installed:true,authenticated:null,checkedAt,note:'Не підтверджено каталог, включену квоту або безпечну конфігурацію Antigravity. Оновіть CLI та перевірте вхід Google; активні hooks/MCP/plugins потребують окремої ізоляції.'});}
         } else if(name==='claude') {
           try{
             const info=JSON.parse(await run(path,['auth','status'],{cwd,prompt:'',signal:AbortSignal.timeout(8000)}));
@@ -133,13 +137,13 @@ export function createModelRegistry({store,env=process.env,find=locateCli,inspec
 }
 
 export function withModelPolicy(registry,provider) {
-  const invoke=provider??((agent,context)=>agent.provider==='opencode'?(agent.fileWorker?executeFileWorker(agent,context):executeOpenCode(agent,context)):execute(agent,context));
+  const invoke=provider??((agent,context)=>agent.provider==='antigravity'?(agent.fileWorker?executeFileWorker(agent,context,{model:(a,c)=>executeAntigravity(a,c)}):executeAntigravity(agent,context)):agent.provider==='opencode'?(agent.fileWorker?executeFileWorker(agent,context):executeOpenCode(agent,context)):execute(agent,context));
   return async(agent,context)=>{
     if(agent.provider==='demo')return invoke(agent,context);
-    if(!['codex','opencode'].includes(agent.provider))throw new Error('Маршрут цього провайдера ще не має підтверджених умов без додаткових списань');
+    if(!['codex','opencode','antigravity'].includes(agent.provider))throw new Error('Маршрут цього провайдера ще не має підтверджених умов без додаткових списань');
     const route=await registry.requireRoute(`${agent.provider}:${agent.model}`);
     if(route.backend!==agent.provider||route.model!==agent.model)throw new Error('Маршрут не відповідає обраній моделі');
-    if(agent.provider==='opencode'&&agent.access!=='read-only'&&!(agent.fileWorker===true&&route.capabilities?.workspaceWrite===true))throw new Error('OpenCode не має дозволу на запис файлів');
+    if(['opencode','antigravity'].includes(agent.provider)&&agent.access!=='read-only'&&!(agent.fileWorker===true&&route.capabilities?.workspaceWrite===true))throw new Error('Текстовий runtime не має дозволу на прямий запис файлів');
     if(route.billingBoundary==='subscription_quota_guarded') {
       if(typeof registry.guardSubscription!=='function')throw Error('Контроль виконання підписки не підключений');
       return registry.guardSubscription({authorize:()=>registry.requireRoute(route.id,{refresh:'subscription'}),signal:context.signal,onEvent:context.onEvent,

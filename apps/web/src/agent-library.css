@@ -1,0 +1,19 @@
+.agent-library { min-width: 0; }
+.agent-library-filters { display: grid; grid-template-columns: minmax(180px, 2fr) repeat(3, minmax(120px, 1fr)); gap: 14px; padding: 20px; background: var(--panel, #111c30); border: 1px solid var(--border, #2b3c5b); border-radius: 12px; }
+.agent-library-filters label { display: grid; gap: 8px; min-width: 0; font-size: 12px; color: #c1cce4; }
+.agent-library-filters input, .agent-library-filters select { width: 100%; min-width: 0; min-height: 44px; margin: 0; }
+.agent-library-summary { margin: 16px 0; font-size: 13px; }
+.agent-model-card { display: flex; flex-direction: column; min-width: 0; gap: 12px; }
+.agent-model-card h3 { font-size: 16px; line-height: 1.45; margin: 0; overflow-wrap: anywhere; }
+.agent-model-card .agent-model-id { min-height: 0; margin: 0; font-family: monospace; font-size: 12px; overflow-wrap: anywhere; }
+.agent-model-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.agent-model-card .agent-access-note { min-height: 0; margin: 0 0 8px; font-size: 12px; line-height: 1.6; color: #b4c4df; overflow-wrap: anywhere; }
+.agent-model-card .agent-card-bottom { margin-top: auto; flex-wrap: wrap; gap: 10px; }
+.agent-model-card .agent-card-top { margin-bottom: 2px; }
+.agent-model-card .text-button, .agent-model-card .small-btn { min-height: 44px; }
+.agent-role-profiles { margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border, #2b3c5b); }
+.agent-role-profiles > summary { cursor: pointer; padding: 12px 0; font-size: 16px; color: #d9e1f6; }
+.agent-role-profiles > p { margin: 12px 0 20px; line-height: 1.6; }
+.agent-library :is(input,select,button,summary):focus-visible { outline: 2px solid #b5a0ff; outline-offset: 3px; }
+@media (max-width: 1100px) { .agent-library-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .agent-library-filters { grid-template-columns: minmax(0, 1fr); padding: 16px; } .agent-model-card { padding: 20px; } }
