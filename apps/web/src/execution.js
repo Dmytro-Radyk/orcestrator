@@ -30,8 +30,8 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
     if(!routingStates.has(projectId))routingStates.set(projectId,{loading:false,proposing:false,error:null,proposal:null,stale:false,draftConfig:null,loadSeq:0,proposeSeq:0});
     return routingStates.get(projectId);
   }
-  async function call(path,method='GET',body) {
-    const response=await fetch(path,{method,headers:{'X-Execution-Token':token??'',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
+  async function call(path,method='GET',body,{signal}={}) {
+    const response=await fetch(path,{method,signal,headers:{'X-Execution-Token':token??'',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
     const data=await response.json();if(!response.ok)throw new Error(data.error??'Помилка сервера');return data;
   }
   function persist() {
@@ -45,6 +45,27 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
   }
   client.scheduleSave=()=>{if(ready&&!conflict){clearTimeout(timer);timer=setTimeout(()=>persist().catch(()=>{}),300);}};
   client.flush=()=>persist();
+  client.proposeDraft=(input,signal)=>{
+    if(!ready)throw Error('Дочекайтеся підключення до локального сервера');
+    return call('/api/routing/draft','POST',input,{signal});
+  };
+  client.createPlannedProject=({project,profiles,routingDraftId})=>{
+    if(!ready||conflict)throw Error('Оновіть сторінку для збереження проєкту на сервері');
+    clearTimeout(timer);client.saving=true;
+    const request=queue.then(async()=>{
+      if(conflict)throw Error('Конфлікт збереження: оновіть сторінку перед створенням проєкту');
+      const workspace=structuredClone(getState());
+      if(workspace.projects.some(p=>p.id===project.id))throw Error('Проєкт уже створено');
+      for(const profile of profiles)if(!workspace.agents.some(a=>a.id===profile.id))workspace.agents.push(profile);
+      workspace.projects.push(project);workspace.activeId=project.id;
+      const stored=await call('/api/workspace','PUT',{revision,workspace,...(routingDraftId?{routingDraftId,routingProjectId:project.id}:{})});
+      revision=stored.revision;setState(stored.workspace);saveLocal();
+      if(routingDraftId){const entry=ensureRouting(project.id);const data=await call(`/api/routing?projectId=${encodeURIComponent(project.id)}`).catch(()=>null);if(data){entry.proposal=data.proposal;entry.stale=data.stale;}}
+      return project;
+    });
+    queue=request.catch(error=>{if(error.message.includes('Конфлікт'))conflict=true;}).finally(()=>{client.saving=false;});
+    return request;
+  };
   client.routingState=projectId=>routingStates.get(projectId)??null;
   client.updateRoutingDraft=(projectId,patch)=>{
     if(!projectId)return;

@@ -1,7 +1,12 @@
 .agent-library { min-width: 0; }
 .agent-library-filters { display: grid; grid-template-columns: minmax(180px, 2fr) repeat(3, minmax(120px, 1fr)); gap: 14px; padding: 20px; background: var(--panel, #111c30); border: 1px solid var(--border, #2b3c5b); border-radius: 12px; }
-.agent-library-filters label { display: grid; gap: 8px; min-width: 0; font-size: 12px; color: #c1cce4; }
+.agent-library-filters label { display: grid; gap: 8px; min-width: 0; font-size: 12px; color: #c1cce4; margin-bottom: 0; }
 .agent-library-filters input, .agent-library-filters select { width: 100%; min-width: 0; min-height: 44px; margin: 0; }
+.agent-quick-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.filter-chip { min-height: 38px; padding: 6px 13px; border-radius: 999px; border: 1px solid #334361; background: #121c31; color: #b8c7e4; font-size: 12px; font-weight: 500; cursor: pointer; }
+.filter-chip:hover { border-color: #7d6fc2; color: #eef2ff; }
+.filter-chip.active { background: rgba(154, 134, 238, 0.22); border-color: #b7a5ff; color: #efeaff; font-weight: 600; }
+.filter-chip.reset { border-color: rgba(234, 162, 181, 0.48); color: #f2bccb; background: rgba(76, 30, 48, 0.35); }
 .agent-library-summary { margin: 16px 0; font-size: 13px; }
 .agent-model-card { display: flex; flex-direction: column; min-width: 0; gap: 12px; }
 .agent-model-card h3 { font-size: 16px; line-height: 1.45; margin: 0; overflow-wrap: anywhere; }
@@ -16,4 +21,4 @@
 .agent-role-profiles > p { margin: 12px 0 20px; line-height: 1.6; }
 .agent-library :is(input,select,button,summary):focus-visible { outline: 2px solid #b5a0ff; outline-offset: 3px; }
 @media (max-width: 1100px) { .agent-library-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 600px) { .agent-library-filters { grid-template-columns: minmax(0, 1fr); padding: 16px; } .agent-model-card { padding: 20px; } }
+@media (max-width: 600px) { .agent-library-filters { grid-template-columns: minmax(0, 1fr); padding: 14px; } .agent-model-card { padding: 18px; } .filter-chip { min-height: 42px; font-size: 12px; } }

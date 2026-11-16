@@ -1,0 +1,7 @@
+.creation-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.creation-fields > h3 { font-size: 18px; margin: 8px 0 17px; }
+.creation-fields:disabled { opacity: .72; }
+.creation-fields select { max-width: 100%; }
+.creation-fields .routing-cards article { overflow-wrap: anywhere; }
+.creation-fields > details { margin-block: 16px; }
+.creation-fields > details > summary { cursor: pointer; padding-block: 10px; }

@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { execute } from '../src/providers.js';
+import { chooseManager } from '../src/model-policy.js';
 import { validateIdea, validatePlan, validateAssignments } from '../apps/web/src/planning.js';
 
 export function plannerConfig(env = process.env) {
@@ -51,13 +52,17 @@ export function planningHandler(config = plannerConfig(), provider = execute) {
     const send = (code, data) => { res.writeHead(code, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store' }); res.end(JSON.stringify(data)); };
     const host = req.headers.host;
     if (!host || !/^127\.0\.0\.1:\d+$/.test(host) || (req.headers.origin && req.headers.origin !== `http://${host}`)) { send(403,{error:'Лише локальний same-origin доступ'}); return; }
-    if (req.url === '/api/planning/status' && req.method === 'GET') {
-      try { const current=config.resolve?await config.resolve():config,access=current.access?.();
+    const url=new URL(req.url,'http://localhost');
+    const managerRouteId=url.searchParams.get('managerRouteId')||undefined;
+    if (url.pathname === '/api/planning/status' && req.method === 'GET') {
+      try { const current=config.resolve?await config.resolve({preferred:managerRouteId}):config,access=current.access?.();
         send(200,{configured:current.configured&&(access?.allowed??true),blockedReason:access&&!access.allowed?access.reason:current.blockedReason??null,
-          model:current.label,provider:current.provider,routeId:current.routeId??null,reasoningEffort:current.agent?.reasoningEffort,token});
+          model:current.label,provider:current.provider,routeId:current.routeId??null,reasoningEffort:current.agent?.reasoningEffort,token,
+          ...(config.managerCatalog?{managerRoutes:config.managerCatalog().filter(route=>chooseManager([route])).map(route=>({id:route.id,name:route.name,model:route.model,backend:route.backend,
+            expiresAt:route.expiresAt,capabilities:route.capabilities,decision:{allowed:true}}))}:{})});
       }catch{send(200,{configured:false,blockedReason:'Не вдалося перевірити каталог керівників',token});}return;
     }
-    if (req.url !== '/api/planning' || req.method !== 'POST') { send(404,{error:'Not found'}); return; }
+    if (url.pathname !== '/api/planning' || req.method !== 'POST') { send(404,{error:'Not found'}); return; }
     const actual = Buffer.from(req.headers['x-planning-token'] ?? ''), expected = Buffer.from(token);
     if (actual.length !== expected.length || !timingSafeEqual(actual,expected) || !req.headers['content-type']?.startsWith('application/json')) { send(403,{error:'Оновіть сторінку для авторизованого запиту'}); return; }
     if (busy) { send(429,{error:'Планувальник уже працює. Дочекайтеся результату.'}); return; }
@@ -66,8 +71,10 @@ export function planningHandler(config = plannerConfig(), provider = execute) {
     res.on('close', () => { if (!res.writableEnded) controller.abort(); });
     try {
       let body = ''; for await (const chunk of req) { body += chunk; if (body.length > 200000) throw new Error('Завеликий опис проєкту'); }
-      const { kind, input } = JSON.parse(body);
-      const current=config.resolve?await config.resolve({refresh:true}):config;
+      const { kind, input,managerRouteId:preferred } = JSON.parse(body);
+      if(preferred!==undefined&&(typeof preferred!=='string'||!preferred||preferred.length>300))throw Error('Некоректний маршрут керівника');
+      if(preferred&&!config.resolve)throw Error('Вибір керівника потребує підключеного каталогу моделей');
+      const current=config.resolve?await config.resolve({refresh:true,preferred}):config;
       const result = await generatePlanning(kind, input, current, provider, AbortSignal.any([controller.signal,AbortSignal.timeout(TIMEOUT_MS)]));
       send(200,result);
     } catch (error) { if (!res.destroyed) send(400,{error:error.message}); }

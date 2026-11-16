@@ -87,6 +87,7 @@ export function renderAgentLibrary(catalog,profiles,filters,{h,icon,button,avata
   const backends=[...new Set(items.map(i=>i.profile.backend))].sort();
   const select=(key,label,options)=>`<label>${label}<select data-agent-filter="${key}" id="agent-filter-${key}">${options.map(([value,text])=>`<option value="${h(value)}" ${filters[key]===value?'selected':''}>${h(text)}</option>`).join('')}</select></label>`;
   const roleProfiles=profiles.filter(p=>p.source!=='catalog');
+  const hasFilter=Boolean(filters.query||filters.backend||filters.billing||(filters.status&&filters.status!=='all'));
   return `<section class="agent-library" aria-label="Каталог агентів">
     <div class="section-heading"><div><h2>Моделі для агентів <span class="count">${items.length}</span></h2><p class="muted">Codex, OpenCode та Antigravity — моделі з підключених CLI.</p></div>${button('scan-connections',loading?'Оновлення…':'Оновити доступ','search','btn small-btn',loading?'disabled':'')}</div>
     ${loading?'<p class="planning-busy" role="status">Перевіряємо підключення й квоти моделей…</p>':''}
@@ -96,6 +97,13 @@ export function renderAgentLibrary(catalog,profiles,filters,{h,icon,button,avata
       ${select('backend','Провайдер',[['','Усі провайдери'],...backends.map(b=>[b,providerNames[b]??b])])}
       ${select('billing','Доступ',[['','Усі тарифи'],['free_tier','Безкоштовні'],['subscription_included','За підпискою']])}
       ${select('status','Стан',[['all','Усі моделі'],['available','Доступні зараз'],['blocked','Потребують перевірки']])}
+    </div>
+    <div class="agent-quick-filters" role="group" aria-label="Швидкі фільтри моделей">
+      <button type="button" class="filter-chip ${!hasFilter?'active':''}" data-action="agent-library-reset" aria-pressed="${!hasFilter}">Усі (${items.length})</button>
+      <button type="button" class="filter-chip ${filters.status==='available'?'active':''}" data-action="agent-filter-preset" data-status="available" aria-pressed="${filters.status==='available'}">Доступні зараз (${available})</button>
+      <button type="button" class="filter-chip ${filters.billing==='free_tier'?'active':''}" data-action="agent-filter-preset" data-billing="free_tier" aria-pressed="${filters.billing==='free_tier'}">Безкоштовні</button>
+      <button type="button" class="filter-chip ${filters.billing==='subscription_included'?'active':''}" data-action="agent-filter-preset" data-billing="subscription_included" aria-pressed="${filters.billing==='subscription_included'}">За підпискою</button>
+      ${hasFilter?`<button type="button" class="filter-chip reset" data-action="agent-library-reset">Скинути фільтри</button>`:''}
     </div>
     <p class="muted agent-library-summary" data-live-key="agent-library-summary" role="status" aria-live="polite">Показано ${shown.length} з ${items.length} · доступні зараз: ${available}</p>
     <div class="agent-grid agent-model-grid" data-live-key="agent-model-grid">${shown.map(item=>{

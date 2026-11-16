@@ -13,16 +13,19 @@ async function until(fn){for(let n=0;n<2500;n++){if(await fn())return;await dela
 const route=(model,backend='opencode')=>({id:`${backend}:${model}`,connectionId:backend,backend,model,name:model,
   checkedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+300000).toISOString(),availability:'ready',billing:'free_tier',freeConfirmed:true,billingBoundary:'included_only',runtimeSupported:true,
   capabilities:{workspaceWrite:backend==='opencode',structuredOutput:true,tools:false},decision:{allowed:true,reason:'Fixture only'}});
-async function fixture(t,{policy={enabled:true,maxAttempts:2},maxCalls=8,failCode='MODEL_ACCESS_BLOCKED',alwaysFail=false,failedModels=['opencode/bad'],manager,modify,worker}={}){
+async function fixture(t,{policy={enabled:true,maxAttempts:2},maxCalls=8,failCode='MODEL_ACCESS_BLOCKED',alwaysFail=false,failedModels=['opencode/bad'],manager,modify,worker,routingManagerRouteId}={}){
   const owned=resolve('.orchestrator/tests');await mkdir(owned,{recursive:true});const dir=await mkdtemp(join(owned,'recovery-'));
   const routes=[route('manager','codex'),route('opencode/bad'),route('opencode/good'),route('opencode/check')];
-  let managerCalls=0;const invocations=[];
+  let managerCalls=0;const invocations=[],managerModels=[];
   const registry={snapshot:()=>({routes,connections:[]}),scan:async()=>registry.snapshot(),requireRoute:async id=>{
     const found=routes.find(r=>r.id===id);assert.ok(found,id);return {...found,command:'fixture-executable'};
   }};
   const service=createExecutionService({directory:join(dir,'data'),workspaces:join(dir,'workspaces'),registry,provider:async(agent,ctx)=>{
     if(ctx.prompt.includes('TaskBrief:')){
       managerCalls++;const brief=JSON.parse(ctx.prompt.split('TaskBrief: ')[1]);
+      managerModels.push(agent.model);
+      if(routingManagerRouteId&&brief.tasks.length===3)return{text:JSON.stringify({assignments:brief.tasks.map(task=>({taskId:task.id,
+        routeIds:[`opencode:opencode/${task.id==='a'?'good':task.id==='b'?'bad':'check'}`],reason:'Initial fixture assignment with explicitly selected manager'}))})};
       assert.ok(brief.tasks.every(t=>!t.candidateRouteIds.includes('opencode:opencode/bad')));
       if(manager)return manager(agent,ctx,brief);
       return{text:JSON.stringify({assignments:brief.tasks.map(task=>({taskId:task.id,routeIds:[task.candidateRouteIds.find(id=>id.startsWith('opencode:'))],reason:'Alternate free route after the recorded failure'}))}),usage:{cost:0,input_tokens:2,output_tokens:3}};
@@ -46,12 +49,47 @@ async function fixture(t,{policy={enabled:true,maxAttempts:2},maxCalls=8,failCod
   p.tasks=[{id:'a',title:'accepted',prompt:'Preserve this accepted file',agentIds:['architect'],dependsOn:[]},
     {id:'b',title:'failed',prompt:'Create recovered.txt',agentIds:['backend'],dependsOn:['a']},
     {id:'c',title:'downstream',prompt:'Verify files',agentIds:['reviewer'],dependsOn:['b']}];modify?.(p);
+  if(routingManagerRouteId)p.tasks.forEach(task=>{task.acceptanceCriteria=['Required fixture file verified'];});
   assert.equal((await call('/api/workspace','PUT',{revision:0,workspace})).status,200);
   const bindings={architect:'opencode:opencode/good#write',backend:'opencode:opencode/bad#write',reviewer:'opencode:opencode/check#read'};
-  const launch=await call('/api/execution/runs','POST',{projectId:p.id,revision:p.revision,bindings});assert.equal(launch.status,202,JSON.stringify(launch.value));
+  let proposalId;
+  if(routingManagerRouteId){
+    const proposal=await call('/api/routing','POST',{projectId:p.id,revision:p.revision,managerRouteId:routingManagerRouteId,
+      requirements:{a:{workspaceWrite:true},b:{workspaceWrite:true},c:{workspaceWrite:false}}});
+    assert.equal(proposal.status,200,JSON.stringify(proposal.value));proposalId=proposal.value.id;
+  }
+  const launch=await call('/api/execution/runs','POST',{projectId:p.id,revision:p.revision,bindings,...(proposalId?{proposalId}:{})});assert.equal(launch.status,202,JSON.stringify(launch.value));
   const run=service.engine.run(launch.value.id);
-  return {service,run,call,url,token,p,workspace,dir,invocations,managerCalls:()=>managerCalls,settle:()=>until(()=>!['running','paused'].includes(run.status)&&!service.engine.controls.get(run.id).recovering)};
+  return {service,run,call,url,token,p,workspace,dir,invocations,managerModels,routes,managerCalls:()=>managerCalls,settle:()=>until(()=>!['running','paused'].includes(run.status)&&!service.engine.controls.get(run.id).recovering)};
 }
+
+for(const override of [false,true])test(`pinned recovery manager follows ${override?'the explicit project override':'the saved routing selection'} through a real failed task`,async t=>{
+  const routingManagerRouteId='opencode:opencode/check',expected=override?'manager':'opencode/check';
+  const f=await fixture(t,{routingManagerRouteId,policy:{enabled:true,maxAttempts:2,...(override?{managerRouteId:'codex:manager'}:{})}});
+  await f.settle();assert.equal(f.run.status,'completed');assert.equal(f.run.calls,5);
+  assert.deepEqual(f.managerModels,['opencode/check',expected]);
+  assert.equal(f.run.project.recovery.managerRouteId,override?'codex:manager':routingManagerRouteId);
+  assert.equal(f.run.recovery.rounds[0].manager.model,expected);
+  assert.equal(f.invocations.filter(i=>i.id==='accepted').length,1);
+  assert.equal(await readFile(join(f.run.project.workspace,'recovered.txt'),'utf8'),'recovered');
+});
+
+test('pinned recovery manager becoming unavailable stops before any fallback director or replacement worker call',async t=>{
+  let failReady=false,releaseFailure;const gate=new Promise(resolve=>{releaseFailure=resolve;});
+  const routingManagerRouteId='opencode:opencode/check';
+  const f=await fixture(t,{routingManagerRouteId,worker:async(agent,ctx,id)=>{
+    if(id==='failed'&&agent.model==='opencode/bad'){failReady=true;await gate;}
+  }});
+  try{
+    await until(()=>failReady);f.routes.find(r=>r.id===routingManagerRouteId).availability='unavailable';releaseFailure();await f.settle();
+    assert.equal(f.run.status,'failed');assert.equal(f.run.calls,2);assert.equal(f.run.recovery.rounds.length,1);
+    assert.match(f.run.recovery.reason,/Обраний маршрут керівника недоступний/);
+    assert.deepEqual(f.managerModels,['opencode/check']);assert.equal(f.managerCalls(),1);
+    assert.equal(f.invocations.filter(i=>i.id==='failed').length,1);assert.equal(f.invocations.some(i=>i.id==='downstream'),false);
+    assert.equal(await readFile(join(f.run.project.workspace,'accepted.txt'),'utf8'),'accepted once');
+    await assert.rejects(access(join(f.run.project.workspace,'recovered.txt')));
+  }finally{releaseFailure();}
+});
 
 test('automatic recovery keeps the same run, accepted results and dependency graph; SSE carries the new assignment through to final completion',async t=>{
   const f=await fixture(t),response=await fetch(`${f.url}/api/execution/runs/${f.run.id}/events`,{headers:{'X-Execution-Token':f.token},signal:AbortSignal.timeout(30000)});

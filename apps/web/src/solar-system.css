@@ -10,6 +10,13 @@
   user-select: none;
 }
 
+.solar-stage-box {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
 .solar-viewport.is-compact {
   height: 410px;
   margin-bottom: 24px;
@@ -110,14 +117,21 @@
 
 .solar-target-select {
   pointer-events: auto;
-  max-width: 195px;
-  min-height: 30px;
-  padding: 4px 10px;
+  width: auto;
+  max-width: 210px;
+  height: 34px;
+  min-height: 34px;
+  margin-top: 0;
+  padding: 0 10px;
   border-radius: 999px;
   background: rgba(8, 18, 34, 0.86);
   border: 1px solid rgba(72, 138, 189, 0.45);
   color: #dbeeff;
   font-size: 11px;
+  line-height: 32px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-family: inherit;
   backdrop-filter: blur(8px);
   cursor: pointer;
@@ -611,29 +625,71 @@
 }
 
 @media (max-width: 780px) {
-  .solar-viewport { height: 520px; min-height: 460px; }
+  .solar-viewport:not(.is-fullscreen) {
+    height: auto;
+    min-height: 0;
+  }
+  .solar-viewport:not(.is-fullscreen) .solar-stage-box {
+    height: 440px;
+  }
+  .solar-viewport.is-compact:not(.is-fullscreen) .solar-stage-box {
+    height: 400px;
+  }
   .solar-legend-pills { display: none; }
   .solar-hud-top { left: 10px; right: 10px; top: 10px; flex-direction: column; gap: 6px; }
   .solar-hud-controls { width: 100%; justify-content: flex-start; }
-  .solar-target-select { max-width: 100%; width: 100%; }
+  .solar-target-select { max-width: 100%; width: 100%; height: 44px; min-height: 44px; line-height: 42px; font-size: 12px; }
   .solar-brand-pill { max-width: 100%; width: 100%; }
-  .solar-dock { top: auto; bottom: 68px; left: 10px; right: 10px; max-width: calc(100% - 20px); transform: none; flex-direction: row; flex-wrap: wrap; justify-content: center; gap: 6px; padding: 4px 6px; }
-  .solar-dock-btn { width: 32px; height: 32px; }
-  .solar-inspector-slot {
-    left: 10px;
-    right: 10px;
-    top: 96px;
-    bottom: 64px;
-    max-height: none;
+  .solar-dock {
+    top: auto;
+    bottom: 70px;
+    left: 8px;
+    right: 8px;
+    max-width: calc(100% - 16px);
+    transform: none;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    justify-content: safe center;
+    gap: 4px;
+    padding: 4px 6px;
+    scrollbar-width: thin;
   }
-  .solar-inspector { width: 100%; max-height: 100%; }
-  .solar-bottom-bar { max-width: calc(100% - 16px); gap: 6px; padding: 5px 10px; flex-wrap: wrap; justify-content: center; border-radius: 14px; }
-  .solar-time-readout { display: none; }
+  .solar-dock-btn { width: 44px; height: 44px; flex-shrink: 0; }
+  .solar-play-btn { width: 44px; height: 44px; flex-shrink: 0; }
+  .solar-sim-btn { min-height: 44px; padding: 4px 12px; font-size: 11px; flex-shrink: 0; }
+  .solar-viewport:not(.is-fullscreen) .solar-inspector-slot {
+    position: static;
+    width: 100%;
+    max-height: none;
+    pointer-events: auto;
+    border-top: 1px solid rgba(72, 138, 189, 0.35);
+    background: rgba(7, 13, 25, 0.96);
+  }
+  .solar-viewport:not(.is-fullscreen) .solar-inspector {
+    width: 100%;
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    backdrop-filter: none;
+    padding: 14px;
+  }
+  .solar-inspector .solar-close,
+  .solar-inspector .solar-ctrl-btn,
+  .solar-inspector .solar-link-btn,
+  .solar-inspector .solar-list-item { min-height: 44px; }
+  .solar-inspector .solar-close { width: 44px; height: 44px; font-size: 18px; }
+  .solar-bottom-bar { max-width: calc(100% - 16px); height: 54px; bottom: 8px; gap: 8px; padding: 3px 10px; flex-wrap: nowrap; justify-content: center; border-radius: 999px; }
+  .solar-time-readout, .solar-rate-tag { display: none; }
 }
 
 @media (max-width: 480px) {
-  .solar-viewport { height: 490px; min-height: 430px; }
-  .solar-rate-tag { display: none; }
+  .solar-viewport:not(.is-fullscreen) .solar-stage-box { height: 390px; }
+  .solar-viewport.is-compact:not(.is-fullscreen) .solar-stage-box { height: 370px; }
+  .solar-dock { justify-content: flex-start; gap: 3px; padding: 4px; bottom: 70px; }
+  .solar-dock-btn { width: 44px; height: 44px; flex-shrink: 0; }
+  .solar-bottom-bar { bottom: 8px; gap: 6px; padding: 3px 8px; height: 54px; }
   .solar-brand-pill strong { font-size: 10px; letter-spacing: .06em; }
   .solar-brand-pill small { font-size: 10px; }
 }

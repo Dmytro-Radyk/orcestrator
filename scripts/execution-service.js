@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Engine } from '../src/engine.js';
 import { Store } from '../src/store.js';
 import { validateTasks } from '../apps/web/src/state.js';
+import { validatePlan } from '../apps/web/src/planning.js';
 import { createModelRegistry,withModelPolicy } from './model-registry.js';
 import { createDirector,planFingerprint,routingCandidates,validateRouteAssignments } from './director-service.js';
 import { WorkspaceManager } from '../src/workspaces.js';
@@ -46,6 +47,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
   const token=randomBytes(32).toString('hex');
   const launching=new Set();
   const routingControls=new Map();
+  const draftProposals=new Map(),draftRoutingKey=Symbol('draft-routing');
   const streams=new Set();
   const routingPlan=p=>({summary:p.description||p.name,assumptions:[],risks:[],tasks:p.tasks.filter(t=>!t.parentId).map(t=>({
     id:t.id,title:t.title,prompt:t.prompt,skills:t.skills??[],dependsOn:t.dependsOn,acceptanceCriteria:t.acceptanceCriteria??[]}))});
@@ -87,7 +89,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>5*1024*1024)throw new Error('Завеликий запит');}
     return raw?JSON.parse(raw):{};
   }
-  function saveWorkspace(input) {
+  async function saveWorkspace(input) {
     if(input.revision!==(store.data.ui?.revision??0)) throw new Error('Конфлікт збереження: оновіть сторінку, щоб отримати актуальні дані');
     const value=input.workspace;
     if(value?.version!==1 || !Array.isArray(value.projects) || !value.projects.length || !Array.isArray(value.agents) || !value.agents.length || value.projects.length>100 || value.agents.length>100) throw new Error('Некоректний робочий простір');
@@ -96,7 +98,21 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       if(typeof p.id!=='string'||!p.id||ids.has(p.id)||typeof p.name!=='string'||!p.name.trim()||!Array.isArray(p.tasks)||p.tasks.length>100)throw new Error('Некоректний проєкт');
       ids.add(p.id);validateTasks(p.tasks);
     }
-    store.data.ui={revision:input.revision+1,workspace:structuredClone(value)};store.save();return store.data.ui;
+    let adopted;
+    if(input.routingDraftId!==undefined){
+      const draft=draftProposals.get(input.routingDraftId),p=value.projects.find(p=>p.id===input.routingProjectId);
+      if(!draft||draft.expiresAt<=Date.now())throw Error('Підбір команди застарів: повторіть його в майстрі');
+      if(!p||store.data.ui?.workspace.projects.some(old=>old.id===p.id)||p.revision!==1||draft.proposal.planFingerprint!==planFingerprint(routingPlan(p)))throw Error('План змінився після підбору команди');
+      await registry.scan();
+      validateRouteAssignments(draft.proposal,routingPlan(p),routingCandidates(routingPlan(p),registry.snapshot().routes,draft.proposal.requirements),{maxAgentsPerTask:draft.proposal.maxAgentsPerTask});
+      if(input.revision!==(store.data.ui?.revision??0))throw Error('Конфлікт збереження: оновіть сторінку, щоб отримати актуальні дані');
+      if(draftProposals.get(input.routingDraftId)!==draft||draft.expiresAt<=Date.now())throw Error('Підбір команди застарів: повторіть його в майстрі');
+      adopted={...draft.proposal,projectId:p.id,revision:p.revision};
+    }
+    if(adopted){store.data.routing??={};store.data.routing[adopted.projectId]=adopted;}
+    store.data.ui={revision:input.revision+1,workspace:structuredClone(value)};store.save();
+    if(adopted)draftProposals.delete(input.routingDraftId);
+    return store.data.ui;
   }
   async function launchReady(input) {
     const p=uiProject(input.projectId);
@@ -159,6 +175,25 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       if(['POST','PUT'].includes(req.method)&&!req.headers['content-type']?.startsWith('application/json'))return send(415,{error:'Потрібен JSON'});
       if(req.method==='GET'&&url.pathname==='/api/connections')return send(200,registry.snapshot());
       if(req.method==='POST'&&url.pathname==='/api/connections/scan')return send(200,await registry.scan());
+      if(req.method==='POST'&&url.pathname==='/api/routing/draft'){
+        const input=await readBody(req);validatePlan(input.plan);
+        if(typeof input.name!=='string'||!input.name.trim()||input.name.length>80||typeof input.description!=='string'||!input.description.trim()||input.description.length>12000)throw Error('Потрібні назва та опис проєкту');
+        if(input.requirements!==undefined&&(!input.requirements||typeof input.requirements!=='object'||Array.isArray(input.requirements)||Object.keys(input.requirements).some(id=>!input.plan.tasks.some(t=>t.id===id))))throw Error('Некоректні вимоги задач');
+        if(routingControls.has(draftRoutingKey))throw Error('Підбір команди в майстрі вже триває');
+        const plan=routingPlan({name:input.name,description:input.description,tasks:input.plan.tasks});
+        const requirements=Object.fromEntries(plan.tasks.map(t=>[t.id,{workspaceWrite:true,...input.requirements?.[t.id]}]));
+        const controller=new AbortController();routingControls.set(draftRoutingKey,controller);
+        res.on('close',()=>{if(!res.writableEnded)controller.abort();});
+        try{
+          const proposal=await director.propose({plan,requirements,managerRouteId:input.managerRouteId,priority:input.priority,maxAgentsPerTask:input.maxAgentsPerTask},
+            AbortSignal.any([controller.signal,AbortSignal.timeout(120000)]));
+          controller.signal.throwIfAborted();
+          for(const [id,draft] of draftProposals)if(draft.expiresAt<=Date.now())draftProposals.delete(id);
+          while(draftProposals.size>=20)draftProposals.delete(draftProposals.keys().next().value);
+          const expiresAt=Date.now()+30*60*1000;draftProposals.set(proposal.id,{proposal,expiresAt});
+          return send(200,{...proposal,expiresAt:new Date(expiresAt).toISOString()});
+        }finally{routingControls.delete(draftRoutingKey);}
+      }
       if(url.pathname==='/api/routing') {
         if(req.method==='GET'){const p=uiProject(url.searchParams.get('projectId'));const proposal=store.data.routing?.[p.id]??null;
           return send(200,{proposal,stale:proposal?proposal.revision!==p.revision||proposal.planFingerprint!==planFingerprint(routingPlan(p)):false});}
@@ -185,7 +220,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       }
       if(url.pathname==='/api/workspace') {
         if(req.method==='GET')return send(200,store.data.ui??{revision:0,workspace:null});
-        if(req.method==='PUT')return send(200,saveWorkspace(await readBody(req)));
+        if(req.method==='PUT')return send(200,await saveWorkspace(await readBody(req)));
       }
       if(url.pathname==='/api/execution/preview'&&req.method==='POST') {
         await registry.scan();

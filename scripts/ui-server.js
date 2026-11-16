@@ -13,7 +13,7 @@ const root = fileURLToPath(new URL('../apps/web/', import.meta.url));
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' };
 const execution = createExecutionService();
 // A pinned director is optional. Automatic selection uses only verified, allowed routes.
-const planning = planningHandler({resolve:options=>execution.director.plannerConfig(options)},execution.director.invoke);
+const planning = planningHandler({resolve:options=>execution.director.plannerConfig(options),managerCatalog:()=>execution.registry.snapshot().routes},execution.director.invoke);
 const server = createServer(async (req, res) => {
   try {
     if (req.url?.startsWith('/api/')) { await (req.url.startsWith('/api/planning') ? planning : execution.handler)(req,res); return; }

@@ -482,77 +482,80 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
 
   container.innerHTML = `
     <div class="solar-viewport ${uiState.fullscreen ? 'is-fullscreen' : ''} ${callbacks.compact ? 'is-compact' : ''}">
-      <canvas class="solar-canvas-gl" tabindex="0" aria-label="Інтерактивна 3D-сцена сонячної системи. Стрілки вліво і вправо перемикають об’єкт, пробіл призупиняє орбіти, R центрує на Сонці."></canvas>
-      <canvas class="solar-canvas-hud" aria-hidden="true"></canvas>
-      <div class="solar-hud-top">
-        <div class="solar-brand-pill">
-          <span class="solar-beacon"></span>
-          <div>
-            <strong>SOLAR ORCHESTRATOR</strong>
-            <small class="solar-project-sub">${h(model.sun.name)} · ${model.planets.length} моделей · ${model.totalMoons} субагентів</small>
+      <div class="solar-stage-box">
+        <canvas class="solar-canvas-gl" tabindex="0" aria-label="Інтерактивна 3D-сцена сонячної системи. Стрілки вліво і вправо перемикають об’єкт, пробіл призупиняє орбіти, R центрує на Сонці."></canvas>
+        <canvas class="solar-canvas-hud" aria-hidden="true"></canvas>
+        <div class="solar-hud-top">
+          <div class="solar-brand-pill">
+            <span class="solar-beacon"></span>
+            <div>
+              <strong>SOLAR ORCHESTRATOR</strong>
+              <small class="solar-project-sub">${h(model.sun.name)} · ${model.planets.length} моделей · ${model.totalMoons} субагентів</small>
+            </div>
+          </div>
+          <div class="solar-hud-controls">
+            <label class="solar-sr-only" for="solar-target-picker">Ціль камери</label>
+            <select id="solar-target-picker" class="solar-target-select" aria-label="Обрати ціль камери у сонячній системі"></select>
+            <div class="solar-legend-pills">
+              <span class="solar-pill sun"><i></i>Сонце: Оркестратор</span>
+              <span class="solar-pill planet"><i></i>Планети: Моделі</span>
+              <span class="solar-pill moon"><i></i>Супутники: Субагенти</span>
+            </div>
           </div>
         </div>
-        <div class="solar-hud-controls">
-          <label class="solar-sr-only" for="solar-target-picker">Ціль камери</label>
-          <select id="solar-target-picker" class="solar-target-select" aria-label="Обрати ціль камери у сонячній системі"></select>
-          <div class="solar-legend-pills">
-            <span class="solar-pill sun"><i></i>Сонце: Оркестратор</span>
-            <span class="solar-pill planet"><i></i>Планети: Моделі</span>
-            <span class="solar-pill moon"><i></i>Супутники: Субагенти</span>
-          </div>
-        </div>
-      </div>
-      <div class="solar-live-announce solar-sr-only" aria-live="polite"></div>
+        <div class="solar-live-announce solar-sr-only" aria-live="polite"></div>
 
-      <div class="solar-dock" role="toolbar" aria-label="Керування 3D-картою і камерою">
-        <button type="button" class="solar-dock-btn" data-solar-action="select-sun" aria-label="Інспектор оркестратора (Сонце)" title="Інспектор оркестратора (Сонце)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="prev-target" aria-label="Попередній об’єкт" title="Попередній об’єкт (←)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="next-target" aria-label="Наступний об’єкт" title="Наступний об’єкт (→)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn ${uiState.showGrid ? 'active' : ''}" data-solar-action="toggle-grid" aria-label="Показати або приховати орбіти" aria-pressed="${uiState.showGrid}" title="Орбіти">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="9" ry="4"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="zoom-in" aria-label="Наблизити камеру" title="Наблизити (+)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="zoom-out" aria-label="Віддалити камеру" title="Віддалити (−)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M5 12h14"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn ${uiState.showLabels ? 'active' : ''}" data-solar-action="toggle-labels" aria-label="Показати або приховати підписи" aria-pressed="${uiState.showLabels}" title="Підписи">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn" data-solar-action="reset-camera" aria-label="Центрувати камеру на Сонці" title="Центрувати на Сонці (Home / R)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg>
-        </button>
-        <button type="button" class="solar-dock-btn ${uiState.fullscreen ? 'active' : ''}" data-solar-action="toggle-fullscreen" aria-label="Повноекранний режим" aria-pressed="${uiState.fullscreen}" title="На весь екран">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 3H3v5m18-5h-5m5 0v5M3 16v5h5m13-5v5h-5"/></svg>
-        </button>
+        <div class="solar-dock" role="toolbar" aria-label="Керування 3D-картою і камерою">
+          <button type="button" class="solar-dock-btn" data-solar-action="select-sun" aria-label="Інспектор оркестратора (Сонце)" title="Інспектор оркестратора (Сонце)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn" data-solar-action="prev-target" aria-label="Попередній об’єкт" title="Попередній об’єкт (←)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn" data-solar-action="next-target" aria-label="Наступний об’єкт" title="Наступний об’єкт (→)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn ${uiState.showGrid ? 'active' : ''}" data-solar-action="toggle-grid" aria-label="Показати або приховати орбіти" aria-pressed="${uiState.showGrid}" title="Орбіти">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="9" ry="4"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn" data-solar-action="zoom-in" aria-label="Наблизити камеру" title="Наблизити (+)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn" data-solar-action="zoom-out" aria-label="Віддалити камеру" title="Віддалити (−)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M5 12h14"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn ${uiState.showLabels ? 'active' : ''}" data-solar-action="toggle-labels" aria-label="Показати або приховати підписи" aria-pressed="${uiState.showLabels}" title="Підписи">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn" data-solar-action="reset-camera" aria-label="Центрувати камеру на Сонці" title="Центрувати на Сонці (Home / R)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg>
+          </button>
+          <button type="button" class="solar-dock-btn ${uiState.fullscreen ? 'active' : ''}" data-solar-action="toggle-fullscreen" aria-label="Повноекранний режим" aria-pressed="${uiState.fullscreen}" title="На весь екран">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 3H3v5m18-5h-5m5 0v5M3 16v5h5m13-5v5h-5"/></svg>
+          </button>
+        </div>
+
+        <div class="solar-bottom-bar">
+          <button type="button" class="solar-play-btn" data-solar-action="toggle-motion" aria-label="${uiState.motionPaused ? 'Відновити рух орбіт' : 'Пауза руху орбіт'}" aria-pressed="${uiState.motionPaused}" title="${uiState.motionPaused ? 'Відновити рух орбіт' : 'Пауза руху орбіт'}">
+            ${uiState.motionPaused ? '▶' : '❚❚'}
+          </button>
+          <span class="solar-live-tag ${tb.liveClass}"><i></i><span class="solar-live-text">${h(tb.liveLabel)}</span></span>
+          <span class="solar-time-readout">${h(tb.dateStr)}</span>
+          <span class="solar-rate-tag">${uiState.motionPaused ? 'ORBITS PAUSED' : 'REAL RATE'}</span>
+          <span class="solar-time-readout solar-clock-readout">${h(tb.timeStr)}</span>
+          ${callbacks.onRunAction ? `
+            <button type="button" class="solar-sim-btn" data-solar-action="run-control" ${model.sun.draining ? 'disabled' : ''}>
+              ${model.sun.draining ? 'Зупиняється…' : model.sun.status === 'running' ? 'Пауза' : model.sun.status === 'paused' ? 'Продовжити' : callbacks.canRealStart ? 'Запустити AI' : 'Запустити демо'}
+            </button>` : ''}
+        </div>
       </div>
 
       <div class="solar-inspector-slot"></div>
-
-      <div class="solar-bottom-bar">
-        <button type="button" class="solar-play-btn" data-solar-action="toggle-motion" aria-label="${uiState.motionPaused ? 'Відновити рух орбіт' : 'Пауза руху орбіт'}" aria-pressed="${uiState.motionPaused}" title="${uiState.motionPaused ? 'Відновити рух орбіт' : 'Пауза руху орбіт'}">
-          ${uiState.motionPaused ? '▶' : '❚❚'}
-        </button>
-        <span class="solar-live-tag ${tb.liveClass}"><i></i><span class="solar-live-text">${h(tb.liveLabel)}</span></span>
-        <span class="solar-time-readout">${h(tb.dateStr)}</span>
-        <span class="solar-rate-tag">${uiState.motionPaused ? 'ORBITS PAUSED' : 'REAL RATE'}</span>
-        <span class="solar-time-readout solar-clock-readout">${h(tb.timeStr)}</span>
-        ${callbacks.onRunAction ? `
-          <button type="button" class="solar-sim-btn" data-solar-action="run-control" ${model.sun.draining ? 'disabled' : ''}>
-            ${model.sun.draining ? 'Зупиняється…' : model.sun.status === 'running' ? 'Пауза' : model.sun.status === 'paused' ? 'Продовжити' : callbacks.canRealStart ? 'Запустити AI' : 'Запустити демо'}
-          </button>` : ''}
-      </div>
     </div>
   `;
 
   const viewport = container.querySelector('.solar-viewport');
+  const stageBox = container.querySelector('.solar-stage-box');
   const glCanvas = container.querySelector('.solar-canvas-gl');
   const hudCanvas = container.querySelector('.solar-canvas-hud');
   const inspectorSlot = container.querySelector('.solar-inspector-slot');
@@ -581,19 +584,19 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
   let lastY = 0;
   let rafId = 0;
   let lastFrame = performance.now();
-  let viewportW = viewport.clientWidth || 800;
-  let viewportH = viewport.clientHeight || 500;
+  let viewportW = stageBox.clientWidth || 800;
+  let viewportH = stageBox.clientHeight || 500;
   let perfFrames = 0;
   let perfSumMs = 0;
   let perfMaxMs = 0;
 
   const resizeObserver = typeof ResizeObserver === 'function'
     ? new ResizeObserver(() => {
-      viewportW = viewport.clientWidth || 800;
-      viewportH = viewport.clientHeight || 500;
+      viewportW = stageBox.clientWidth || 800;
+      viewportH = stageBox.clientHeight || 500;
     })
     : null;
-  resizeObserver?.observe(viewport);
+  resizeObserver?.observe(stageBox);
 
   function syncTargetPicker() {
     if (!targetPicker) return;
@@ -613,8 +616,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
 
   function syncHud() {
     viewport.classList.toggle('is-fullscreen', uiState.fullscreen);
-    viewportW = viewport.clientWidth || 800;
-    viewportH = viewport.clientHeight || 500;
+    viewportW = stageBox.clientWidth || 800;
+    viewportH = stageBox.clientHeight || 500;
     if (subEl) {
       subEl.textContent = `${currentModel.sun.name} · ${currentModel.planets.length} моделей · ${currentModel.totalMoons} субагентів`;
     }
@@ -884,8 +887,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     if (!uiState.motionPaused) uiState.simTime += dt;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const width = viewportW || viewport.clientWidth || 800;
-    const height = viewportH || viewport.clientHeight || 500;
+    const width = viewportW || stageBox.clientWidth || 800;
+    const height = viewportH || stageBox.clientHeight || 500;
     const hudW = Math.round(width * dpr);
     const hudH = Math.round(height * dpr);
     if (hudCanvas.width !== hudW || hudCanvas.height !== hudH) {

@@ -96,8 +96,10 @@ export function renderConnections(catalog, scanning, { h, button, heading, loadi
     <div class="connection-grid">${connections.map(c => {
       const auth = describeConnectionAuth(c);
       return `<article class="panel connection">
-        <span class="connection-symbol purple">${h(c.name.slice(0, 2))}</span>
-        <span class="provider-pill">${c.installed ? 'CLI знайдено' : 'Не знайдено'}</span>
+        <div class="connection-top">
+          <span class="connection-symbol purple">${h(c.name.slice(0, 2))}</span>
+          <span class="provider-pill">${c.installed ? 'CLI знайдено' : 'Не знайдено'}</span>
+        </div>
         <h3>${h(c.name)}</h3>
         <p><span class="badge ${auth.badgeClass}"><i></i>${h(auth.text)}</span>${c.plan ? ' · ' + h(c.plan) : ''}</p>
         <small class="muted">${h(authNames[c.authType] ?? c.authType ?? '')}${c.version ? ' · ' + h(c.version) : ''}</small>

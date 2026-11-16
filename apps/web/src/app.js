@@ -1,4 +1,5 @@
 import { createProjectWizard } from './create-project.js';
+import { composeProject } from './project-composition.js';
 import { renderConnections } from './connections.js';
 import { createExecutionClient } from './execution.js';
 import { executionPanel, fileArtifacts, runHistory } from './execution-ui.js';
@@ -18,6 +19,7 @@ const paths = {
   pulse: '<path d="M2 12h5l3-8 4 16 3-8h5"/>',
   plug: '<path d="M8 3v5m8-5v5M6 8h12v3a6 6 0 0 1-12 0zm6 9v4"/>',
   settings: '<path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="8" cy="18" r="2"/>',
+  menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   arrow: '<path d="M5 12h14m-6-6 6 6-6 6"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
@@ -43,7 +45,9 @@ let state, execution;
 try { state = JSON.parse(localStorage.getItem('orcestrator.ui.v1')); if (state?.version !== 1 || !state.projects?.length) state = seed(); } catch { state = seed(); }
 // A closed prototype tab does not imply a live background execution.
 for (const p of state.projects) if (p.status === 'running' && p.execution?.mode !== 'real') { p.status = 'paused'; log(p, 'Демо відновлено на паузі після відкриття сторінки'); }
-let route = location.hash.slice(1) || 'overview', tab = 'plan', view = 'solar', selected = null, search = '';
+let route = location.hash.slice(1) || 'overview', tab = 'plan', view = 'solar', selected = null, search = '', navOpen = false;
+const mobileNavigation=window.matchMedia('(max-width: 700px)');
+mobileNavigation.addEventListener('change',()=>{if(navOpen){navOpen=false;render({executionOnly:true});}});
 let agentLibraryFilters = {query:'',backend:'',billing:'',status:'all'};
 function availableProfiles() {
   const all=new Map(state.agents.map(a=>[a.id,a]));
@@ -72,14 +76,14 @@ function toast(message) {
   setTimeout(() => $('#toast').classList.remove('visible'), 3500);
 }
 function navigate(next) { location.hash = next; }
-window.addEventListener('hashchange', () => { route = location.hash.slice(1) || 'overview'; selected = null; search = ''; render(); });
+window.addEventListener('hashchange', () => { route = location.hash.slice(1) || 'overview'; selected = null; search = ''; navOpen = false; render(); });
 function sidebar() {
   const nav = [['overview', 'grid', 'Огляд простору'], ['projects', 'layers', 'Проєкти'], ['agents', 'users', 'Агенти'], ['runs', 'pulse', 'Запуски'], ['connections', 'plug', 'Підключення']];
-  return `<aside class="sidebar"><a class="brand" href="#overview"><span class="brand-symbol">${icon('orbit')}</span>orcestrator<span class="brand-dot">®</span></a><button class="workspace" data-action="workspace"><span class="workspace-icon">W</span><span>Мій робочий простір<small>Personal workspace</small></span>${icon('chevron')}</button><div class="nav-label">РОБОЧИЙ ПРОСТІР</div><nav>${nav.map(([id, glyph, label]) => `<a href="#${id}" class="nav-item ${route === id || (route === 'project' && id === 'projects') ? 'active' : ''}">${icon(glyph)}<span>${label}</span>${id === 'projects' ? `<span class="nav-count">${state.projects.length}</span>` : ''}</a>`).join('')}</nav><div class="nav-label project-label">МОЇ ПРОЄКТИ<button data-action="new-project" aria-label="Створити проєкт">${icon('plus')}</button></div><div class="side-projects">${state.projects.map(p => `<button class="side-project ${route === 'project' && p.id === state.activeId ? 'current' : ''}" data-action="open-project" data-id="${h(p.id)}"><span class="project-dot ${p.id === 'core' ? 'orange' : 'purple'}"></span>${h(p.name)}</button>`).join('')}</div><div class="sidebar-bottom"><div class="local-card"><span class="live-dot"></span> Локальний простір<small>${execution?.ready ? 'Дані на локальному сервері' : 'Підключення до сервера…'}</small></div><a class="nav-item ${route === 'settings' ? 'active' : ''}" href="#settings">${icon('settings')}Налаштування</a><div class="profile"><span class="user-avatar">ВИ</span><span>Мій профіль<small>Особистий простір</small></span><span class="profile-local">LOCAL</span></div></div></aside>`;
+  return `${navOpen ? '<div class="sidebar-backdrop" data-action="close-nav" aria-hidden="true"></div>' : ''}<aside id="app-sidebar" class="sidebar ${navOpen ? 'is-open' : ''}" aria-label="Бічна навігація"><div class="sidebar-top-row"><a class="brand" href="#overview"><span class="brand-symbol">${icon('orbit')}</span>orcestrator<span class="brand-dot">®</span></a><button type="button" class="sidebar-close" data-action="close-nav" aria-label="Закрити меню навігації">${icon('close')}</button></div><button type="button" class="workspace" data-action="workspace"><span class="workspace-icon">W</span><span>Мій робочий простір<small>Personal workspace</small></span>${icon('chevron')}</button><div class="nav-label">РОБОЧИЙ ПРОСТІР</div><nav aria-label="Основна навігація">${nav.map(([id, glyph, label]) => `<a href="#${id}" class="nav-item ${route === id || (route === 'project' && id === 'projects') ? 'active' : ''}">${icon(glyph)}<span>${label}</span>${id === 'projects' ? `<span class="nav-count">${state.projects.length}</span>` : ''}</a>`).join('')}</nav><div class="nav-label project-label">МОЇ ПРОЄКТИ<button type="button" data-action="new-project" aria-label="Створити проєкт">${icon('plus')}</button></div><div class="side-projects">${state.projects.map(p => `<button type="button" class="side-project ${route === 'project' && p.id === state.activeId ? 'current' : ''}" data-action="open-project" data-id="${h(p.id)}"><span class="project-dot ${p.id === 'core' ? 'orange' : 'purple'}"></span><span>${h(p.name)}</span></button>`).join('')}</div><div class="sidebar-bottom"><div class="local-card"><span class="live-dot"></span> Локальний простір<small>${execution?.ready ? 'Дані на локальному сервері' : 'Підключення до сервера…'}</small></div><a class="nav-item ${route === 'settings' ? 'active' : ''}" href="#settings">${icon('settings')}<span>Налаштування</span></a><div class="profile"><span class="user-avatar">ВИ</span><span>Мій профіль<small>Особистий простір</small></span><span class="profile-local">LOCAL</span></div></div></aside>`;
 }
 function header() {
   const titles = { overview: 'Огляд простору', projects: 'Проєкти', project: project().name, agents: 'Агенти', runs: 'Запуски', connections: 'Підключення', settings: 'Налаштування' };
-  return `<header class="topbar"><div class="breadcrumb">Робочий простір ${icon('chevron')}<strong>${h(titles[route] ?? 'Огляд')}</strong></div><div class="topbar-right"><button class="search-trigger" data-action="search">${icon('search')}<span>Швидкий пошук</span><kbd>Ctrl K</kbd></button><span class="top-divider"></span><span class="mode-dot"></span><span class="mode-text">${execution?.ready ? "Локальний сервер" : "Підключення…"}</span><span class="user-avatar small">ВИ</span></div></header>`;
+  return `<header class="topbar"><button type="button" class="mobile-nav-btn" data-action="toggle-nav" aria-label="${navOpen ? 'Закрити меню навігації' : 'Відкрити меню навігації'}" aria-expanded="${navOpen}" aria-controls="app-sidebar">${icon('menu')}</button><div class="breadcrumb">Робочий простір ${icon('chevron')}<strong>${h(titles[route] ?? 'Огляд')}</strong></div><div class="topbar-right"><button type="button" class="search-trigger" data-action="search" aria-label="Швидкий пошук (Ctrl+K)">${icon('search')}<span>Швидкий пошук</span><kbd>Ctrl K</kbd></button><span class="top-divider" aria-hidden="true"></span><span class="mode-dot" aria-hidden="true"></span><span class="mode-text">${execution?.ready ? "Локальний сервер" : "Підключення…"}</span><span class="user-avatar small" aria-hidden="true">ВИ</span></div></header>`;
 }
 function heading(eyebrow, title, description, action = '') { return `<div class="page-heading"><div><div class="eyebrow">${eyebrow}</div><h1>${h(title)}</h1><p>${h(description)}</p></div><div class="heading-actions">${action}</div></div>`; }
 function progress(p) { return Math.round(p.tasks.filter(t => t.status === 'done').length / Math.max(1, p.tasks.length) * 100); }
@@ -224,7 +228,7 @@ function render({executionOnly=false}={}) {
   const scroll = window.scrollY;
   const existingStage = document.querySelector('#solar-stage');
   const existingViewport = existingStage?.querySelector('.solar-viewport');
-  const html = `${sidebar()}<div class="shell">${header()}<main>${main()}<footer class="page-footer"><span>orcestrator <b>/</b> Ваш простір для командного інтелекту</span><span>UI Preview · v0.1</span></footer></main></div>`;
+  const html = `<a class="skip-link" href="#main-content" data-action="skip-content">Перейти до вмісту</a>${sidebar()}<div class="shell" ${navOpen&&mobileNavigation.matches?'inert':''}>${header()}<main id="main-content" tabindex="-1">${main()}<footer class="page-footer"><span>orcestrator <b>/</b> Ваш простір для командного інтелекту</span><span>UI Preview · v0.1</span></footer></main></div>`;
   if(executionOnly || route==='agents'&&document.activeElement?.matches('[data-agent-filter]'))patchLiveDom($('#app'),html);else $('#app').innerHTML=html;
   const nextStage = document.querySelector('#solar-stage');
   if (nextStage) {
@@ -237,7 +241,7 @@ function render({executionOnly=false}={}) {
   document.querySelector('.team-summary .text-button')?.setAttribute('aria-label', 'Редагувати команду');
   window.scrollTo(0, scroll);
 }
-function modal(title, body, footer = '') { const d = $('#modal'); d.innerHTML = `<div class="modal-heading"><div><span class="eyebrow">ORCESTRATOR WORKSPACE</span><h2>${h(title)}</h2></div>${button('close-modal','','close','btn icon-btn','aria-label="Закрити вікно"')}</div>${body}${footer}`; if (!d.open) d.showModal(); }
+function modal(title, body, footer = '') { const d = $('#modal'); d.setAttribute('aria-modal', 'true'); d.setAttribute('aria-labelledby', 'modal-title'); d.innerHTML = `<div class="modal-heading"><div><span class="eyebrow">ORCESTRATOR WORKSPACE</span><h2 id="modal-title">${h(title)}</h2></div>${button('close-modal','','close','btn icon-btn','aria-label="Закрити вікно"')}</div>${body}${footer}`; if (!d.open) d.showModal(); }
 function checks(ids, name = 'team') { return availableProfiles().map(a => `<label class="agent-option">${avatar(a)}<span><strong>${h(a.name)}</strong><small>${h(a.model)}${a.backend?' · '+h(providerNames[a.backend]??a.backend):''}</small></span><input type="checkbox" name="${name}" value="${h(a.id)}" ${ids.includes(a.id) ? 'checked' : ''}></label>`).join(''); }
 function newProject() { creation.open(); }
 
@@ -250,11 +254,22 @@ function download(name, content, type = 'application/json') { const url = URL.cr
 function locked() { return ['running','paused'].includes(project().status); }
 document.addEventListener('click', async event => {
   const target = event.target.closest('[data-action]'); if (!target || target.disabled) return;
+  if(target.hasAttribute('data-creation'))return;
   const action = target.dataset.action, id = target.dataset.id, p = project();
   try {
+    if(action==='skip-content'){event.preventDefault();$('#main-content')?.focus();return;}
+    if (action === 'toggle-nav') { navOpen = !navOpen; render({ executionOnly: true }); if (navOpen) document.querySelector('#app-sidebar .sidebar-close')?.focus(); else document.querySelector('.mobile-nav-btn')?.focus(); return; }
+    if (action === 'close-nav') { navOpen = false; render({ executionOnly: true }); document.querySelector('.mobile-nav-btn')?.focus(); return; }
     if (!execution?.ready && !['close-modal','view-solar','view-graph','view-list','view-tree'].includes(action)) { toast('Дочекайтеся відновлення даних із сервера'); return; }
     if (action === 'scan-connections') { await execution.scan(); return; }
     if (action === 'agent-library-reset') { agentLibraryFilters={query:'',backend:'',billing:'',status:'all'};render({executionOnly:true});return; }
+    if (action === 'agent-filter-preset') {
+      const st = target.dataset.status; const bl = target.dataset.billing;
+      if (st !== undefined) agentLibraryFilters.status = st;
+      if (bl !== undefined) agentLibraryFilters.billing = agentLibraryFilters.billing === bl ? '' : bl;
+      render({ executionOnly: true });
+      return;
+    }
     if (action === 'catalog-agent-detail' || action === 'catalog-agent-add') {
       const item=agentLibraryGroups(execution.catalog,state.agents).find(item=>item.id===id);
       if(!item)throw Error('Модель більше не знайдено: оновіть каталог');
@@ -281,10 +296,10 @@ document.addEventListener('click', async event => {
     if (action === 'view-run') { await execution.viewRun(id); return; }
     if (action === 'execution-file') { await execution.file(p,target.dataset.path); return; }
     if (p.execution?.mode==='real' && ['pause','resume','cancel','cancel-task'].includes(action)) { await execution.control(p,action,id); return; }
-    if (action === 'new-project') { newProject(); return; }
+    if (action === 'new-project') { navOpen = false; newProject(); return; }
     if (action === 'close-modal') { $('#modal').close(); return; }
-    if (action === 'workspace') { navigate('settings'); return; }
-    if (action === 'open-project') { state.activeId = id; selected = null; tab = 'plan'; save(); if (route === 'project') render(); else navigate('project'); $('#modal').close(); void execution.loadRouting(id, { silent: true }); return; }
+    if (action === 'workspace') { navOpen = false; navigate('settings'); return; }
+    if (action === 'open-project') { navOpen = false; state.activeId = id; selected = null; tab = 'plan'; save(); if (route === 'project') render(); else navigate('project'); $('#modal').close(); void execution.loadRouting(id, { silent: true }); return; }
     if (action === 'tab') { tab = id; if (id === 'team' && !execution.routingState(p.id)?.proposal && !execution.routingState(p.id)?.loading) void execution.loadRouting(p.id, { silent: true }); }
     else if (action.startsWith('view-')) view = action.slice(5);
     else if (action === 'select-task') selected = id;
@@ -378,22 +393,27 @@ document.addEventListener('input', event => {
   else if (event.target.id === 'quick-search') searchResults(event.target.value);
   else if (event.target.matches?.('#config-form input, #config-form textarea')) event.target.dataset.userEdited = '1';
 });
-document.addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); document.querySelector('[data-action="search"]').click(); } if (event.key === 'Escape' && selected) { selected = null; render(); } });
+document.addEventListener('keydown', event => {
+  if($('#modal').open)return;
+  if(navOpen&&mobileNavigation.matches&&event.key==='Tab'){
+    const sidebar=$('#app-sidebar'),items=[...sidebar.querySelectorAll('a[href],button:not([disabled])')].filter(el=>el.getClientRects().length);
+    const first=items[0],last=items.at(-1),active=document.activeElement;
+    if(first&&((event.shiftKey&&(active===first||!sidebar.contains(active)))||(!event.shiftKey&&(active===last||!sidebar.contains(active))))){event.preventDefault();(event.shiftKey?last:first).focus();}
+  }
+  if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){event.preventDefault();if(navOpen){navOpen=false;render({executionOnly:true});}document.querySelector('[data-action="search"]').click();}
+  if(event.key==='Escape'){if(navOpen){navOpen=false;render({executionOnly:true});document.querySelector('.mobile-nav-btn')?.focus();}else if(selected){selected=null;render();}}
+});
 $('#modal').addEventListener('click', event => { if (event.target === $('#modal')) { const rect = event.target.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) event.target.close(); } });
 setInterval(() => { let changed = false; for (const p of state.projects) changed = (p.execution?.mode==='real'?false:tick(p)) || changed; if (changed) { save(); if (!$('#modal').open) render({ executionOnly: true }); } }, 1600);
 const creation = createProjectWizard({ modal, h, icon, button, agents: availableProfiles, notify: toast,
-  refreshCatalog:async()=>{await execution.scan();if(execution.catalogError)throw Error(execution.catalogError);},
-  onCreate(draft) {
-    retainProfiles(draft.routing.assignments.flatMap(a=>a.agentIds));
-    const tasks = draft.plan.tasks.map(t => ({ ...t, status: 'pending', agentIds: draft.routing.assignments.find(a => a.taskId === t.id).agentIds }));
-    const team = [...new Set(tasks.flatMap(t => t.agentIds))];
-    const next = { id: uid(), name: draft.name, description: draft.idea?.summary ?? draft.description, icon: 'layers', team, tasks,
-      concurrency: 3, maxCalls: 50, revision: 1, status: 'idle', events: [], artifacts: [],
-      planning: { mode: draft.mode, originalBrief: draft.description, priority: draft.priority, idea: draft.idea, plan: draft.plan,
-        routing: draft.routing, ideaSource: draft.ideaSource, planSource: draft.planSource, teamSource: draft.teamSource } };
-    log(next, draft.planSource?.mode === 'ai' ? 'Прийнято AI-план і рекомендації команди' : 'Прийнято демонстраційний план і підбір за правилами');
-    state.projects.push(next); state.activeId = next.id; tab = 'plan'; selected = null; route = 'project'; location.hash = 'project';
-    save(); render(); toast('Проєкт створено з прийнятим планом і командою');
+  getCatalog:()=>execution?.catalog,
+  proposeDraft:(input,signal)=>execution.proposeDraft(input,signal),
+  async onCreate(draft) {
+    const {project:next,profiles}=composeProject(draft,availableProfiles());
+    log(next,draft.teamSource?.mode==='ai'?'Прийнято AI-план і точне призначення моделей':'Прийнято демонстраційний план і підбір за правилами');
+    await execution.createPlannedProject({project:next,profiles,...(draft.teamSource?.mode==='ai'?{routingDraftId:draft.proposal.id}:{})});
+    tab='plan';selected=null;route='project';location.hash='project';
+    render();toast('Проєкт створено з прийнятим планом і командою');
   }
 });
 execution = createExecutionClient({getState:()=>state,setState:value=>{state=value;},render,saveLocal:()=>save(true),notify:toast,modal,h,button,download});
