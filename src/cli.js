@@ -9,20 +9,24 @@ import { WorkspaceManager } from './workspaces.js';
 import { createDirector } from '../scripts/director-service.js';
 import { createRecoveryHandler } from '../scripts/recovery-service.js';
 
-const createEngine=()=>{const store=new Store(process.env.ORCHESTRATOR_DATA),registry=createModelRegistry({store});const engine=new Engine(store,withModelPolicy(registry),{workspaces:new WorkspaceManager(join(store.directory,'runtime-worktrees'))});engine.recover=createRecoveryHandler({engine,registry,director:createDirector({registry})});return engine;};
+const createEngine=()=>{const store=new Store(process.env.ORCHESTRATOR_DATA),registry=createModelRegistry({store});const allowedRoot=process.env.ORCHESTRATOR_ALLOW_ANY_WORKSPACE==='1'?undefined:join(store.directory,'workspaces');const engine=new Engine(store,withModelPolicy(registry),{workspaces:new WorkspaceManager(join(store.directory,'runtime-worktrees'),{allowedRoot})});engine.recover=createRecoveryHandler({engine,registry,director:createDirector({registry})});return engine;};
 
 const [command = 'help', file] = process.argv.slice(2);
 try {
   if (command === 'serve') {
     const engine = createEngine();
-    const { server, token } = createApi(engine, process.env.ORCHESTRATOR_TOKEN);
-    const port = Number(process.env.PORT ?? 4310);
+    const { server, token, closeStreams } = createApi(engine, process.env.ORCHESTRATOR_TOKEN || undefined);
+    const port = process.env.PORT === undefined || process.env.PORT === '' ? 4310 : Number(process.env.PORT);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be an integer 1..65535');
     server.on('error', error => { console.error(error.message); process.exitCode = 1; });
     server.listen(port, '127.0.0.1', () => {
       console.log(`Orcestrator API: http://127.0.0.1:${server.address().port}\nBearer token: ${token}\nKeep this token private. Data: ${engine.store.directory}`);
     });
     const shutdown = () => {
+      closeStreams();
       for (const run of Object.values(engine.store.data.runs)) if (['running', 'paused'].includes(run.status)) engine.cancel(run.id);
+      engine.store.flush?.();
+      server.closeAllConnections();
       server.close();
     };
     process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

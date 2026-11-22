@@ -133,6 +133,7 @@ function collectMoonsForGroup(group, allTasks, taskById, agentById, execAgents, 
         id: child.id,
         key: moonKey,
         kind: 'moon',
+        source: execAgents.size > 0 ? 'execution' : 'plan',
         parentPlanetId: group.modelName,
         parentTaskId: task.id,
         parentTaskTitle: task.title,
@@ -182,6 +183,7 @@ function collectMoonsForGroup(group, allTasks, taskById, agentById, execAgents, 
       id: child.id,
       key: moonKey,
       kind: 'moon',
+      source: execAgents.size > 0 ? 'execution' : 'plan',
       parentPlanetId: group.modelName,
       parentTaskId: parentTask?.id ?? child.parentId,
       parentTaskTitle: parentTask?.title ?? 'Батьківська задача',
@@ -351,17 +353,19 @@ export function buildSolarSystemModel(project, agents = [], labels = {}, routing
     const palette = PLANET_PALETTES[group.firstColor] ?? PALETTE_LIST[index % PALETTE_LIST.length];
     const roleSummary = group.agents.map(a => a.name).join(', ');
     const billingInfo = formatBillingBadge(group.billing, group.billingBoundary);
+    const connectorPlaceholder=group.modelSource==='profile'&&group.agents.every(a=>a.source!=='catalog'&&!a.routeId)&&
+      /^(?:codex(?:\s+cli)?|claude(?:\s+code)?|opencode|antigravity)$/i.test(group.modelName.trim());
 
     return {
       id: group.modelName,
       kind: 'planet',
       orbitIndex: index,
       agentIds: [...group.agentIds],
-      name: group.modelName,
-      model: roleSummary || group.modelName,
+      name: connectorPlaceholder?(roleSummary||'Роль команди'):group.modelName,
+      model: connectorPlaceholder?'Модель ще не вибрана':roleSummary||group.modelName,
       provider: group.provider,
       modelSource: group.modelSource,
-      sourceLabel: group.sourceLabel,
+      sourceLabel: connectorPlaceholder?'Рольовий профіль · модель ще не вибрана':group.sourceLabel,
       billing: group.billing,
       billingBoundary: group.billingBoundary,
       billingLabel: group.billing ? billingInfo.label : null,

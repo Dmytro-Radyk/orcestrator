@@ -85,11 +85,17 @@ function compileShader(gl, type, source) {
 
 function createProgram(gl, vsSrc, fsSrc) {
   const prog = gl.createProgram();
-  gl.attachShader(prog, compileShader(gl, gl.VERTEX_SHADER, vsSrc));
-  gl.attachShader(prog, compileShader(gl, gl.FRAGMENT_SHADER, fsSrc));
+  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
   gl.linkProgram(prog);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
   if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    throw new Error(`Program link error: ${gl.getProgramInfoLog(prog)}`);
+    const info = gl.getProgramInfoLog(prog);
+    gl.deleteProgram(prog);
+    throw new Error(`Program link error: ${info}`);
   }
   return prog;
 }
@@ -250,6 +256,7 @@ uniform int uType;       // 0=sun, 1=gas, 2=terra, 3=ice, 4=exo, 5=moon
 uniform float uTime;
 uniform float uActive;
 uniform vec3 uAtmoColor;
+uniform vec3 uSurfaceTint;
 
 ${NOISE_GLSL}
 
@@ -362,6 +369,7 @@ void main() {
   }
 
   // Natural dark side ambient (subtle starlight only, stronger craters contrast on moons)
+  texCol *= uSurfaceTint;
   float ambientLevel = (uType == 5) ? 0.045 : 0.065;
   vec3 ambient = texCol * ambientLevel;
 
@@ -686,8 +694,54 @@ export function createSolarGL(canvas) {
     uTilt: gl.getUniformLocation(bodyProg, 'uTilt'),
     uType: gl.getUniformLocation(bodyProg, 'uType'),
     uActive: gl.getUniformLocation(bodyProg, 'uActive'),
-    uAtmoColor: gl.getUniformLocation(bodyProg, 'uAtmoColor')
+    uAtmoColor: gl.getUniformLocation(bodyProg, 'uAtmoColor'),
+    uSurfaceTint: gl.getUniformLocation(bodyProg, 'uSurfaceTint')
   };
+
+  const skyLoc = {
+    aPos: gl.getAttribLocation(skyProg, 'aPos'),
+    uRes: gl.getUniformLocation(skyProg, 'uRes'),
+    uYaw: gl.getUniformLocation(skyProg, 'uYaw'),
+    uPitch: gl.getUniformLocation(skyProg, 'uPitch'),
+    uTime: gl.getUniformLocation(skyProg, 'uTime')
+  };
+  const lineLoc = {
+    aPos: gl.getAttribLocation(lineProg, 'aPos'),
+    aCol: gl.getAttribLocation(lineProg, 'aCol'),
+    uViewProj: gl.getUniformLocation(lineProg, 'uViewProj')
+  };
+  const pointLoc = {
+    aPos: gl.getAttribLocation(pointProg, 'aPos'),
+    aSize: gl.getAttribLocation(pointProg, 'aSize'),
+    aAlpha: gl.getAttribLocation(pointProg, 'aAlpha'),
+    uViewProj: gl.getUniformLocation(pointProg, 'uViewProj')
+  };
+  const ringLoc = {
+    aPos: gl.getAttribLocation(ringProg, 'aPos'),
+    uViewProj: gl.getUniformLocation(ringProg, 'uViewProj'),
+    uEyePos: gl.getUniformLocation(ringProg, 'uEyePos'),
+    uRingTex: gl.getUniformLocation(ringProg, 'uRingTex'),
+    uHasRingTex: gl.getUniformLocation(ringProg, 'uHasRingTex'),
+    uCenter: gl.getUniformLocation(ringProg, 'uCenter'),
+    uRadius: gl.getUniformLocation(ringProg, 'uRadius'),
+    uTilt: gl.getUniformLocation(ringProg, 'uTilt'),
+    uRingColor: gl.getUniformLocation(ringProg, 'uRingColor')
+  };
+  const coronaLoc = {
+    aPos: gl.getAttribLocation(coronaProg, 'aPos'),
+    uViewProj: gl.getUniformLocation(coronaProg, 'uViewProj'),
+    uCenter: gl.getUniformLocation(coronaProg, 'uCenter'),
+    uCamRight: gl.getUniformLocation(coronaProg, 'uCamRight'),
+    uCamUp: gl.getUniformLocation(coronaProg, 'uCamUp'),
+    uSize: gl.getUniformLocation(coronaProg, 'uSize'),
+    uTime: gl.getUniformLocation(coronaProg, 'uTime'),
+    uReduced: gl.getUniformLocation(coronaProg, 'uReduced'),
+    uPulse: gl.getUniformLocation(coronaProg, 'uPulse')
+  };
+
+  let disposed = false;
+  const onContextLost = event => { event.preventDefault(); };
+  canvas.addEventListener('webglcontextlost', onContextLost);
 
   const textureCache = new Map();
   const loadingState = new Map();
@@ -695,10 +749,11 @@ export function createSolarGL(canvas) {
   const failedUrls = new Set();
 
   function uploadTexture(url, tex, clampS = false) {
-    if (!url || loadingState.has(url)) return tex;
+    if (!url || disposed || gl.isContextLost() || loadingState.has(url)) return tex;
     loadingState.set(url, 'loading');
     const img = new Image();
     img.onload = () => {
+      if (disposed || gl.isContextLost()) return;
       const size=fitTextureDimensions(img.naturalWidth,img.naturalHeight,maxTexSize);
       let pixels=img;
       if(size.width!==img.naturalWidth||size.height!==img.naturalHeight){
@@ -728,6 +783,7 @@ export function createSolarGL(canvas) {
       loadedUrls.add(url);
     };
     img.onerror = () => {
+      if (disposed) return;
       loadingState.set(url, 'error');
       failedUrls.add(url);
     };
@@ -800,6 +856,32 @@ export function createSolarGL(canvas) {
 
   return {
     gl,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      canvas.removeEventListener('webglcontextlost', onContextLost);
+      if (!gl.isContextLost()) {
+        for (const tex of textureCache.values()) gl.deleteTexture(tex);
+        gl.deleteTexture(fallbackFlatNormal);
+        gl.deleteTexture(fallbackDark);
+        for (const mesh of [highSphere, medSphere]) {
+          gl.deleteBuffer(mesh.posBuf);
+          gl.deleteBuffer(mesh.normBuf);
+          gl.deleteBuffer(mesh.tanBuf);
+          gl.deleteBuffer(mesh.uvBuf);
+          gl.deleteBuffer(mesh.idxBuf);
+        }
+        gl.deleteBuffer(ring.posBuf);
+        gl.deleteBuffer(ring.idxBuf);
+        gl.deleteBuffer(quad);
+        gl.deleteBuffer(lineBuf);
+        gl.deleteBuffer(pointBuf);
+        for (const prog of [skyProg, bodyProg, ringProg, coronaProg, lineProg, pointProg]) gl.deleteProgram(prog);
+        gl.getExtension('WEBGL_lose_context')?.loseContext();
+      }
+      textureCache.clear();
+      loadingState.clear();
+    },
     getCapabilities() {
       return {
         maxTexSize,
@@ -810,6 +892,7 @@ export function createSolarGL(canvas) {
       };
     },
     render({ width, height, dpr, eye, viewProj, yaw, pitch, time, reducedMotion = false, showGrid, gridSegments, bodies, rings, beltPoints }) {
+      if (disposed || gl.isContextLost()) return;
       const pw = Math.max(1, Math.round(width * dpr));
       const ph = Math.max(1, Math.round(height * dpr));
       if (canvas.width !== pw || canvas.height !== ph) {
@@ -825,15 +908,14 @@ export function createSolarGL(canvas) {
       gl.disable(gl.BLEND);
       gl.useProgram(skyProg);
       gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-      const skyPos = gl.getAttribLocation(skyProg, 'aPos');
-      gl.enableVertexAttribArray(skyPos);
-      gl.vertexAttribPointer(skyPos, 2, gl.FLOAT, false, 0, 0);
-      gl.uniform2f(gl.getUniformLocation(skyProg, 'uRes'), width, height);
-      gl.uniform1f(gl.getUniformLocation(skyProg, 'uYaw'), yaw);
-      gl.uniform1f(gl.getUniformLocation(skyProg, 'uPitch'), pitch);
-      gl.uniform1f(gl.getUniformLocation(skyProg, 'uTime'), reducedMotion ? 0 : time);
+      gl.enableVertexAttribArray(skyLoc.aPos);
+      gl.vertexAttribPointer(skyLoc.aPos, 2, gl.FLOAT, false, 0, 0);
+      gl.uniform2f(skyLoc.uRes, width, height);
+      gl.uniform1f(skyLoc.uYaw, yaw);
+      gl.uniform1f(skyLoc.uPitch, pitch);
+      gl.uniform1f(skyLoc.uTime, reducedMotion ? 0 : time);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      gl.disableVertexAttribArray(skyPos);
+      gl.disableVertexAttribArray(skyLoc.aPos);
 
       gl.enable(gl.DEPTH_TEST);
       gl.enable(gl.BLEND);
@@ -844,16 +926,14 @@ export function createSolarGL(canvas) {
         gl.useProgram(lineProg);
         gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
         gl.bufferData(gl.ARRAY_BUFFER, gridSegments, gl.DYNAMIC_DRAW);
-        const lPos = gl.getAttribLocation(lineProg, 'aPos');
-        const lCol = gl.getAttribLocation(lineProg, 'aCol');
-        gl.enableVertexAttribArray(lPos);
-        gl.enableVertexAttribArray(lCol);
-        gl.vertexAttribPointer(lPos, 3, gl.FLOAT, false, 28, 0);
-        gl.vertexAttribPointer(lCol, 4, gl.FLOAT, false, 28, 12);
-        gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, 'uViewProj'), false, viewProj);
+        gl.enableVertexAttribArray(lineLoc.aPos);
+        gl.enableVertexAttribArray(lineLoc.aCol);
+        gl.vertexAttribPointer(lineLoc.aPos, 3, gl.FLOAT, false, 28, 0);
+        gl.vertexAttribPointer(lineLoc.aCol, 4, gl.FLOAT, false, 28, 12);
+        gl.uniformMatrix4fv(lineLoc.uViewProj, false, viewProj);
         gl.drawArrays(gl.LINES, 0, gridSegments.length / 7);
-        gl.disableVertexAttribArray(lPos);
-        gl.disableVertexAttribArray(lCol);
+        gl.disableVertexAttribArray(lineLoc.aPos);
+        gl.disableVertexAttribArray(lineLoc.aCol);
       }
 
       // 3. Asteroid Belt
@@ -861,20 +941,17 @@ export function createSolarGL(canvas) {
         gl.useProgram(pointProg);
         gl.bindBuffer(gl.ARRAY_BUFFER, pointBuf);
         gl.bufferData(gl.ARRAY_BUFFER, beltPoints, gl.DYNAMIC_DRAW);
-        const pPos = gl.getAttribLocation(pointProg, 'aPos');
-        const pSize = gl.getAttribLocation(pointProg, 'aSize');
-        const pAlpha = gl.getAttribLocation(pointProg, 'aAlpha');
-        gl.enableVertexAttribArray(pPos);
-        gl.enableVertexAttribArray(pSize);
-        gl.enableVertexAttribArray(pAlpha);
-        gl.vertexAttribPointer(pPos, 3, gl.FLOAT, false, 20, 0);
-        gl.vertexAttribPointer(pSize, 1, gl.FLOAT, false, 20, 12);
-        gl.vertexAttribPointer(pAlpha, 1, gl.FLOAT, false, 20, 16);
-        gl.uniformMatrix4fv(gl.getUniformLocation(pointProg, 'uViewProj'), false, viewProj);
+        gl.enableVertexAttribArray(pointLoc.aPos);
+        gl.enableVertexAttribArray(pointLoc.aSize);
+        gl.enableVertexAttribArray(pointLoc.aAlpha);
+        gl.vertexAttribPointer(pointLoc.aPos, 3, gl.FLOAT, false, 20, 0);
+        gl.vertexAttribPointer(pointLoc.aSize, 1, gl.FLOAT, false, 20, 12);
+        gl.vertexAttribPointer(pointLoc.aAlpha, 1, gl.FLOAT, false, 20, 16);
+        gl.uniformMatrix4fv(pointLoc.uViewProj, false, viewProj);
         gl.drawArrays(gl.POINTS, 0, beltPoints.length / 5);
-        gl.disableVertexAttribArray(pPos);
-        gl.disableVertexAttribArray(pSize);
-        gl.disableVertexAttribArray(pAlpha);
+        gl.disableVertexAttribArray(pointLoc.aPos);
+        gl.disableVertexAttribArray(pointLoc.aSize);
+        gl.disableVertexAttribArray(pointLoc.aAlpha);
       }
 
       // 4. Textured 3D Spheres (Sun, Planets, Moons)
@@ -946,6 +1023,7 @@ export function createSolarGL(canvas) {
         gl.uniform1i(bodyLocations.uType, b.type);
         gl.uniform1f(bodyLocations.uActive, b.active ? 1.0 : 0.0);
         gl.uniform3fv(bodyLocations.uAtmoColor, b.atmoColor);
+        gl.uniform3fv(bodyLocations.uSurfaceTint, b.surfaceTint ?? [1, 1, 1]);
         gl.drawElements(gl.TRIANGLES, targetMesh.count, gl.UNSIGNED_SHORT, 0);
       }
 
@@ -962,24 +1040,23 @@ export function createSolarGL(canvas) {
         gl.depthMask(false);
         gl.useProgram(ringProg);
         gl.bindBuffer(gl.ARRAY_BUFFER, ring.posBuf);
-        const rPos = gl.getAttribLocation(ringProg, 'aPos');
-        gl.enableVertexAttribArray(rPos);
-        gl.vertexAttribPointer(rPos, 3, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(ringLoc.aPos);
+        gl.vertexAttribPointer(ringLoc.aPos, 3, gl.FLOAT, false, 0, 0);
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ring.idxBuf);
-        gl.uniformMatrix4fv(gl.getUniformLocation(ringProg, 'uViewProj'), false, viewProj);
-        gl.uniform3fv(gl.getUniformLocation(ringProg, 'uEyePos'), eye);
+        gl.uniformMatrix4fv(ringLoc.uViewProj, false, viewProj);
+        gl.uniform3fv(ringLoc.uEyePos, eye);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, ringMap?.ready ? ringMap.tex : fallbackDark);
-        gl.uniform1i(gl.getUniformLocation(ringProg, 'uRingTex'), 0);
-        gl.uniform1f(gl.getUniformLocation(ringProg, 'uHasRingTex'), ringMap?.ready ? 1.0 : 0.0);
+        gl.uniform1i(ringLoc.uRingTex, 0);
+        gl.uniform1f(ringLoc.uHasRingTex, ringMap?.ready ? 1.0 : 0.0);
         for (const r of rings) {
-          gl.uniform3fv(gl.getUniformLocation(ringProg, 'uCenter'), r.center);
-          gl.uniform1f(gl.getUniformLocation(ringProg, 'uRadius'), r.radius);
-          gl.uniform1f(gl.getUniformLocation(ringProg, 'uTilt'), r.tilt);
-          gl.uniform3fv(gl.getUniformLocation(ringProg, 'uRingColor'), r.color);
+          gl.uniform3fv(ringLoc.uCenter, r.center);
+          gl.uniform1f(ringLoc.uRadius, r.radius);
+          gl.uniform1f(ringLoc.uTilt, r.tilt);
+          gl.uniform3fv(ringLoc.uRingColor, r.color);
           gl.drawElements(gl.TRIANGLES, ring.count, gl.UNSIGNED_SHORT, 0);
         }
-        gl.disableVertexAttribArray(rPos);
+        gl.disableVertexAttribArray(ringLoc.aPos);
         gl.depthMask(true);
       }
 
@@ -991,9 +1068,8 @@ export function createSolarGL(canvas) {
         gl.depthMask(false);
         gl.useProgram(coronaProg);
         gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-        const cPos = gl.getAttribLocation(coronaProg, 'aPos');
-        gl.enableVertexAttribArray(cPos);
-        gl.vertexAttribPointer(cPos, 2, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(coronaLoc.aPos);
+        gl.vertexAttribPointer(coronaLoc.aPos, 2, gl.FLOAT, false, 0, 0);
 
         let fx = -eye[0], fy = -eye[1], fz = -eye[2];
         const fl = Math.hypot(fx, fy, fz) || 1;
@@ -1005,16 +1081,16 @@ export function createSolarGL(canvas) {
         const uy = fz * rx - fx * rz;
         const uz = fx * ry - fy * rx;
 
-        gl.uniformMatrix4fv(gl.getUniformLocation(coronaProg, 'uViewProj'), false, viewProj);
-        gl.uniform3fv(gl.getUniformLocation(coronaProg, 'uCenter'), sunBody.center);
-        gl.uniform3f(gl.getUniformLocation(coronaProg, 'uCamRight'), rx, ry, rz);
-        gl.uniform3f(gl.getUniformLocation(coronaProg, 'uCamUp'), ux, uy, uz);
-        gl.uniform1f(gl.getUniformLocation(coronaProg, 'uSize'), sunBody.radius * 3.45);
-        gl.uniform1f(gl.getUniformLocation(coronaProg, 'uTime'), reducedMotion ? 0 : time);
-        gl.uniform1f(gl.getUniformLocation(coronaProg, 'uReduced'), reducedMotion ? 1.0 : 0.0);
-        gl.uniform1f(gl.getUniformLocation(coronaProg, 'uPulse'), (!reducedMotion && sunBody.active) ? 0.5 + 0.5 * Math.sin(time * 3.2) : 0.0);
+        gl.uniformMatrix4fv(coronaLoc.uViewProj, false, viewProj);
+        gl.uniform3fv(coronaLoc.uCenter, sunBody.center);
+        gl.uniform3f(coronaLoc.uCamRight, rx, ry, rz);
+        gl.uniform3f(coronaLoc.uCamUp, ux, uy, uz);
+        gl.uniform1f(coronaLoc.uSize, sunBody.radius * 3.45);
+        gl.uniform1f(coronaLoc.uTime, reducedMotion ? 0 : time);
+        gl.uniform1f(coronaLoc.uReduced, reducedMotion ? 1.0 : 0.0);
+        gl.uniform1f(coronaLoc.uPulse, (!reducedMotion && sunBody.active) ? 0.5 + 0.5 * Math.sin(time * 3.2) : 0.0);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        gl.disableVertexAttribArray(cPos);
+        gl.disableVertexAttribArray(coronaLoc.aPos);
         gl.depthMask(true);
       }
     }

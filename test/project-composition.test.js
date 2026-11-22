@@ -16,6 +16,14 @@ test('draft request preserves manager, worker billing and read-only requirements
   d.freeWorkers=false;d.managerRouteId='';assert.equal(draftRoutingInput(d).managerRouteId,undefined);assert.equal(draftRoutingInput(d).requirements.review.billing,undefined);
 });
 
+test('the automatically selected plan model directs the team while an explicit override still wins',()=>{
+  const d=draft();d.managerRouteId='';d.planSource={mode:'ai',routeId:'codex:auto-planner'};
+  assert.equal(draftRoutingInput(d).managerRouteId,'codex:auto-planner');
+  assert.equal(draftRoutingInput(d).allowManagerFallback,true);
+  d.managerRouteId='codex:manual';assert.equal(draftRoutingInput(d).managerRouteId,'codex:manual');assert.equal(draftRoutingInput(d).allowManagerFallback,undefined);
+  d.managerRouteId='';d.planSource={mode:'demo',routeId:'not-a-real-model'};assert.equal(draftRoutingInput(d).managerRouteId,undefined);
+});
+
 test('composition materializes the exact selected model once and preserves editable task IDs and provenance',()=>{
   const d=draft();d.proposal=proposal(d);d.teamSource={mode:'ai',routeId:'codex:manager'};const before=structuredClone(d);
   const {project,profiles}=composeProject(d,seed().agents,'new-project');assert.deepEqual(d,before);assert.equal(profiles.length,1);

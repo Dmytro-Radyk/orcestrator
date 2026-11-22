@@ -1,4 +1,5 @@
-import { mkdir,writeFile,rename } from 'node:fs/promises';
+import { mkdir,writeFile,rename,unlink } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import { join,resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,8 +23,19 @@ export async function opencodeEnvironment({home=OPENCODE_HOME,env=process.env}={
     deny('plugin.use'),allow('plugin.use','opencode.*'),
     deny('mcp.use'),deny('skill.use'),deny('websearch.use'),deny('tool.use')
   ]};
-  const temporary=join(config,`config-${randomUUID()}.tmp`);
-  await writeFile(temporary,JSON.stringify(settings,null,2));await rename(temporary,join(config,'opencode.json'));
+  const temporary=join(config,`config-${randomUUID()}.tmp`),target=join(config,'opencode.json');
+  try {
+    await writeFile(temporary,JSON.stringify(settings,null,2));
+    for(let attempt=0;;attempt++){
+      try{await rename(temporary,target);break;}catch(error){
+        if(!['EPERM','EACCES','EBUSY'].includes(error.code)||attempt>=5)throw error;
+        await delay(Math.min(10*2**attempt,100));
+      }
+    }
+  } catch (error) {
+    await unlink(temporary).catch(()=>{});
+    throw error;
+  }
   return {...safe,OPENCODE_CONFIG_DIR:config,OPENCODE_CONFIG_CONTENT:JSON.stringify(settings),
     OPENCODE_TEST_HOME:resolve(home),
     OPENCODE_DISABLE_PROJECT_CONFIG:'1',OPENCODE_DISABLE_CLAUDE_CODE:'1',OPENCODE_DISABLE_FILEWATCHER:'1',
@@ -77,13 +89,14 @@ export function supportedVersion(value) {
   return Boolean(match&&(Number(match[1])>2||(Number(match[1])===2&&Number(match[2])>=6)));
 }
 
-export async function executeOpenCode(agent,{prompt,signal,onEvent}, {run=runProcess,home=OPENCODE_HOME,env=process.env}={}) {
+export async function executeOpenCode(agent,{prompt,signal=new AbortController().signal,onEvent}, {run=runProcess,home=OPENCODE_HOME,env=process.env}={}) {
   if(agent.access!=='read-only')throw new Error('OpenCode поки підтримує лише текстові задачі без інструментів та запису файлів');
   if(!/^opencode\/[^\s#]+$/.test(agent.model??''))throw new Error('Потрібен точний anonymous OpenCode model ID');
   const isolatedEnv=await opencodeEnvironment({home,env});
   const text=[],finished=new Map(),parts=new Set();let steps=0;
   await run(agent.command,['run','--standalone','--model',agent.model,'--format','json','--archived','--log-level','none'],{
     cwd:join(home,'workspace'),env:isolatedEnv,prompt,signal,onLine:line=>{
+      if(!line.trim())return;
       let event;try{event=JSON.parse(line);}catch{throw new Error('OpenCode повернув некоректний JSONL');}
       if(event.type==='error')throw new Error('OpenCode не завершив запит: перевірте доступність безкоштовної квоти');
       if(event.type==='tool_use')throw Object.assign(modelAccessError({code:'tools_not_supported',reason:`Інструменти заборонені для текстового маршруту OpenCode · ${agent.model}`}),{routeId:`opencode:${agent.model}`});
@@ -95,7 +108,7 @@ export async function executeOpenCode(agent,{prompt,signal,onEvent}, {run=runPro
         const p=event.part??{};
         if(p.cost!==0)throw new Error('OpenCode не підтвердив нульову вартість результату');
         if(!['stop','end_turn'].includes(p.reason))throw new Error('OpenCode завершив відповідь без повного результату');
-        finished.set(p.messageID??p.id??finished.size,p.tokens??null);
+        finished.set(p.id??`step-${finished.size}`,p.tokens??null);
       }
     }
   });

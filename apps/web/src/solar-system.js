@@ -13,6 +13,7 @@ import {
   stepCameraFrame,
   stepTargetCycle,
   buildFocusableTargetList,
+  SUN_RADIUS,
   clamp
 } from './solar-camera.js';
 
@@ -51,13 +52,23 @@ const PLANET_ARCHETYPES = {
   green:  { type: 4, atmo: [0.34, 0.90, 0.74], ring: [0.62, 0.90, 0.80], orbitRgb: [0.36, 0.88, 0.70], hasRing: false, tilt: 0.18, baseRadius: 7.5, tex: '/textures/exo_planet.jpg' }
 };
 
-function archetypeForPlanet(planet, idx) {
-  if (planet.palette?.ring) return PLANET_ARCHETYPES.orange;
-  if (planet.palette?.core === '#7ad7ff') return PLANET_ARCHETYPES.blue;
-  if (planet.palette?.core === '#d4b3ff') return PLANET_ARCHETYPES.purple;
-  if (planet.palette?.core === '#7ef0c8') return PLANET_ARCHETYPES.green;
-  const list = Object.values(PLANET_ARCHETYPES);
-  return list[idx % list.length];
+const planetArchetypes = Object.values(PLANET_ARCHETYPES);
+
+function archetypeForPlanet(idx) {
+  const base = planetArchetypes[idx % planetArchetypes.length];
+  const variant = Math.floor(idx / planetArchetypes.length);
+  if (!variant) return base;
+  const phase = idx * 2.399963;
+  const tint = [0, 2.094, 4.189].map(offset => 0.79 + 0.38 * Math.cos(phase + offset));
+  return {
+    ...base,
+    baseRadius: base.baseRadius * (0.97 + 0.15 * Math.cos(phase)),
+    hasRing: variant % 2 ? base.type === 3 : base.hasRing,
+    tilt: base.tilt + 0.32 * Math.sin(phase),
+    surfaceTint: tint,
+    atmo: base.atmo.map((channel, i) => clamp(channel * tint[i], 0, 1)),
+    ring: base.ring.map((channel, i) => clamp(channel * tint[i], 0, 1))
+  };
 }
 
 const BELT_ASTEROIDS = Array.from({ length: 580 }, (_, i) => ({
@@ -105,7 +116,7 @@ function resolveSelectedEntity(model) {
     }
     if (idx === -1) return null;
     const p = model.planets[idx];
-    return { ...p, tex: archetypeForPlanet(p, idx).tex };
+    return { ...p, tex: archetypeForPlanet(idx).tex };
   }
   if (uiState.selected.kind === 'moon') {
     for (const p of model.planets) {
@@ -177,7 +188,7 @@ function renderInspectorHtml(model, callbacks) {
           <button type="button" class="solar-close" data-solar-action="close-inspector" aria-label="Закрити">×</button>
         </div>
         <div class="solar-inspector-title">
-          <span class="solar-orb" style="background:url('/textures/sun.jpg') center/cover;box-shadow:0 0 18px rgba(255,190,70,.65)"></span>
+          <span class="solar-orb" style="background:url('/textures/low/sun.jpg') center/cover;box-shadow:0 0 18px rgba(255,190,70,.65)"></span>
           <div>
             <h3>${h(entity.name)}</h3>
             <small>${h(entity.modeLabel)}</small>
@@ -305,7 +316,7 @@ function renderInspectorHtml(model, callbacks) {
         <button type="button" class="solar-close" data-solar-action="close-inspector" aria-label="Закрити">×</button>
       </div>
       <div class="solar-inspector-title">
-        <span class="solar-orb" style="background:url('/textures/moon.jpg') center/cover;box-shadow:inset -6px -4px 10px rgba(0,0,0,.75)"></span>
+        <span class="solar-orb" style="background:url('/textures/low/moon.jpg') center/cover;box-shadow:inset -6px -4px 10px rgba(0,0,0,.75)"></span>
         <div>
           <h3>${h(entity.name)}</h3>
           <small>${h(entity.model || entity.role)}${entity.provider ? ` · ${h(entity.provider)}` : ''}</small>
@@ -421,7 +432,7 @@ const viewportControllers = new WeakMap();
 function computePlanetPositions(model, simTime) {
   const totalPlanets = Math.max(1, model.planets.length);
   return model.planets.map((planet, idx) => {
-    const arch = archetypeForPlanet(planet, idx);
+    const arch = archetypeForPlanet(idx);
     const orbitR = 66 + idx * 44;
     const speed = (planet.status === 'running' ? 0.22 : 0.085) / (1 + idx * 0.35);
     const angle = (idx / totalPlanets) * Math.PI * 2 + 0.55 + simTime * speed;
@@ -656,24 +667,20 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     }
   }
 
-  function selectEntity(ref, { focus = true, snap = uiState.reducedMotion, keepDistance = false, zoomMultiplier = 1.0 } = {}) {
+  function selectEntity(ref, { focus = true, snap = uiState.reducedMotion, keepDistance = false } = {}) {
     uiState.selected = ref;
     if (focus && ref) {
       const nextFocusRef = ref.kind === 'sun' ? { kind: 'sun', focused: true } : ref;
       const positions = computePlanetPositions(currentModel, uiState.simTime);
-      const { center, bounds } = resolveTargetPositionAndBounds(nextFocusRef, positions, 17);
+      const { center, bounds } = resolveTargetPositionAndBounds(nextFocusRef, positions);
       setCameraFocus(uiState.camera, nextFocusRef, center, bounds, { snap, keepDistance });
-      if (zoomMultiplier !== 1.0) {
-        uiState.camera.desiredDistance = clamp(uiState.camera.desiredDistance * zoomMultiplier, bounds.minDistance, bounds.maxDistance);
-        if (snap) uiState.camera.distance = uiState.camera.desiredDistance;
-      }
     }
     syncHud();
   }
 
   function currentFocusBounds() {
     const positions = computePlanetPositions(currentModel, uiState.simTime);
-    return resolveTargetPositionAndBounds(uiState.camera.focusRef, positions, 17).bounds;
+    return resolveTargetPositionAndBounds(uiState.camera.focusRef, positions).bounds;
   }
 
   function findHit(cx, cy) {
@@ -726,12 +733,14 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       }
     }
   });
+  glCanvas.addEventListener('pointercancel', () => { dragging = false; });
+  glCanvas.addEventListener('lostpointercapture', () => { dragging = false; });
 
   glCanvas.addEventListener('dblclick', e => {
     const rect = glCanvas.getBoundingClientRect();
     const hit = findHit(e.clientX - rect.left, e.clientY - rect.top);
     if (hit) {
-      selectEntity(hit.ref, { focus: true, zoomMultiplier: 0.65 });
+      selectEntity(hit.ref);
     } else {
       uiState.selected = null;
       resetCameraToSun(uiState.camera, { snap: uiState.reducedMotion });
@@ -769,9 +778,9 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       uiState.userToggledMotion = true;
       uiState.motionPaused = !uiState.motionPaused;
       syncHud();
-    } else if (e.key === 'Escape' && uiState.selected) {
-      uiState.selected = null;
-      syncHud();
+    } else if (e.key === 'Escape') {
+      if (uiState.fullscreen) { uiState.fullscreen = false; syncHud(); }
+      else if (uiState.selected) { uiState.selected = null; syncHud(); }
     }
   });
 
@@ -820,7 +829,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
         resetCameraToSun(uiState.camera, { snap: uiState.reducedMotion });
         syncHud();
       } else if (act === 'focus-selected' && uiState.selected) {
-        selectEntity(uiState.selected, { focus: true, zoomMultiplier: 0.72 });
+        selectEntity(uiState.selected);
       } else if (act === 'toggle-fullscreen') {
         uiState.fullscreen = !uiState.fullscreen;
         syncHud();
@@ -870,6 +879,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     }
     const taskBtn = e.target.closest('[data-solar-task]');
     if (taskBtn && currentCallbacks.onSelectTask) {
+      if (uiState.fullscreen) { uiState.fullscreen = false; syncHud(); }
       currentCallbacks.onSelectTask(taskBtn.dataset.solarTask);
     }
   });
@@ -878,6 +888,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     if (!document.body.contains(glCanvas)) {
       cancelAnimationFrame(rafId);
       resizeObserver?.disconnect();
+      glEngine?.dispose?.();
+      glEngine = null;
       return;
     }
     const frameStart = performance.now();
@@ -896,7 +908,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
       hudCanvas.height = hudH;
     }
 
-    const sunRadius = 17;
+    const sunRadius = SUN_RADIUS;
     const planetPositions = computePlanetPositions(currentModel, uiState.simTime);
 
     const targetRes = resolveTargetPositionAndBounds(uiState.camera.focusRef, planetPositions, sunRadius);
@@ -947,7 +959,8 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
         hasRing: ps.arch.hasRing,
         highDetail: isFocusedPlanet,
         active: ps.planet.status === 'running',
-        atmoColor: ps.arch.atmo
+        atmoColor: ps.arch.atmo,
+        surfaceTint: ps.arch.surfaceTint
       });
       if (ps.arch.hasRing) {
         rings.push({
@@ -1191,6 +1204,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     update(nextModel, nextCallbacks) {
       currentModel = nextModel;
       currentCallbacks = nextCallbacks;
+      viewport.classList.toggle('is-compact', Boolean(nextCallbacks?.compact));
       const rec = reconcileTargetWithModel(uiState.selected, uiState.camera.focusRef, nextModel);
       uiState.selected = rec.selected;
       if (rec.fellBack) {

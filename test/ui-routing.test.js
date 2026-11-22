@@ -259,3 +259,49 @@ test('live execution retains recovery state, counts manager tokens once, and exp
   assert.match(html, /Відновлення зупинено: Немає дозволених маршрутів/);
   assert.match(formatBillingBadge('subscription_included').label, /межу списань не підтверджено/);
 });
+
+test('execution failure summary distinguishes the original error from blocked dependency tasks',()=>{
+  const html=executionPanel({execution:{mode:'real',status:'failed',calls:1,agents:[],tasks:[
+    {id:'a',title:'Root task',status:'failed',error:'Invalid schema'},
+    ...Array.from({length:27},(_,i)=>({id:`dependent-${i}`,title:`Dependent ${i}`,status:'blocked'}))
+  ]}},h,button);
+  assert.match(html,/Root task: Invalid schema/);assert.match(html,/Залежні задачі не запускалися: 27/);
+  assert.doesNotMatch(html,/помилка виконання|Dependent 26/);
+});
+
+test('timeout continuation is offered only when the server confirms eligibility',()=>{
+  const p={execution:{mode:'real',status:'failed',calls:6,agents:[],tasks:[],canContinue:true}};
+  assert.match(executionPanel(p,h,button),/data-action="continue-run"/);
+  assert.match(executionPanel(p,h,button),/Готові результати й облік викликів зберігаються/);
+  p.execution.canContinue=false;assert.doesNotMatch(executionPanel(p,h,button),/data-action="continue-run"/);
+});
+
+test('blocked reports show a clarification action and draft checks instead of an execution failure',()=>{
+  const p={execution:{mode:'real',status:'blocked',calls:2,agents:[],canClarify:true,tasks:[{id:'t',title:'Assortment',status:'blocked',failure:{code:'AGENT_BLOCKED'},
+    blockedReport:{summary:'Inventory not confirmed <script>',files:['draft.md'],checks:[{command:'draft check',status:'passed',details:'verified'}]}}]}};
+  const html=executionPanel(p,h,button);assert.match(html,/Потрібне уточнення вимог/);assert.match(html,/data-action="clarify-run"/);
+  assert.match(html,/draft.md/);assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/Запуск завершився помилкою/);
+});
+
+test('saved local checks show progress and remaining requirements without prompting for clarification',()=>{
+  const task={id:'b',title:'Storefront quality',status:'blocked',attempts:1,canVerifyOnHost:false,failure:{code:'AGENT_BLOCKED'},
+    blockedReport:{summary:'HTTP EACCES',files:['draft.md'],checks:[{command:'Physical Safari',status:'not_run',details:'Потрібен iPhone'}]},
+    verificationBlockers:[{command:'HTTP tests',reason:'Loopback unavailable'}],
+    hostVerificationProgress:{attempt:1,checks:[{command:'HTTP tests',status:'passed'}]},
+    pendingVerificationChecks:[{command:'Physical Safari',details:'Потрібен iPhone'}]};
+  const html=executionPanel({execution:{mode:'real',status:'blocked',canClarify:true,calls:1,agents:[],tasks:[task]}},h,button);
+  assert.match(html,/Локальні результати збережено/);
+  assert.match(html,/HTTP tests<\/code> · Пройшла локально/);
+  assert.match(html,/Physical Safari<\/code> · Очікує перевірки/);
+  assert.equal(html.match(/<strong>Storefront quality<\/strong>/g).length,1);
+  assert.match(html,/<details><summary>Чернетка та початковий звіт агента<\/summary>\s*<p>HTTP EACCES<\/p>/);
+  assert.match(html,/draft.md/);
+  assert.doesNotMatch(html,/data-action="clarify-run"|data-action="verify-host-run"/);
+});
+
+test('access retry has a separate action and explains entitlement revalidation',()=>{
+  const p={execution:{mode:'real',status:'failed',calls:8,agents:[],tasks:[],canRetryAccess:true}};
+  assert.match(executionPanel(p,h,button),/data-action="retry-access-run"/);
+  assert.match(executionPanel(p,h,button),/повторно перевіримо підписку, квоту й тариф/);
+  p.execution.canRetryAccess=false;assert.doesNotMatch(executionPanel(p,h,button),/data-action="retry-access-run"/);
+});

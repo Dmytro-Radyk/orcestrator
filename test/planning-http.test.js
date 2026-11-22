@@ -49,3 +49,52 @@ test('planning HTTP resolves the actual permitted director for status and refres
     body:JSON.stringify({kind:'plan',input:{name:'Test',description:'A test'}})});
   assert.equal(result.status,200);assert.equal((await result.json()).provenance.routeId,status.routeId);assert.deepEqual(refreshes,[false,true]);
 });
+
+test('planning has no total time limit and still explains an upstream model timeout',async t=>{
+  const server=createServer(planningHandler({configured:true,label:'slow-model',provider:'codex',agent:{}},async()=>{
+    throw new DOMException('The operation was aborted due to timeout','TimeoutError');
+  }));
+  server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+  const base=`http://127.0.0.1:${server.address().port}`,status=await(await fetch(base+'/api/planning/status')).json();
+  assert.equal(status.timeouts.plan,null);assert.equal(status.timeouts.idea,null);assert.equal(status.timeouts.team,null);
+  const response=await fetch(base+'/api/planning',{method:'POST',headers:{'Content-Type':'application/json','X-Planning-Token':status.token},
+    body:JSON.stringify({kind:'plan',input:{name:'Test',description:'Project'}})});
+  assert.equal(response.status,408);const result=await response.json();assert.equal(result.code,'PLANNING_TIMEOUT');
+  assert.match(result.error,/Планування не завершилося/);assert.match(result.error,/дані залишилися/);assert.ok(!result.error.includes('operation was aborted'));
+});
+
+test('planning HTTP selects by project before inference, preserves the explanation, and honors manual overrides',async t=>{
+  const selections=[],calls=[];
+  const configFor=(model,selection)=>({configured:true,label:model,provider:'opencode',routeId:`opencode:${model}`,agent:{provider:'opencode',model},...(selection?{selection}:{})});
+  const server=createServer(planningHandler({resolve:async({preferred}={})=>configFor(preferred?'manual':'bootstrap'),
+    select:async(request,signal)=>{assert.equal(signal.aborted,false);selections.push(request);return configFor('project-planner',{mode:'project',stage:request.kind,reason:'Chosen for the described architecture'});}
+  },async agent=>{calls.push(agent.model);return{text:JSON.stringify(demoPlan({name:'Test',description:'Project'}))};}));
+  server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+  const base=`http://127.0.0.1:${server.address().port}`,status=await(await fetch(base+'/api/planning/status')).json();assert.equal(status.selectionMode,'project');
+  const send=body=>fetch(base+'/api/planning',{method:'POST',headers:{'Content-Type':'application/json','X-Planning-Token':status.token},body:JSON.stringify(body)});
+  const automatic=await send({kind:'plan',input:{name:'Shop',description:'E-commerce with API contracts',priority:'quality'}});
+  assert.equal(automatic.status,200);const result=await automatic.json();assert.equal(result.provenance.model,'project-planner');assert.match(result.provenance.selection.reason,/architecture/);
+  assert.equal(selections[0].input.description,'E-commerce with API contracts');assert.equal(selections[0].kind,'plan');
+  const manual=await send({kind:'plan',input:{name:'Shop',description:'Existing plan'},managerRouteId:'opencode:manual'});assert.equal(manual.status,200);
+  assert.equal(selections.length,1);assert.deepEqual(calls,['project-planner','manual']);
+  assert.equal((await send({kind:'plan',input:{name:'',description:''}})).status,400);assert.equal(selections.length,1);
+});
+
+test('unlimited planning remains cancellable and releases the planner for the next request',async t=>{
+  let entered=false,aborted=false,calls=0;
+  const server=createServer(planningHandler({configured:true,label:'slow',provider:'codex',agent:{}},async(agent,{signal})=>{
+    if(++calls===1){entered=true;await new Promise((resolve,reject)=>signal.addEventListener('abort',()=>{aborted=true;reject(signal.reason);},{once:true}));}
+    return{text:JSON.stringify(demoPlan({name:'Test',description:'Project'}))};
+  }));
+  server.listen(0,'127.0.0.1');await once(server,'listening');const controller=new AbortController();
+  t.after(()=>{controller.abort();server.closeAllConnections();server.close();});
+  const base=`http://127.0.0.1:${server.address().port}`,status=await(await fetch(base+'/api/planning/status')).json();
+  const options={method:'POST',headers:{'Content-Type':'application/json','X-Planning-Token':status.token},body:JSON.stringify({kind:'plan',input:{name:'Test',description:'Project'}})};
+  const pending=fetch(base+'/api/planning',{...options,signal:controller.signal}),rejected=assert.rejects(pending,error=>error.name==='AbortError');
+  for(let i=0;i<200&&!entered;i++)await new Promise(r=>setTimeout(r,5));assert.equal(entered,true);
+  assert.equal((await(await fetch(base+'/api/planning/status')).json()).busy,true);
+  controller.abort();await rejected;
+  for(let i=0;i<200&&!aborted;i++)await new Promise(r=>setTimeout(r,5));assert.equal(aborted,true);
+  assert.equal((await(await fetch(base+'/api/planning/status')).json()).busy,false);
+  assert.equal((await fetch(base+'/api/planning',options)).status,200);assert.equal(calls,2);
+});

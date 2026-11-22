@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { resolve,join,relative,isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { createExecutionService } from '../scripts/execution-service.js';
+import { createExecutionService,executorConfig } from '../scripts/execution-service.js';
 import { seed } from '../apps/web/src/state.js';
 import { applyExecutionRun } from '../apps/web/src/execution.js';
 
@@ -30,6 +30,59 @@ async function fixture(t,provider) {
   return {service,call,workspace,p,dir,trusted};
 }
 async function until(predicate){for(let i=0;i<1500;i++){if(await predicate())return;await delay(10);}throw Error('Timed out');}
+
+test('UI execution and recovery deadlines are opt-in and reported by the status endpoint',async t=>{
+  assert.equal(executorConfig({}).timeoutMs,null);assert.equal(executorConfig({}).recoveryTimeoutMs,null);
+  assert.equal(executorConfig({ORCHESTRATOR_EXECUTOR_TIMEOUT_MS:'600000'}).timeoutMs,600000);
+  assert.equal(executorConfig({ORCHESTRATOR_RECOVERY_TIMEOUT_MS:'300000'}).recoveryTimeoutMs,300000);
+  for(const value of ['0','bad','-3'])assert.throws(()=>executorConfig({ORCHESTRATOR_EXECUTOR_TIMEOUT_MS:value}),/TIMEOUT_MS/);
+  const f=await fixture(t,async()=>({text:'done'}));
+  assert.deepEqual((await f.call('/api/execution/status')).value.timeouts,{task:null,recovery:null});
+  const started=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-write'}});
+  assert.equal(started.status,202);const run=f.service.engine.run(started.value.id);
+  await until(()=>run.status==='completed');assert.equal(run.project.limits.timeoutMs,null);
+});
+
+test('a new project uses its selected folder for execution and static preview',async t=>{
+  const f=await fixture(t,async(_agent,{cwd})=>{
+    await writeFile(join(cwd,'result.txt'),'done');
+    return {text:'done'};
+  });
+  const parent=join(f.dir,'Власні проєкти');
+  await mkdir(parent);
+  const listed=await f.call(`/api/project-folders?path=${encodeURIComponent(f.dir)}`);
+  assert.equal(listed.status,200);
+  assert.ok(listed.value.folders.some(folder=>folder.path===parent));
+  const project={...f.p,id:'with-custom-location',name:'Магазин',tasks:f.p.tasks.slice(0,1)};
+  const workspace={...f.workspace,projects:[...f.workspace.projects,project]};
+  const save=await f.call('/api/workspace','PUT',{revision:1,workspace,projectLocation:{projectId:project.id,parent}});
+  assert.equal(save.status,200);
+  const plan=await f.call('/api/execution/preview','POST',{projectId:project.id});
+  const folder=plan.value.workspace;
+  assert.match(relative(parent,folder),/^Магазин - [0-9a-f]{8}$/);
+
+  const launch=await f.call('/api/execution/runs','POST',{projectId:project.id,revision:project.revision,bindings:{backend:'codex-write'}});
+  assert.equal(launch.status,202);
+  const run=f.service.engine.run(launch.value.id);
+  await until(()=>['completed','failed','blocked'].includes(run.status));
+  assert.equal(run.status,'completed');
+  const file=await f.call(`/api/execution/runs/${run.id}/file?path=result.txt`);
+  assert.equal(file.value.text,'done');
+
+  const empty=await f.call('/api/project-preview','POST',{projectId:project.id});
+  assert.deepEqual(empty.value,{url:null});
+  await mkdir(join(folder,'dist'));
+  await writeFile(join(folder,'dist','index.html'),'<h1>Магазин</h1>');
+  await writeFile(join(folder,'dist','.private.json'),'{}');
+  const preview=await f.call('/api/project-preview','POST',{projectId:project.id});
+  assert.equal(preview.status,200);
+  const page=await fetch(preview.value.url);
+  assert.equal(page.status,200);
+  assert.match(page.headers.get('content-security-policy'),/frame-ancestors http:\/\/127\.0\.0\.1:/);
+  assert.equal(await page.text(),'<h1>Магазин</h1>');
+  assert.equal((await fetch(new URL('.private.json',preview.value.url))).status,404);
+  assert.equal((await f.call('/api/project-preview','POST',{projectId:project.id,url:'https://example.com'})).status,400);
+});
 
 test('saved Codex reasoning reaches the executor and unsupported levels stop before model invocation',async t=>{
   const observed=[];const f=await fixture(t,async agent=>{observed.push(agent.reasoningEffort);return {text:'Verified reasoning selection'};});

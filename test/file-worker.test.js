@@ -46,3 +46,29 @@ test('documenting a test command does not require unavailable tests in a paralle
     {model:async()=>({text:JSON.stringify(value)})});
   assert.deepEqual(result.report.files,['README.md']);assert.deepEqual(result.report.checks,[]);
 });
+
+test('blocked file worker reports need clarification and do not apply proposed changes',async t=>{
+  const cwd=await folder(t),value={status:'blocked',summary:'Confirm whether to build launch-ready without enabling sales',changes:[{path:'unapproved.txt',baseHash:null,content:'candidate'}],testFiles:[]};
+  await assert.rejects(executeFileWorker({access:'workspace-write'},{cwd,prompt:'Build shop',signal:AbortSignal.timeout(1000)},
+    {model:async()=>({text:JSON.stringify(value),usage:{input_tokens:2}})}),error=>{
+      assert.equal(error.code,'AGENT_BLOCKED');assert.equal(error.report.summary,value.summary);assert.equal(error.usage.input_tokens,2);return true;
+    });
+  await assert.rejects(access(join(cwd,'unapproved.txt')));
+});
+
+test('file worker keeps the full task before the most relevant files within the serialized request budget',async t=>{
+  const cwd=await folder(t);
+  await mkdir(join(cwd,'src'));
+  for(let i=0;i<15;i++)await writeFile(join(cwd,'src',`fixture-${i}.mjs`),'/* '+ 'ї\\\n'.repeat(7000)+' */');
+  await writeFile(join(cwd,'src','seo.mjs'),'export const sitemap = [];');
+  const task='Додати SEO в src/seo.mjs.\nAcceptance criteria: sitemap, policies and funnel analytics.';
+  let sent;
+  await executeFileWorker({access:'workspace-write'},{cwd,prompt:task,signal:AbortSignal.timeout(10000)},{model:async(_agent,{prompt})=>{
+    sent=prompt;
+    return {text:JSON.stringify({status:'completed',summary:'Checked context',changes:[],testFiles:[]})};
+  }});
+  assert.ok(Buffer.byteLength(JSON.stringify({event:'user',message:{content:sent}})+'\n')<=48*1024);
+  assert.ok(sent.indexOf(task)<sent.indexOf('Файли з вмістом:'));
+  assert.match(sent,/export const sitemap = \[\];/);
+  assert.match(sent,/Виявлені шляхи.*src\/fixture-0\.mjs/);
+});

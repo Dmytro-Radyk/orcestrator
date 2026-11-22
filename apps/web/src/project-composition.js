@@ -1,5 +1,6 @@
 import {catalogAgent} from './agent-library.js';
 import {validatePlan,validateAssignments} from './planning.js';
+import {recommendedCalls} from './call-budget.js';
 
 export function plannerChoices(catalog,now=Date.now()) {
   return (catalog?.routes??[]).filter(route=>route.decision?.allowed===true&&Date.parse(route.expiresAt)>now&&
@@ -8,8 +9,9 @@ export function plannerChoices(catalog,now=Date.now()) {
 
 export function draftRoutingInput(draft) {
   validatePlan(draft.plan);
+  const managerRouteId=draft.managerRouteId||(draft.planSource?.mode==='ai'?draft.planSource.routeId:null);
   return {name:draft.name,description:draft.idea?.summary??draft.description,plan:draft.plan,
-    ...(draft.managerRouteId?{managerRouteId:draft.managerRouteId}:{}),priority:draft.priority==='cost'?'economy':draft.priority,
+    ...(managerRouteId?{managerRouteId}:{}),...(!draft.managerRouteId&&managerRouteId?{allowManagerFallback:true}:{}),priority:draft.priority==='cost'?'economy':draft.priority,
     maxAgentsPerTask:draft.maxAgentsPerTask??1,requirements:Object.fromEntries(draft.plan.tasks.map(task=>[task.id,{
       workspaceWrite:draft.requirements?.[task.id]!=='text',...(draft.freeWorkers?{billing:'free_tier'}:{})}]))};
 }
@@ -33,7 +35,7 @@ export function composeProject(draft,existingProfiles=[],id=crypto.randomUUID())
   const tasks=draft.plan.tasks.map(t=>({...structuredClone(t),status:'pending',agentIds:routing.assignments.find(a=>a.taskId===t.id).agentIds}));
   const team=[...new Set(tasks.flatMap(t=>t.agentIds))];
   return {profiles:profiles.filter(p=>team.includes(p.id)),project:{id,name:draft.name,description:draft.idea?.summary??draft.description,icon:'layers',team,tasks,
-    concurrency:3,maxCalls:50,revision:1,status:'idle',events:[],artifacts:[],
-    planning:{mode:draft.mode,originalBrief:draft.description,priority:draft.priority,managerRouteId:draft.managerRouteId||null,
+    concurrency:3,maxCalls:Math.max(50,recommendedCalls(tasks)),revision:1,status:'idle',events:[],artifacts:[],
+    planning:{mode:draft.mode,originalBrief:draft.description,priority:draft.priority,managerRouteId:draft.managerRouteId||draft.proposal?.managerRouteId||(draft.planSource?.mode==='ai'?draft.planSource.routeId:null)||null,
       idea:draft.idea,plan:draft.plan,routing,ideaSource:draft.ideaSource,planSource:draft.planSource,teamSource:draft.teamSource}}};
 }

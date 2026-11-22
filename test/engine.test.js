@@ -5,6 +5,8 @@ import { join, resolve, relative, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Engine } from '../src/engine.js';
 import { Store } from '../src/store.js';
+import { dependencyHandoff } from '../src/execution-context.js';
+import { withModelPolicy } from '../scripts/model-registry.js';
 
 const agents = [
   { id: 'dev', provider: 'demo', skills: ['code'] },
@@ -27,6 +29,68 @@ async function until(predicate) {
   throw new Error('Timed out waiting for test condition');
 }
 const finished = run => !['running', 'paused'].includes(run.status);
+
+test('storefront evidence gets one automatic repair before blocking publication', async t => {
+  const prompts=[];
+  const engine=fixture(t,async(_agent,{prompt})=>{
+    prompts.push(prompt);
+    return {text:'Draft only',report:{status:'completed',summary:'Draft only',files:[],checks:[]}};
+  });
+  engine.workspaces={prepare:async()=>({cwd:process.cwd()}),publish:async()=>assert.fail('Evidence must be checked before publishing')};
+  const project=engine.createProject({name:'Storefront',workspace:process.cwd(),workspaceMode:'isolated',
+    agents,tasks:[task('storefront-acceptance',{agentIds:['dev']})]});
+  const run=engine.start(project.id);
+  await until(()=>finished(run));
+  assert.equal(run.status,'blocked');
+  assert.equal(run.calls,2);
+  assert.match(prompts[1],/Виправ тільки відсутні докази/);
+  assert.equal(run.events.filter(event=>event.type==='task.storefront_evidence_retry').length,1);
+});
+
+test('completed worktree context keeps summaries, file references and checks without command logs',()=>{
+  const output={agentId:'dev',text:'A long command log',report:{status:'completed',summary:'Implemented API',files:['src/api.js'],
+    checks:[{command:'node --test',status:'passed',required:true,details:'A long command log'}]}};
+  const dependency={title:'API',result:output.text,workspace:{commit:'accepted'},outputs:[output]};
+  const brief=dependencyHandoff(dependency,true);
+  assert.equal(brief.outputs[0].summary,'Implemented API');
+  assert.deepEqual(brief.outputs[0].files,['src/api.js']);
+  assert.equal(brief.outputs[0].checks[0].status,'passed');
+  assert.ok(!JSON.stringify(brief).includes('A long command log'));
+  assert.deepEqual(dependencyHandoff(dependency,false),{title:'API',result:output.text});
+  assert.equal(dependencyHandoff({...dependency,outputs:[{text:'Text only'}]},true).result,output.text);
+});
+
+test('quota admission failures do not consume the internal call budget',async t=>{
+  const policy=withModelPolicy({requireRoute:async()=>{throw Object.assign(Error('Quota exceeded'),{code:'MODEL_ACCESS_BLOCKED'});}},
+    async()=>assert.fail('The blocked model must not run'));
+  const engine=fixture(t,policy);
+  const project=engine.createProject({name:'Admission',agents:[{id:'dev',provider:'codex',model:'fixture',skills:['code']}],tasks:[task('a')]});
+  const run=engine.start(project.id);
+  await until(()=>finished(run));
+  assert.equal(run.calls,0);
+  assert.equal(run.tasks[0].failure.code,'MODEL_ACCESS_BLOCKED');
+});
+
+test('waiting Codex work does not occupy the execution slot Gemini can use', async t=>{
+  let release; const gate=new Promise(resolve=>{release=resolve;});
+  const entered=[];
+  const engine=fixture(t,async(agent)=>{
+    entered.push(agent.id);
+    if(agent.id==='codex'&&entered.length===1)await gate;
+    return {text:'Done'};
+  });
+  const project=engine.createProject({name:'Two subscriptions',agents:[
+    {id:'codex',provider:'codex',model:'fixture',skills:['code'],billingBoundary:'subscription_quota_guarded'},
+    {id:'gemini',provider:'antigravity',model:'gemini-fixture',skills:['code']}
+  ],limits:{concurrency:2},tasks:[task('a',{agentIds:['codex']}),task('b',{agentIds:['codex']}),task('c',{agentIds:['gemini']})]});
+  const run=engine.start(project.id);
+  try{
+    await until(()=>entered.includes('gemini'));
+    assert.deepEqual(entered,['codex','gemini']);
+  }finally{release();}
+  await until(()=>finished(run));
+  assert.equal(run.status,'completed');
+});
 
 test('parallel teams obey concurrency, dependencies and persist results', async t => {
   let active = 0, peak = 0;
@@ -154,4 +218,21 @@ test('restart marks unfinished work interrupted instead of replaying edits', t =
   const run = engine.start(project.id);
   const recovered = new Store(engine.store.directory).data.runs[run.id];
   assert.equal(recovered.status, 'interrupted');
+});
+
+test('execution has no default deadline, accepts an explicit timeout and rejects invalid values',async t=>{
+  const engine=fixture(t,async(_,ctx)=>{await delay(80,undefined,{signal:ctx.signal});return{text:'completed'};});
+  const project=engine.createProject({name:'No deadline',agents,tasks:[task('a')]});
+  assert.equal(project.limits.timeoutMs,null);
+  const run=engine.start(project.id);await until(()=>finished(run));assert.equal(run.status,'completed');
+  for(const value of [0,-1,1.5,'100',undefined])assert.throws(()=>engine.createProject({name:'Invalid',agents,tasks:[task('a')],limits:{timeoutMs:value}}),/timeoutMs/);
+  const limited=engine.start(engine.createProject({name:'Limited',agents,tasks:[task('a')],limits:{timeoutMs:20}}).id);
+  await until(()=>finished(limited));assert.equal(limited.tasks[0].failure.code,'AGENT_TIMEOUT');assert.match(limited.tasks[0].error,/20 мс/);
+});
+
+test('an explicit execution deadline starts after acquiring the workspace slot',async t=>{
+  const engine=fixture(t,async(_,ctx)=>{await delay(125,undefined,{signal:ctx.signal});return{text:'done'};});
+  const project=engine.createProject({name:'Queued deadline',agents:[{id:'dev',provider:'codex',skills:['code']}],tasks:[task('a')],limits:{timeoutMs:200}});
+  const first=engine.start(project.id),second=engine.start(project.id);
+  await until(()=>finished(first)&&finished(second));assert.equal(first.status,'completed');assert.equal(second.status,'completed');
 });

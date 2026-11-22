@@ -1,8 +1,8 @@
 import { createProjectWizard } from './create-project.js';
 import { composeProject } from './project-composition.js';
 import { renderConnections } from './connections.js';
-import { createExecutionClient } from './execution.js';
-import { executionPanel, fileArtifacts, runHistory } from './execution-ui.js';
+import { createExecutionClient, serializeWorkspaceState } from './execution.js';
+import { executionPanel, fileArtifacts, hasVerificationChecks, runHistory } from './execution-ui.js';
 import { renderRoutingSection, summarizeTaskModels, formatBillingBadge } from './routing-ui.js';
 import { renderSolarStage } from './solar-system.js';
 import { patchLiveDom } from './live-dom.js';
@@ -46,6 +46,9 @@ try { state = JSON.parse(localStorage.getItem('orcestrator.ui.v1')); if (state?.
 // A closed prototype tab does not imply a live background execution.
 for (const p of state.projects) if (p.status === 'running' && p.execution?.mode !== 'real') { p.status = 'paused'; log(p, 'Демо відновлено на паузі після відкриття сторінки'); }
 let route = location.hash.slice(1) || 'overview', tab = 'plan', view = 'solar', selected = null, search = '', navOpen = false;
+const resumingCancelled = new Set();
+const verifyingHost = new Set();
+let toastTimer;
 const mobileNavigation=window.matchMedia('(max-width: 700px)');
 mobileNavigation.addEventListener('change',()=>{if(navOpen){navOpen=false;render({executionOnly:true});}});
 let agentLibraryFilters = {query:'',backend:'',billing:'',status:'all'};
@@ -62,7 +65,7 @@ function retainProfiles(ids) {
 }
 const project = () => state.projects.find(p => p.id === state.activeId) ?? state.projects[0];
 const agent = id => state.agents.find(a => a.id === id) ?? project().execution?.agents?.map(a=>({...a,initials:a.name.slice(0,2).toUpperCase(),color:'purple'})).find(a=>a.id===id);
-function save(localOnly=false) { try { localStorage.setItem('orcestrator.ui.v1', JSON.stringify(state)); } catch { toast('Не вдалося зберегти кеш у браузері. Експортуйте проєкт.'); } if(!localOnly)execution?.scheduleSave(); }
+function save(localOnly=false) { try { localStorage.setItem('orcestrator.ui.v1', JSON.stringify(serializeWorkspaceState(state))); } catch { toast('Не вдалося зберегти кеш у браузері. Експортуйте проєкт.'); } if(!localOnly)execution?.scheduleSave(); }
 const button = (action, text, glyph, cls = 'btn', extra = '') => `<button type="button" class="${cls}" data-action="${action}" ${extra}>${glyph ? icon(glyph) : ''}${text}</button>`;
 const badge = status => `<span class="badge ${h(status)}"><i></i>${h(labels[status] ?? status)}</span>`;
 const avatar = (a, small = false) => a ? `<span class="avatar ${h(a.color)} ${small ? 'small' : ''}" title="${h(a.name)}">${h(a.initials)}</span>` : '';
@@ -73,7 +76,8 @@ function toast(message) {
     if (!note) { note = document.createElement('div'); note.className = 'modal-alert'; note.setAttribute('role', 'alert'); ($('#modal form') ?? $('#modal')).prepend(note); }
     note.textContent = message;
   }
-  setTimeout(() => $('#toast').classList.remove('visible'), 3500);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $('#toast').classList.remove('visible'), 3500);
 }
 function navigate(next) { location.hash = next; }
 window.addEventListener('hashchange', () => { route = location.hash.slice(1) || 'overview'; selected = null; search = ''; navOpen = false; render(); });
@@ -88,10 +92,10 @@ function header() {
 function heading(eyebrow, title, description, action = '') { return `<div class="page-heading"><div><div class="eyebrow">${eyebrow}</div><h1>${h(title)}</h1><p>${h(description)}</p></div><div class="heading-actions">${action}</div></div>`; }
 function progress(p) { return Math.round(p.tasks.filter(t => t.status === 'done').length / Math.max(1, p.tasks.length) * 100); }
 function projectCard(p) {
-  return `<button class="project-card" data-action="open-project" data-id="${h(p.id)}"><div class="project-card-top"><span class="project-glyph ${p.id === 'core' ? 'orange' : 'purple'}">${icon(p.icon)}</span>${badge(p.status)}</div><h3>${h(p.name)}</h3><p>${h(p.description)}</p><div class="project-card-progress"><span>Виконання плану</span><strong>${progress(p)}%</strong></div><div class="progress"><span style="width:${progress(p)}%"></span></div><div class="project-card-footer"><div class="avatar-stack">${p.team.slice(0, 4).map(id => avatar(agent(id), true)).join('')}</div><span>${p.tasks.length} задач ${icon('arrow')}</span></div></button>`;
+  return `<button type="button" class="project-card" data-action="open-project" data-id="${h(p.id)}"><div class="project-card-top"><span class="project-glyph ${p.id === 'core' ? 'orange' : 'purple'}">${icon(p.icon)}</span>${badge(p.status)}</div><h3>${h(p.name)}</h3><p>${h(p.description)}</p><div class="project-card-progress"><span>Виконання плану</span><strong>${progress(p)}%</strong></div><div class="progress"><span style="width:${progress(p)}%"></span></div><div class="project-card-footer"><div class="avatar-stack">${p.team.slice(0, 4).map(id => avatar(agent(id), true)).join('')}</div><span>${p.tasks.length} задач ${icon('arrow')}</span></div></button>`;
 }
 function stats(p) {
-  const metrics = [ ['users', p.team.length.toString().padStart(2, '0'), 'Агентів у команді', 'Ролі підібрані під задачі'], ['branch', p.tasks.length.toString().padStart(2, '0'), 'Задач у плані', `${p.tasks.filter(t => t.status === 'done').length} завершено · ${p.tasks.filter(t => t.status === 'pending').length} у черзі`], ['pulse', p.tasks.filter(t => t.status === 'running').length.toString().padStart(2, '0'), 'Виконуються зараз', `До ${p.concurrency} задач одночасно`], ['shield', p.execution?.mode==='real'?String(p.execution.calls):'—', p.execution?.mode==='real'?'Викликів оркестратора':'Витрати на моделі', p.execution?.mode==='real'?'Грошова сума не обчислюється':'Демо без викликів API'] ];
+  const metrics = [ ['users', p.team.length.toString().padStart(2, '0'), 'Агентів у команді', 'Ролі підібрані під задачі'], ['branch', p.tasks.length.toString().padStart(2, '0'), 'Задач у плані', `${p.tasks.filter(t => t.status === 'done').length} завершено · ${p.tasks.filter(t => t.status === 'pending').length} у черзі`], ['pulse', p.tasks.filter(t => t.status === 'running').length.toString().padStart(2, '0'), 'Виконуються зараз', `До ${Number(p.concurrency) || 1} задач одночасно`], ['shield', p.execution?.mode==='real'?String(p.execution.calls):'—', p.execution?.mode==='real'?'Викликів оркестратора':'Витрати на моделі', p.execution?.mode==='real'?'Грошова сума не обчислюється':'Демо без викликів API'] ];
   return `<div class="stats">${metrics.map(([glyph, value, label, note]) => `<div class="stat"><div class="stat-label">${icon(glyph)}${label}</div><strong>${value}</strong><small>${note}</small></div>`).join('')}</div>`;
 }
 function activity(p, count = 5) {
@@ -99,40 +103,62 @@ function activity(p, count = 5) {
 }
 function overview() {
   const p = project();
-  return `<section class="mission-hero"><div class="hero-copy"><div class="eyebrow"><span class="hero-beacon"></span> MISSION CONTROL <span class="hero-coordinate">/ 001</span></div><h1>Ваш центр керування<br><span>командним інтелектом.</span></h1><p>Кожен агент — частина сузір’я.<br>Поєднайте їхні можливості для вашої наступної місії.</p><div class="hero-actions">${button('new-project', 'Новий проєкт', 'plus', 'btn primary')}<a class="hero-link" href="#projects">Переглянути проєкти ${icon('arrow')}</a></div></div><div class="orbital-art" aria-hidden="true"><img src="/orbital.svg" alt=""><span class="orbital-label">MULTI-AGENT CONSTELLATION</span></div><span class="hero-corner">LOCAL SPACE</span></section><section class="solar-overview-section"><div class="section-heading"><h2>Сонячна система оркестратора <span>LIVE</span></h2><button class="text-button" data-action="open-project" data-id="${h(p.id)}">Відкрити проєкт ${icon('arrow')}</button></div><div id="solar-stage" data-compact="true"></div></section>${stats(p)}<section><div class="section-heading"><h2>Ваші проєкти <span>${state.projects.length}</span></h2><a href="#projects">Усі проєкти ${icon('arrow')}</a></div><div class="project-cards">${state.projects.slice(0, 2).map(projectCard).join('')}<button class="new-project-card" data-action="new-project"><span>${icon('plus')}</span><strong>Створити проєкт</strong><p>Нова мета. Нова команда.<br>Наступний результат.</p></button></div></section><div class="overview-bottom"><section class="panel"><div class="panel-heading"><h2>Журнал місії</h2><span class="muted text-small">${h(p.name)}</span></div>${activity(p, 4)}</section><section class="panel next-step"><span class="eyebrow">НАСТУПНИЙ КРОК</span><div class="step-illustration">${icon('orbit')}</div><h2>Виведіть команду на орбіту</h2><p>Перегляньте граф задач, налаштуйте виконавців і запустіть команду.</p>${button('open-project', 'Відкрити робочий простір', 'arrow', 'btn', `data-id="${h(p.id)}"`)}</section></div>`;
+  return `<section class="mission-hero"><div class="hero-copy"><div class="eyebrow"><span class="hero-beacon"></span> MISSION CONTROL <span class="hero-coordinate">/ 001</span></div><h1>Ваш центр керування<br><span>командним інтелектом.</span></h1><p>Кожен агент — частина сузір’я.<br>Поєднайте їхні можливості для вашої наступної місії.</p><div class="hero-actions">${button('new-project', 'Новий проєкт', 'plus', 'btn primary')}<a class="hero-link" href="#projects">Переглянути проєкти ${icon('arrow')}</a></div></div><div class="orbital-art" aria-hidden="true"><img src="/orbital.svg" alt=""><span class="orbital-label">MULTI-AGENT CONSTELLATION</span></div><span class="hero-corner">LOCAL SPACE</span></section><section class="solar-overview-section"><div class="section-heading"><h2>Сонячна система оркестратора <span>LIVE</span></h2><button type="button" class="text-button" data-action="open-project" data-id="${h(p.id)}">Відкрити проєкт ${icon('arrow')}</button></div><div id="solar-stage" data-compact="true"></div></section>${stats(p)}<section><div class="section-heading"><h2>Ваші проєкти <span>${state.projects.length}</span></h2><a href="#projects">Усі проєкти ${icon('arrow')}</a></div><div class="project-cards">${state.projects.slice(0, 2).map(projectCard).join('')}<button type="button" class="new-project-card" data-action="new-project"><span>${icon('plus')}</span><strong>Створити проєкт</strong><p>Нова мета. Нова команда.<br>Наступний результат.</p></button></div></section><div class="overview-bottom"><section class="panel"><div class="panel-heading"><h2>Журнал місії</h2><span class="muted text-small">${h(p.name)}</span></div>${activity(p, 4)}</section><section class="panel next-step"><span class="eyebrow">НАСТУПНИЙ КРОК</span><div class="step-illustration">${icon('orbit')}</div><h2>Виведіть команду на орбіту</h2><p>Перегляньте граф задач, налаштуйте виконавців і запустіть команду.</p>${button('open-project', 'Відкрити робочий простір', 'arrow', 'btn', `data-id="${h(p.id)}"`)}</section></div>`;
 }
 function runControls(p) {
+  if (p.execution?.hostChecking || (p.execution?.id && verifyingHost.has(p.execution.id))) return button('noop','Локальна перевірка…','clock','btn','disabled');
+  if(p.execution?.canClarify){
+    const task=p.execution.tasks.find(task=>task.canVerifyOnHost);
+    if(task)return button('verify-host-run','Запустити локальні перевірки','play','btn primary',`data-id="${h(task.id)}"`);
+    if(p.execution.tasks.some(hasVerificationChecks))return button('verify-blocked-run','Додати результати перевірок','file','btn');
+    return button('clarify-run','Уточнити вимоги','spark','btn primary');
+  }
   if (p.execution?.draining) return button('noop','Зупиняється…','clock','btn','disabled');
   if (p.status === 'running') return `${button('pause', 'Пауза', 'pause')}${button('cancel', 'Зупинити', 'stop', 'btn danger-quiet')}`;
   if (p.status === 'paused') return `${button('resume', 'Продовжити', 'play', 'btn primary')}${button('cancel', 'Зупинити', 'stop')}`;
+  if (p.status === 'cancelled' && p.execution?.canResumeCancelled) {
+    const busy = resumingCancelled.has(p.execution.id);
+    return button('resume-cancelled-run', busy ? 'Перевіряємо доступ…' : 'Продовжити після скасування', 'play', 'btn primary',
+      busy || !execution?.ready ? 'disabled' : '');
+  }
   return button('real-start','Запустити AI-команду','play','btn primary',execution?.ready?'':'disabled') + button('start','Демо','','btn');
 }
 function projectPage() {
   const p = project();
-  const tabs = [['plan', 'План задач'], ['team', 'Команда'], ['activity', 'Активність'], ['artifacts', 'Результати'], ['config', 'Налаштування']];
+  const tabs = [['plan', 'Сонячна система'], ['team', 'План'], ['activity', 'Активність'], ['artifacts', 'Результати'], ['config', 'Налаштування']];
   const streamState = execution?.streamState?.(p.execution?.id) ?? null;
-  return `<div class="project-intro"><div><div class="eyebrow"><span class="project-dot orange"></span> ПРОЄКТ / РЕВІЗІЯ ${p.revision}</div><h1>${h(p.name)}</h1><p>${h(p.description)}</p></div><div class="heading-actions">${button('edit-project', '', 'settings', 'btn icon-btn', 'aria-label="Редагувати проєкт"')}${runControls(p)}</div></div><div class="project-meta">${badge(p.status)}<span>${icon('users')}${p.team.length} агенти</span><span>${icon('shield')}Збалансований режим</span><span>${icon('code')}${p.execution?.mode==='real'?'Реальний запуск AI-команди':'План проєкту / демо доступне окремо'}</span></div>${executionPanel(p,h,button,streamState)}<div class="tabs" data-live-key="project-tabs" role="tablist">${tabs.map(([id, label]) => `<button role="tab" aria-selected="${tab === id}" class="${tab === id ? 'selected' : ''}" data-action="tab" data-id="${id}">${label}${id === 'team' ? `<span>${p.team.length}</span>` : ''}</button>`).join('')}</div>${tab === 'plan' ? plan(p) : tab === 'team' ? teamPage(p) : tab === 'activity' ? `<section class="panel" data-live-key="activity-panel"><div class="panel-heading"><h2>Журнал запуску</h2>${button('export', 'Експортувати', 'download')}</div>${activity(p, 100)}</section>` : tab === 'artifacts' ? artifacts(p) : config(p)}`;
+  return `<div class="project-intro"><div><div class="eyebrow"><span class="project-dot orange"></span> ПРОЄКТ / РЕВІЗІЯ ${Number(p.revision) || 1}</div><h1>${h(p.name)}</h1><p>${h(p.description)}</p></div><div class="heading-actions">${button('edit-project', '', 'settings', 'btn icon-btn', 'aria-label="Редагувати проєкт"')}${runControls(p)}</div></div><div class="project-meta">${badge(p.status)}<span>${icon('users')}${p.team.length} агенти</span><span>${icon('shield')}Збалансований режим</span><span>${icon('code')}${p.execution?.mode==='real'?'Реальний запуск AI-команди':'План проєкту / демо доступне окремо'}</span></div>${executionPanel(p,h,button,streamState)}<div class="tabs" data-live-key="project-tabs" role="tablist">${tabs.map(([id, label]) => `<button type="button" role="tab" aria-selected="${tab === id}" class="${tab === id ? 'selected' : ''}" data-action="tab" data-id="${id}">${label}</button>`).join('')}</div>${tab === 'plan' ? plan(p) : tab === 'team' ? teamPage(p) : tab === 'activity' ? `<section class="panel" data-live-key="activity-panel"><div class="panel-heading"><h2>Журнал запуску</h2>${button('export', 'Експортувати', 'download')}</div>${activity(p, 100)}</section>` : tab === 'artifacts' ? artifacts(p) : config(p)}`;
 }
 function plan(p) {
-  return `<div class="plan-layout"><section class="panel graph-panel"><div class="panel-heading"><div><h2>План виконання <span class="count">${p.tasks.length}</span></h2><p class="muted text-small">Залежності задач і призначені виконавці</p></div>${button('new-task', 'Задача', 'plus', 'btn small-btn', ['running', 'paused'].includes(p.status) ? 'disabled title="Редагування доступне після завершення запуску"' : '')}</div><div class="graph-toolbar"><div class="segmented">${[['solar','orbit','Сонячна система'], ['graph','branch','Граф'], ['list','layers','Список'], ['tree','users','Субагенти']].map(([id, glyph, label]) => button(`view-${id}`, label, glyph, view === id ? 'chosen' : '')).join('')}</div><div class="graph-legend"><span class="legend-dot done"></span>Готово<span class="legend-dot running"></span>В роботі<span class="legend-dot pending"></span>У черзі</div></div>${view === 'solar' ? '<div id="solar-stage" data-live-key="solar-stage"></div>' : view === 'graph' ? graph(p) : view === 'list' ? taskList(p) : tree(p)}<div class="graph-footer"><span>${icon('link')}${view === 'solar' ? 'Натисніть Сонце, планету або супутник для деталей' : 'Натисніть задачу, щоб переглянути деталі'}</span><span>${p.execution?.mode==='real'?`ІЗОЛЬОВАНІ WORKTREE · ${p.concurrency} паралельних викликів`:'ДЕМО · '+p.concurrency+' паралельні задачі'}</span></div></section><section class="panel team-summary"><div class="panel-heading"><h2>Команда проєкту</h2><button class="text-button" data-action="tab" data-id="team">${icon('settings')}</button></div>${p.team.map(id => { const a = agent(id); if (!a) return ''; const working = p.tasks.some(t => t.status === 'running' && t.agentIds.includes(id)); return `<button class="team-member" data-action="agent-detail" data-id="${h(id)}">${avatar(a)}<span><strong>${h(a.name)}</strong><small>${h(a.model)}</small></span><span class="availability ${working ? 'busy' : ''}" title="${working ? 'Виконує задачу' : 'Профіль ролі'}"></span></button>`; }).join('')}<div class="team-summary-footer">${icon('shield')}Агенти працюють у межах<br>прав та бюджету проєкту</div></section></div><div class="section-heading section-spaced"><h2>Активність запуску</h2><button class="text-button" data-action="tab" data-id="activity">Повний журнал ${icon('arrow')}</button></div><section class="panel" data-live-key="plan-activity">${activity(p, 3)}</section>${selected ? drawer(p) : ''}`;
+  return `<div class="plan-layout"><section class="panel graph-panel"><div class="panel-heading"><div><h2>Сонячна система та задачі <span class="count">${p.tasks.length}</span></h2><p class="muted text-small">Залежності задач і призначені виконавці</p></div>${button('new-task', 'Задача', 'plus', 'btn small-btn', locked(p) ? 'disabled title="Редагування доступне після завершення запуску"' : '')}</div><div class="graph-toolbar"><div class="segmented">${[['solar','orbit','Сонячна система'], ['graph','branch','Граф'], ['list','layers','Список'], ['tree','users','Субагенти']].map(([id, glyph, label]) => button(`view-${id}`, label, glyph, view === id ? 'chosen' : '')).join('')}</div><div class="graph-legend"><span class="legend-dot done"></span>Готово<span class="legend-dot running"></span>В роботі<span class="legend-dot pending"></span>У черзі</div></div>${view === 'solar' ? '<div id="solar-stage" data-live-key="solar-stage"></div>' : view === 'graph' ? graph(p) : view === 'list' ? taskList(p) : tree(p)}<div class="graph-footer"><span>${icon('link')}${view === 'solar' ? 'Натисніть Сонце, планету або супутник для деталей' : 'Натисніть задачу, щоб переглянути деталі'}</span><span>${p.execution?.mode==='real'?`ІЗОЛЬОВАНІ WORKTREE · ${Number(p.concurrency) || 1} паралельних викликів`:'ДЕМО · '+(Number(p.concurrency) || 1)+' паралельні задачі'}</span></div></section><section class="panel team-summary"><div class="panel-heading"><h2>Команда проєкту</h2><button type="button" class="text-button" data-action="tab" data-id="team">${icon('settings')}</button></div>${p.team.map(id => { const a = agent(id); if (!a) return ''; const working = p.tasks.some(t => t.status === 'running' && t.agentIds.includes(id)); return `<button type="button" class="team-member" data-action="agent-detail" data-id="${h(id)}">${avatar(a)}<span><strong>${h(a.name)}</strong><small>${h(a.model)}</small></span><span class="availability ${working ? 'busy' : ''}" title="${working ? 'Виконує задачу' : 'Профіль ролі'}"></span></button>`; }).join('')}<div class="team-summary-footer">${icon('shield')}Агенти працюють у межах<br>прав та бюджету проєкту</div></section></div>${selected ? drawer(p) : ''}`;
 }
 function taskNode(t, index, style = '') {
-  return `<button class="task-node ${h(t.status)} ${selected === t.id ? 'focused' : ''}" data-action="select-task" data-id="${h(t.id)}" ${style}><div class="task-node-top"><span class="task-number">${String(index + 1).padStart(2, '0')}</span><span class="node-state">${icon(t.status === 'done' ? 'check' : t.status === 'running' ? 'pulse' : 'clock')}</span></div><strong>${h(t.title)}</strong><div class="task-agent">${t.agentIds.map(id => avatar(agent(id), true)).join('')}<span>${h(agent(t.agentIds[0])?.name ?? 'Не призначено')}${t.agentIds.length > 1 ? ` +${t.agentIds.length - 1}` : ''}</span></div><div class="node-bottom">${badge(t.status)}${t.children ? `<span>${icon('branch')} ${t.children.length}</span>` : ''}</div></button>`;
+  return `<button type="button" class="task-node ${h(t.status)} ${selected === t.id ? 'focused' : ''}" data-action="select-task" data-id="${h(t.id)}" ${style}><div class="task-node-top"><span class="task-number">${String(index + 1).padStart(2, '0')}</span><span class="node-state">${icon(t.status === 'done' ? 'check' : t.status === 'running' ? 'pulse' : 'clock')}</span></div><strong>${h(t.title)}</strong><div class="task-agent">${t.agentIds.map(id => avatar(agent(id), true)).join('')}<span>${h(agent(t.agentIds[0])?.name ?? 'Не призначено')}${t.agentIds.length > 1 ? ` +${t.agentIds.length - 1}` : ''}</span></div><div class="node-bottom">${badge(t.status)}${t.children ? `<span>${icon('branch')} ${t.children.length}</span>` : ''}</div></button>`;
 }
 function graph(p) {
-  const levels = new Map();
-  const level = t => { if (levels.has(t.id)) return levels.get(t.id); const value = t.dependsOn.length ? Math.max(...t.dependsOn.map(id => level(p.tasks.find(d => d.id === id)))) + 1 : 0; levels.set(t.id, value); return value; };
-  p.tasks.forEach(level);
+  const levels = new Map(), byId = new Map(p.tasks.map(t => [t.id, t]));
+  const level = (t, visiting = new Set()) => {
+    if (!t) return 0;
+    if (levels.has(t.id)) return levels.get(t.id);
+    if (visiting.has(t.id)) return 0;
+    visiting.add(t.id);
+    const deps = (t.dependsOn ?? []).map(id => byId.get(id)).filter(Boolean);
+    const value = deps.length ? Math.max(...deps.map(d => level(d, visiting))) + 1 : 0;
+    visiting.delete(t.id);
+    levels.set(t.id, value);
+    return value;
+  };
+  p.tasks.forEach(t => level(t));
   const max = Math.max(0, ...levels.values()), positions = new Map();
   for (let col = 0; col <= max; col++) { const nodes = p.tasks.filter(t => levels.get(t.id) === col); nodes.forEach((t, row) => positions.set(t.id, { x: 25 + col * 246, y: 34 + row * 192 })); }
   const width = Math.max(950, (max + 1) * 246 + 30), rows = Math.max(1, ...Array.from({ length: max + 1 }, (_, col) => p.tasks.filter(t => levels.get(t.id) === col).length)), height = Math.max(340, rows * 192 + 65);
-  return `<div class="graph-scroll"><div class="graph-canvas" style="width:${width}px;height:${height}px"><svg class="edges" width="${width}" height="${height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7f91b8"/></marker></defs>${p.tasks.flatMap(t => t.dependsOn.map(id => { const from = positions.get(id), to = positions.get(t.id); return `<path d="M${from.x + 210},${from.y + 78} C${from.x + 230},${from.y + 78} ${to.x - 20},${to.y + 78} ${to.x - 4},${to.y + 78}" fill="none" stroke="${t.status === 'done' ? '#6ecdb5' : '#4a6084'}" stroke-width="1.5" marker-end="url(#arrow)"/>`; })).join('')}</svg>${p.tasks.map((t, i) => { const pos = positions.get(t.id); return taskNode(t, i, `style="left:${pos.x}px;top:${pos.y}px"`); }).join('')}<span class="canvas-label">${icon('branch')} WORKFLOW / ${h(p.name.toUpperCase())}</span></div></div>`;
+  return `<div class="graph-scroll"><div class="graph-canvas" style="width:${width}px;height:${height}px"><svg class="edges" width="${width}" height="${height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7f91b8"/></marker></defs>${p.tasks.flatMap(t => (t.dependsOn ?? []).map(id => { const from = positions.get(id), to = positions.get(t.id); if (!from || !to) return ''; return `<path d="M${from.x + 210},${from.y + 78} C${from.x + 230},${from.y + 78} ${to.x - 20},${to.y + 78} ${to.x - 4},${to.y + 78}" fill="none" stroke="${t.status === 'done' ? '#6ecdb5' : '#4a6084'}" stroke-width="1.5" marker-end="url(#arrow)"/>`; })).join('')}</svg>${p.tasks.map((t, i) => { const pos = positions.get(t.id) ?? { x: 25, y: 34 }; return taskNode(t, i, `style="left:${pos.x}px;top:${pos.y}px"`); }).join('')}<span class="canvas-label">${icon('branch')} WORKFLOW / ${h(p.name.toUpperCase())}</span></div></div>`;
 }
-function taskList(p) { return `<div class="task-list">${p.tasks.map((t, i) => `<button data-action="select-task" data-id="${h(t.id)}"><span class="task-number">${String(i+1).padStart(2,'0')}</span><strong>${h(t.title)}</strong><span>${t.agentIds.map(id => avatar(agent(id), true)).join('')}</span>${badge(t.status)}${icon('chevron')}</button>`).join('')}</div>`; }
+function taskList(p) { return `<div class="task-list">${p.tasks.map((t, i) => `<button type="button" data-action="select-task" data-id="${h(t.id)}"><span class="task-number">${String(i+1).padStart(2,'0')}</span><strong>${h(t.title)}</strong><span>${t.agentIds.map(id => avatar(agent(id), true)).join('')}</span>${badge(t.status)}${icon('chevron')}</button>`).join('')}</div>`; }
 function tree(p) {
-  const rows=tasks=>tasks.map(t=>`<div class="tree-task"><button data-action="select-task" data-id="${h(t.id)}">${icon(t.parentId?'users':'branch')}<strong>${h(t.title)}</strong>${badge(t.status)}</button>${t.children?.length?`<div class="tree-child">${rows(t.children)}</div>`:''}</div>`).join('');
+  const rows=tasks=>tasks.map(t=>`<div class="tree-task"><button type="button" data-action="select-task" data-id="${h(t.id)}">${icon(t.parentId?'users':'branch')}<strong>${h(t.title)}</strong>${badge(t.status)}</button>${t.children?.length?`<div class="tree-child">${rows(t.children)}</div>`:''}</div>`).join('');
   const count=p.execution?.tasks?.filter(t=>t.parentId).length??p.tasks.reduce((n,t)=>n+(t.children?.length??0),0);
-  return `<div class="subtree"><div class="tree-root">${icon('layers')} ${h(p.name)}</div>${rows(p.tasks)}<p class="muted text-small">${p.execution?.mode==='real'?`Створено дочірніх задач: ${count}. Ліміт глибини: ${p.maxDepth??2}.`:'Демонстраційне дерево задач.'}</p></div>`;
+  return `<div class="subtree"><div class="tree-root">${icon('layers')} ${h(p.name)}</div>${rows(p.tasks)}<p class="muted text-small">${p.execution?.mode==='real'?`Створено дочірніх задач: ${count}. Ліміт глибини: ${Number(p.maxDepth??2)||0}.`:'Демонстраційне дерево задач.'}</p></div>`;
 }
 function drawer(p) {
   const t = p.tasks.find(t => t.id === selected) ?? p.execution?.tasks?.find(t=>t.id===selected); if (!t) return '';
@@ -141,14 +167,14 @@ function drawer(p) {
     const b = formatBillingBadge(billing, billingBoundary);
     return `<span class="billing-pill ${h(b.tone)}">${h(b.shortLabel)}</span>`;
   };
-  return `<div class="drawer-backdrop" data-live-key="task-drawer-backdrop" data-action="close-drawer"></div><aside class="drawer" data-live-key="task-drawer" aria-label="Деталі задачі"><div class="drawer-heading"><span class="eyebrow">ДЕТАЛІ ЗАДАЧІ</span>${button('close-drawer', '', 'close', 'btn icon-btn', 'aria-label="Закрити деталі"')}</div>${badge(t.status)}<h2>${h(t.title)}</h2><p>${h(t.prompt)}</p><div class="drawer-section"><h3>Рекомендовані профілі (орієнтир)</h3>${summary.recommended.map(a => { const full = agent(a.id); return `<div class="drawer-agent">${avatar(full)}<span>${h(a.name)}<small>Профіль: ${h(a.model)} · ${h(a.provider)}</small></span></div>`; }).join('')}</div><div class="drawer-section"><h3>AI-маршрути (/api/routing)</h3>${summary.routed ? `${summary.routed.stale ? '<p class="route-blocked text-small">Пропозиція застаріла (план змінився після підбору)</p>' : ''}${summary.routed.routes.map(r => `<p><code>${h(r.id)}</code> → <strong>${h(r.model)}</strong> ${pill(r.billing, r.billingBoundary)} <small class="muted">(${h(r.backend)})</small></p>`).join('')}<p class="muted text-small">${h(summary.routed.reason)}</p>` : '<p class="muted text-small">Точні маршрути ще не підібрані. Налаштуйте у вкладці «Команда».</p>'}</div><div class="drawer-section"><h3>Фактичні виконавці запуску</h3>${summary.actual.active ? (summary.actual.agents.length ? summary.actual.agents.map(a => `<p><strong>${h(a.name)}</strong> → ${h(a.model)} ${pill(a.billing, a.billingBoundary)} · ${h(a.access)}</p>`).join('') : '<p class="muted text-small">Для ролей цієї задачі виконавець не зафіксований.</p>') : '<p class="muted text-small">Ще не призначені — обираються перед запуском команди.</p>'}</div><div class="drawer-section"><h3>Залежності</h3>${t.dependsOn.length ? t.dependsOn.map(id => `<div class="dependency">${icon('link')}${h(p.tasks.find(d => d.id === id)?.title)}</div>`).join('') : '<p class="muted">Може починатися незалежно.</p>'}</div>${t.children ? `<div class="drawer-section"><h3>Субагенти</h3>${t.children.map(c => `<div class="dependency">${h(c.title)} ${badge(c.status)}</div>`).join('')}</div>` : ''}<div class="drawer-section"><h3>Результат</h3><p>${h(t.result ?? 'Результат з’явиться після завершення задачі.')}</p></div>${t.error?`<div class="drawer-section execution-error"><h3>Помилка</h3><pre>${h(t.error)}</pre></div>`:""}${planningDetails(p,t)}<div class="drawer-actions">${!t.parentId&&!['running', 'paused'].includes(p.status) ? button('edit-task', 'Редагувати', 'settings', 'btn', `data-id="${h(t.id)}"`) : ['pending', 'running','waiting_children'].includes(t.status) ? button('cancel-task', 'Скасувати задачу', 'stop', 'btn', `data-id="${h(t.id)}"`) : ''}</div></aside>`;
+  return `<div class="drawer-backdrop" data-live-key="task-drawer-backdrop" data-action="close-drawer"></div><aside class="drawer" data-live-key="task-drawer" aria-label="Деталі задачі"><div class="drawer-heading"><span class="eyebrow">ДЕТАЛІ ЗАДАЧІ</span>${button('close-drawer', '', 'close', 'btn icon-btn', 'aria-label="Закрити деталі"')}</div>${badge(t.status)}<h2>${h(t.title)}</h2><p>${h(t.prompt)}</p><div class="drawer-section"><h3>Рекомендовані профілі (орієнтир)</h3>${summary.recommended.map(a => { const full = agent(a.id); return `<div class="drawer-agent">${avatar(full)}<span>${h(a.name)}<small>Профіль: ${h(a.model)} · ${h(a.provider)}</small></span></div>`; }).join('')}</div><div class="drawer-section"><h3>AI-маршрути (/api/routing)</h3>${summary.routed ? `${summary.routed.stale ? '<p class="route-blocked text-small">Пропозиція застаріла (план змінився після підбору)</p>' : ''}${summary.routed.routes.map(r => `<p><code>${h(r.id)}</code> → <strong>${h(r.model)}</strong> ${pill(r.billing, r.billingBoundary)} <small class="muted">(${h(r.backend)})</small></p>`).join('')}<p class="muted text-small">${h(summary.routed.reason)}</p>` : '<p class="muted text-small">Точні маршрути ще не підібрані. Налаштуйте у вкладці «Команда».</p>'}</div><div class="drawer-section"><h3>Фактичні виконавці запуску</h3>${summary.actual.active ? (summary.actual.agents.length ? summary.actual.agents.map(a => `<p><strong>${h(a.name)}</strong> → ${h(a.model)} ${pill(a.billing, a.billingBoundary)} · ${h(a.access)}</p>`).join('') : '<p class="muted text-small">Для ролей цієї задачі виконавець не зафіксований.</p>') : '<p class="muted text-small">Ще не призначені — обираються перед запуском команди.</p>'}</div><div class="drawer-section"><h3>Залежності</h3>${t.dependsOn.length ? t.dependsOn.map(id => `<div class="dependency">${icon('link')}${h(p.tasks.find(d => d.id === id)?.title)}</div>`).join('') : '<p class="muted">Може починатися незалежно.</p>'}</div>${t.children ? `<div class="drawer-section"><h3>Субагенти</h3>${t.children.map(c => `<div class="dependency">${h(c.title)} ${badge(c.status)}</div>`).join('')}</div>` : ''}<div class="drawer-section"><h3>Результат</h3><p>${h(t.result ?? 'Результат з’явиться після завершення задачі.')}</p></div>${t.error?`<div class="drawer-section execution-error"><h3>Помилка</h3><pre>${h(t.error)}</pre></div>`:""}${planningDetails(p,t)}<div class="drawer-actions">${!t.parentId&&!locked(p) ? button('edit-task', 'Редагувати', 'settings', 'btn', `data-id="${h(t.id)}"`) : ['pending', 'running','waiting_children'].includes(t.status) ? button('cancel-task', 'Скасувати задачу', 'stop', 'btn', `data-id="${h(t.id)}"`) : ''}</div></aside>`;
 }
 function planningDetails(p,t) {
   const assignment=p.planning?.routing?.assignments.find(a=>a.taskId===t.id);
   return (t.acceptanceCriteria?.length ? '<div class="drawer-section"><h3>Критерії готовності</h3><ul class="acceptance-list">'+t.acceptanceCriteria.map(v=>'<li>'+h(v)+'</li>').join('')+'</ul></div>' : '')
     + (assignment ? '<div class="drawer-section"><h3>Чому обрано ці профілі ролей</h3><p>'+h(assignment.reason)+'</p><small class="muted">'+(assignment.manual?'Призначення скориговано вручну':p.planning.teamSource?.mode==='ai'?'AI-рекомендація профілів':'Демо-правило за навичками')+'</small></div>' : '');
 }
-function agentCard(a, p) { return `<article class="agent-card"><div class="agent-card-top">${avatar(a)}<span class="provider-pill">${h(a.provider)}</span></div><h3>${h(a.name)}</h3><p>${h(a.role)}</p><div class="model-label">${icon(a.provider === 'CLI' ? 'code' : 'spark')}${h(a.model)}</div><div class="skills">${a.skills.map(s => `<span>${h(s)}</span>`).join('')}</div><div class="agent-card-bottom"><span><i class="demo-indicator"></i> Профіль ролі</span>${button(p ? 'toggle-agent' : 'agent-detail', p ? 'Вилучити' : 'Профіль', p ? 'close' : 'arrow', 'text-button', `data-id="${h(a.id)}" ${p && ['running','paused'].includes(p.status) ? 'disabled' : ''}`)}</div></article>`; }
+function agentCard(a, p) { return `<article class="agent-card"><div class="agent-card-top">${avatar(a)}<span class="provider-pill">${h(a.provider)}</span></div><h3>${h(a.name)}</h3><p>${h(a.role)}</p><div class="model-label">${icon(a.provider === 'CLI' ? 'code' : 'spark')}${h(a.model)}</div><div class="skills">${a.skills.map(s => `<span>${h(s)}</span>`).join('')}</div><div class="agent-card-bottom"><span><i class="demo-indicator"></i> Профіль ролі</span>${button(p ? 'toggle-agent' : 'agent-detail', p ? 'Вилучити' : 'Профіль', p ? 'close' : 'arrow', 'text-button', `data-id="${h(a.id)}" ${p && locked(p) ? 'disabled' : ''}`)}</div></article>`; }
 function teamPage(p) {
   const routingEntry = execution?.routingState(p.id);
   return `${renderRoutingSection(p, routingEntry, execution?.catalog, { h, icon, button })}
@@ -156,15 +182,54 @@ function teamPage(p) {
     <div class="agent-grid">${p.team.map(id => agent(id)).filter(Boolean).map(a => agentCard(a, p)).join('')}</div>
     <section class="panel actual-executors-note" data-live-key="actual-executors-note"><div class="panel-heading"><h2>Фактичні виконавці запуску</h2><span class="provider-pill">${p.execution?.mode==='real'?'Зафіксовано у запуску':'Не призначено'}</span></div>${p.execution?.mode==='real' ? `<div class="execution-bindings">${p.execution.agents.map(a => { const b = formatBillingBadge(a.billing, a.billingBoundary); return `<span>${h(a.name)} → <b>${h(a.model)}</b> <span class="billing-pill ${h(b.tone)}">${h(b.shortLabel)}</span><small>${h(a.provider)} · ${h(a.access)}</small></span>`; }).join('')}</div>` : `<div class="info-note">${icon('shield')}Рекомендовані профілі та AI-маршрути (<code>/api/routing</code>) не запускають код самі по собі. Фактичні виконавці й права доступу фіксуються окремо перед реальним запуском команди.</div>`}</section>`;
 }
-function artifacts(p) { return `${fileArtifacts(p,h,button)}<div class="section-heading"><h2>Результати задач <span>${p.artifacts.length}</span></h2>${button('export', 'Експортувати проєкт', 'download')}</div>${p.artifacts.length ? `<div class="artifact-grid">${p.artifacts.map(a => `<article class="panel artifact"><span class="project-glyph green">${icon('file')}</span><h3>${h(a.name)}</h3><p>${a.real?'Звіт реального агента':'Текстовий результат демонстрації'}</p>${button('download-artifact', 'Завантажити', 'download', 'btn', `data-id="${h(a.id)}"`)}</article>`).join('')}</div>` : `<div class="empty panel">${icon('file')}<h3>Тут будуть результати команди</h3><p>Запустіть демо — завершені задачі створять текстові артефакти.</p>${button('start', 'Запустити демо', 'play', 'btn primary')}</div>`}`; }
-function config(p) { return `<form id="config-form" data-live-key="config-form" class="panel settings-form"><div class="panel-heading"><h2>Налаштування проєкту</h2><span class="muted">Ревізія ${p.revision}</span></div><label>Назва проєкту<input name="name" required maxlength="80" value="${h(p.name)}"></label><label>Мета та опис<textarea name="description" required maxlength="1000">${h(p.description)}</textarea></label><div class="form-grid"><label>Паралельні задачі<input name="concurrency" type="number" min="1" max="16" required value="${p.concurrency}"></label><label>Ліміт викликів оркестратора<input name="maxCalls" type="number" min="1" max="1000" required value="${p.maxCalls}"></label></div><div class="form-grid"><label>Глибина субагентів<input name="maxDepth" type="number" min="0" max="8" required value="${p.maxDepth??2}"></label><label>Ліміт усіх задач<input name="maxTasks" type="number" min="1" max="1000" required value="${p.maxTasks??100}"></label></div><label><input name="allowDelegation" type="checkbox" ${p.allowDelegation!==false?'checked':''}> Дозволити агентам створювати підзадачі</label><p class="muted text-small">Ліміт викликів діє для реального запуску, включно з усіма призначеними агентами. Делегування також витрачає виклики. Незалежні задачі працюють в окремих worktree.</p><div class="form-footer">${button('export', 'Експортувати JSON', 'download')}<button class="btn primary" type="submit">Зберегти ревізію</button></div></form>`; }
+function artifacts(p) {
+  p = execution.resultsFor(p);
+  const stages = new Map((p.execution?.tasks ?? p.tasks).map(task => [task.id, task]));
+  const report = (a, completed) => {
+    const attr = `data-id="${h(a.id)}"`;
+    return `<article class="panel artifact"><span class="project-glyph ${completed ? 'green' : ''}">${icon('file')}</span>
+      <h3>${h(a.name)}</h3><p>${completed ? 'Завершений етап' : 'Звіт етапу'} · ${a.real ? 'Markdown' : 'Демонстрація'}</p>
+      <div class="artifact-actions">${button('read-artifact', 'Читати звіт', 'file', 'btn', attr)}${button('download-artifact', 'Завантажити', 'download', 'btn', attr)}</div></article>`;
+  };
+  const completed = p.artifacts.filter(a => stages.get(a.taskId)?.status === 'done');
+  const other = p.artifacts.filter(a => stages.get(a.taskId)?.status !== 'done');
+  return `<div class="section-heading results-heading"><h2>Завершені етапи <span>${completed.length}</span></h2>
+    <div class="artifact-actions">${button('project-preview', 'Перегляд проєкту', 'play', 'btn primary')}${button('export', 'Експортувати проєкт', 'download')}</div></div>
+    ${completed.length ? `<div class="artifact-grid">${completed.map(a => report(a, true)).join('')}</div>` : '<div class="empty panel"><h3>Звіти з’являться після завершення етапів</h3></div>'}
+    ${other.length ? `<div class="section-heading results-secondary"><h2>Інші звіти етапів</h2></div><div class="artifact-grid">${other.map(a => report(a, false)).join('')}</div>` : ''}
+    <div class="results-secondary">${fileArtifacts(p,h,button)}</div>`;
+}
+
+let previewRequest = 0;
+async function showProjectPreview(p, url = '') {
+  const request = ++previewRequest;
+  const title = `Перегляд · ${p.name}`;
+  modal(title, '<p class="modal-text project-preview" role="status">Відкриваю перегляд…</p>');
+  const loading = $('#modal .project-preview');
+  let preview, error;
+  try { preview = await execution.projectPreview(p.id, url); }
+  catch (cause) { error = cause.message; }
+  if (request !== previewRequest || !$('#modal').open || !loading.isConnected) return;
+  if (preview?.url) {
+    modal(title, `<div class="project-preview">
+      <div class="preview-toolbar"><a class="btn" href="${h(preview.url)}" target="_blank" rel="noopener noreferrer">Відкрити в окремій вкладці</a></div>
+      <iframe src="${h(preview.url)}" title="${h(p.name)}" sandbox="allow-scripts allow-same-origin allow-forms" referrerpolicy="no-referrer"></iframe></div>`);
+    return;
+  }
+  modal(title, `<form id="project-preview-form">
+    <p class="modal-alert" ${error ? 'role="alert"' : ''}>${h(error ?? 'Готовий сайт у папці проєкту не знайдено. Можна відкрити локальний сервер проєкту за його адресою.')}</p>
+    <label>Адреса локального сервера<input name="url" type="url" required placeholder="http://127.0.0.1:3000/" value="${h(url)}"></label>
+    <button class="btn primary" type="submit">Відкрити перегляд</button>
+  </form>`);
+}
+function config(p) { return `<form id="config-form" data-live-key="config-form" class="panel settings-form"><div class="panel-heading"><h2>Налаштування проєкту</h2><span class="muted">Ревізія ${Number(p.revision) || 1}</span></div><label>Назва проєкту<input name="name" required maxlength="80" value="${h(p.name)}"></label><label>Мета та опис<textarea name="description" required maxlength="1000">${h(p.description)}</textarea></label><div class="form-grid"><label>Паралельні задачі<input name="concurrency" type="number" min="1" max="16" required value="${Number(p.concurrency) || 1}"></label><label>Ліміт викликів оркестратора<input name="maxCalls" type="number" min="1" max="10000" required value="${Number(p.maxCalls) || 1}"></label></div><div class="form-grid"><label>Глибина субагентів<input name="maxDepth" type="number" min="0" max="8" required value="${Number(p.maxDepth??2)||0}"></label><label>Ліміт усіх задач<input name="maxTasks" type="number" min="1" max="1000" required value="${Number(p.maxTasks??100)||1}"></label></div><label><input name="allowDelegation" type="checkbox" ${p.allowDelegation!==false?'checked':''}> Дозволити агентам створювати підзадачі</label><p class="muted text-small">Ліміт викликів діє для реального запуску, включно з усіма призначеними агентами. Делегування також витрачає виклики. Незалежні задачі працюють в окремих worktree.</p><div class="form-footer">${button('export', 'Експортувати JSON', 'download')}<button class="btn primary" type="submit">Зберегти ревізію</button></div></form>`; }
 function connections() { return renderConnections(execution?.catalog,execution?.scanning,{h,button,heading,loading:execution?.loadingCatalog,error:execution?.catalogError}); }
 function main() {
   if (route === 'project') return projectPage();
   if (route === 'projects') return `${heading('PROJECTS', 'Усе починається з мети.', 'Ваші проєкти та команди в одному робочому просторі.', button('new-project','Новий проєкт','plus','btn primary'))}<div class="project-cards full">${state.projects.map(projectCard).join('')}</div>`;
   if (route === 'agents') return `${heading('AGENT LIBRARY', 'Правильний агент для кожної задачі.', 'Моделі з твоїх підключень та профілі команди.',button('new-agent','Новий профіль','plus','btn primary'))}${renderAgentLibrary(execution?.catalog,state.agents,agentLibraryFilters,{h,icon,button,avatar,renderProfile:a=>agentCard(a),loading:execution?.scanning||execution?.loadingCatalog,error:execution?.catalogError})}`;
   if (route === 'connections') return connections();
-  if (route === 'runs') return `${heading('RUN HISTORY','Виконання під контролем.','Історія реальних запусків та стан проєктів.')}${runHistory(execution?.history??[],h,button,labels)}<section class="panel run-list">${state.projects.map(p => `<button data-action="open-project" data-id="${h(p.id)}"><span class="project-glyph orange">${icon('pulse')}</span><span><strong>${h(p.name)}</strong><small>${p.events.length ? h(p.events[0].text) : 'Ще не запускався'}</small></span>${badge(p.status)}${icon('chevron')}</button>`).join('')}</section>`;
+  if (route === 'runs') return `${heading('RUN HISTORY','Виконання під контролем.','Історія реальних запусків та стан проєктів.')}${runHistory(execution?.history??[],h,button,labels)}<section class="panel run-list">${state.projects.map(p => `<button type="button" data-action="open-project" data-id="${h(p.id)}"><span class="project-glyph orange">${icon('pulse')}</span><span><strong>${h(p.name)}</strong><small>${p.events.length ? h(p.events[0].text) : 'Ще не запускався'}</small></span>${badge(p.status)}${icon('chevron')}</button>`).join('')}</section>`;
   if (route === 'settings') return `${heading('WORKSPACE SETTINGS','Ваш простір. Ваші правила.','Локальний сервер, кеш браузера та історія запусків.')}<section class="panel workspace-settings"><h2>Зберігання даних</h2><p>Проєкти й профілі зберігаються локальним сервером; браузер тримає кеш. Історія реальних запусків та знімки планів зберігаються окремо й не замінюються скиданням демо. Реальні секрети не вводяться й не зберігаються.</p><div class="settings-row"><span>Експортувати робочий простір<small>Усі проєкти та профілі у JSON</small></span>${button('export-all','Експортувати','download')}</div><div class="settings-row"><span>Відновити демонстрацію<small>Поточні локальні дані буде замінено стартовими</small></span>${button('confirm-reset','Відновити','settings')}</div></section>`;
   return overview();
 }
@@ -199,6 +264,7 @@ function solarCallbacks(compact) {
         return;
       }
       if (actionOrStatus === 'start') {
+        if (p.execution?.id) execution?.stopStream?.(p.execution.id);
         p.execution = null; start(p); toast('Запущено демо. Реальні моделі не викликаються.');
         save(); render();
         return;
@@ -218,6 +284,7 @@ function solarCallbacks(compact) {
         p.status = 'cancelled';
         log(p, 'Демонстрацію зупинено користувачем');
       } else {
+        if (p.execution?.id) execution?.stopStream?.(p.execution.id);
         p.execution = null; start(p); toast('Запущено демо. Реальні моделі не викликаються.');
       }
       save(); render();
@@ -233,7 +300,7 @@ function render({executionOnly=false}={}) {
   const nextStage = document.querySelector('#solar-stage');
   if (nextStage) {
     const compact = nextStage.dataset.compact === 'true';
-    if (existingViewport && existingStage!==nextStage && existingStage?.dataset.compact === nextStage.dataset.compact) {
+    if (existingViewport && existingStage!==nextStage) {
       nextStage.appendChild(existingViewport);
     }
     renderSolarStage(nextStage, project(), state.agents, labels, solarCallbacks(compact));
@@ -247,11 +314,11 @@ function newProject() { creation.open(); }
 
 function taskModal(task) {
   const p = project();
-  if (['running','paused'].includes(p.status)) { toast('Завершіть або скасуйте запуск перед зміною плану'); return; }
+  if (locked(p)) { toast('Завершіть або скасуйте запуск перед зміною плану'); return; }
   modal(task ? 'Редагувати задачу' : 'Нова задача', `<form id="task-form" data-id="${h(task?.id ?? '')}"><label>Назва<input name="title" required maxlength="100" value="${h(task?.title ?? '')}"></label><label>Інструкція<textarea name="prompt" required maxlength="2000">${h(task?.prompt ?? '')}</textarea></label><fieldset><legend>Виконавці — можна обрати кількох</legend>${p.team.map(id => { const a=agent(id); return `<label class="checkline"><input type="checkbox" name="agents" value="${h(id)}" ${task?.agentIds.includes(id) ? 'checked' : ''}>${h(a?.name)}</label>`; }).join('')}</fieldset><fieldset><legend>Почати після завершення</legend>${p.tasks.filter(t => t.id !== task?.id).map(t => `<label class="checkline"><input type="checkbox" name="deps" value="${h(t.id)}" ${task?.dependsOn.includes(t.id) ? 'checked' : ''}>${h(t.title)}</label>`).join('') || '<span class="muted">Перша задача у плані</span>'}</fieldset><div class="form-footer">${button('close-modal','Скасувати')}<button type="submit" class="btn primary">Зберегти задачу</button></div></form>`);
 }
 function download(name, content, type = 'application/json') { const url = URL.createObjectURL(new Blob([content], { type })); const a = document.createElement('a'); a.href = url; a.download = name.replace(/[<>:"/\\|?*]/g, '-'); a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
-function locked() { return ['running','paused'].includes(project().status); }
+function locked(p = project()) { return ['running','paused'].includes(p.status) || Boolean(p.execution?.draining || p.execution?.hostChecking || (p.execution?.id && verifyingHost.has(p.execution.id))); }
 document.addEventListener('click', async event => {
   const target = event.target.closest('[data-action]'); if (!target || target.disabled) return;
   if(target.hasAttribute('data-creation'))return;
@@ -293,18 +360,43 @@ document.addEventListener('click', async event => {
       return;
     }
     if (action === 'real-start') { await execution.setup(p); return; }
+    if (action === 'continue-run') { await execution.control(p,'continue'); return; }
+    if (action === 'retry-access-run') { await execution.control(p,'retry-access'); return; }
+    if (action === 'retry-budget-run') { await execution.control(p,'retry-budget'); return; }
+    if (action === 'change-run-budget') { execution.changeBudget(p); return; }
+    if (action === 'balance-gemini-run') { await execution.control(p,'balance-gemini'); toast('Розподіл нерозпочатих задач оновлено'); return; }
+    if (action === 'verify-blocked-run') { execution.clarify(p,true); return; }
+    if (action === 'verify-host-run') {
+      const runId = p.execution?.id;
+      if (!runId || p.execution.hostChecking || verifyingHost.has(runId)) return;
+      verifyingHost.add(runId);
+      render({executionOnly:true});
+      try { await execution.control(p,'verify-host',id); }
+      finally { verifyingHost.delete(runId); render({executionOnly:true}); }
+      return;
+    }
+    if (action === 'resume-cancelled-run') {
+      const runId = p.execution.id;
+      if (resumingCancelled.has(runId)) return;
+      resumingCancelled.add(runId);
+      render({executionOnly:true});
+      try { await execution.control(p,'resume-cancelled'); }
+      finally { resumingCancelled.delete(runId); render({executionOnly:true}); }
+      return;
+    }
+    if (action === 'clarify-run') { execution.clarify(p); return; }
     if (action === 'view-run') { await execution.viewRun(id); return; }
-    if (action === 'execution-file') { await execution.file(p,target.dataset.path); return; }
+    if (action === 'execution-file') { await execution.file(execution.resultsFor(p),target.dataset.path); return; }
     if (p.execution?.mode==='real' && ['pause','resume','cancel','cancel-task'].includes(action)) { await execution.control(p,action,id); return; }
     if (action === 'new-project') { navOpen = false; newProject(); return; }
     if (action === 'close-modal') { $('#modal').close(); return; }
     if (action === 'workspace') { navOpen = false; navigate('settings'); return; }
     if (action === 'open-project') { navOpen = false; state.activeId = id; selected = null; tab = 'plan'; save(); if (route === 'project') render(); else navigate('project'); $('#modal').close(); void execution.loadRouting(id, { silent: true }); return; }
-    if (action === 'tab') { tab = id; if (id === 'team' && !execution.routingState(p.id)?.proposal && !execution.routingState(p.id)?.loading) void execution.loadRouting(p.id, { silent: true }); }
+    if (action === 'tab') { tab = id; if (id === 'team' && !execution.routingState(p.id)?.proposal && !execution.routingState(p.id)?.loading) void execution.loadRouting(p.id, { silent: true }); if (id === 'artifacts') void execution.loadResults(p).catch(error=>toast(error.message)); }
     else if (action.startsWith('view-')) view = action.slice(5);
     else if (action === 'select-task') selected = id;
     else if (action === 'close-drawer') selected = null;
-    else if (action === 'start') { p.execution=null; start(p); toast('Запущено демо. Реальні моделі не викликаються.'); }
+    else if (action === 'start') { if (p.execution?.id) execution?.stopStream?.(p.execution.id); p.execution=null; start(p); toast('Запущено демо. Реальні моделі не викликаються.'); }
     else if (action === 'pause') { p.status = 'paused'; log(p, 'Демонстрацію поставлено на паузу'); }
     else if (action === 'resume') { p.status = 'running'; log(p, 'Демонстрацію продовжено'); }
     else if (action === 'cancel') { p.tasks.filter(t => ['running', 'pending'].includes(t.status)).forEach(t => { t.status = 'cancelled'; t.children?.forEach(c => c.status = 'cancelled'); }); p.status = 'cancelled'; log(p, 'Демонстрацію зупинено користувачем'); }
@@ -313,22 +405,29 @@ document.addEventListener('click', async event => {
     else if (action === 'edit-task') { taskModal(p.tasks.find(t => t.id === id)); return; }
     else if (action === 'edit-project') { tab = 'config'; }
     else if (action === 'choose-team') { if (locked()) throw new Error('Завершіть або скасуйте запуск перед зміною команди'); modal('Команда проєкту', `<form id="team-form"><div class="agent-options">${checks(p.team)}</div><div class="form-footer">${button('close-modal','Скасувати')}<button class="btn primary" type="submit">Зберегти команду</button></div></form>`); return; }
-    else if (action === 'toggle-agent') { if (p.tasks.some(t => t.agentIds.includes(id))) throw new Error('Спочатку перепризначте задачі цього агента'); if (p.team.length <= 1) throw new Error('Залиште щонайменше одного агента'); p.team = p.team.filter(a => a !== id); p.revision++; }
-    else if (action === 'agent-detail') { const a = agent(id); modal(a.name, `<div class="agent-detail">${avatar(a)}<p>${h(a.role)}</p><div class="detail-pair"><span>Модель / backend</span><strong>${h(a.model)}</strong></div><div class="detail-pair"><span>Спосіб виконання</span><strong>${h(a.provider)}</strong></div><div class="skills">${a.skills.map(s => `<span>${h(s)}</span>`).join('')}</div><div class="info-note">${icon('shield')}Профіль зберігає роль та модель. Фактичний виконавець і права показуються перед запуском; доступ перевіряється повторно.</div></div>`); return; }
+    else if (action === 'toggle-agent') { if (locked()) throw new Error('Завершіть або скасуйте запуск перед зміною команди'); if (p.tasks.some(t => t.agentIds.includes(id))) throw new Error('Спочатку перепризначте задачі цього агента'); if (p.team.length <= 1) throw new Error('Залиште щонайменше одного агента'); p.team = p.team.filter(a => a !== id); p.revision++; }
+    else if (action === 'agent-detail') { const a = agent(id); if (!a) return; modal(a.name, `<div class="agent-detail">${avatar(a)}<p>${h(a.role)}</p><div class="detail-pair"><span>Модель / backend</span><strong>${h(a.model)}</strong></div><div class="detail-pair"><span>Спосіб виконання</span><strong>${h(a.provider)}</strong></div><div class="skills">${a.skills.map(s => `<span>${h(s)}</span>`).join('')}</div><div class="info-note">${icon('shield')}Профіль зберігає роль та модель. Фактичний виконавець і права показуються перед запуском; доступ перевіряється повторно.</div></div>`); return; }
     else if (action === 'new-agent') { modal('Новий профіль агента', `<form id="agent-form"><label>Назва<input name="name" required maxlength="60"></label><label>Роль<input name="role" required maxlength="120" placeholder="Наприклад, перевірка безпеки"></label><div class="form-grid"><label>Backend<select name="provider"><option>API</option><option>CLI</option><option>Local</option></select></label><label>Модель / CLI<input name="model" required maxlength="80" placeholder="Назва моделі"></label></div><label>Навички через кому<input name="skills" required maxlength="160" placeholder="review, testing"></label><div class="form-footer">${button('close-modal','Скасувати')}<button type="submit" class="btn primary">Створити профіль</button></div></form>`); return; }
     else if (action === 'export' || action === 'export-all') { download(action === 'export-all' ? 'orcestrator-workspace.json' : `${p.name}.json`, JSON.stringify(action === 'export-all' ? state : p, null, 2)); toast('JSON експортовано'); return; }
-    else if (action === 'download-artifact') { const a = p.artifacts.find(a => a.id === id); download(a.name, a.text, 'text/markdown;charset=utf-8'); return; }
-    else if (action === 'connection-info' && id==='Codex CLI') { modal('Codex CLI', `<div class="run-report"><p>Модель: ${h(execution.runtimes[0]?.model)}. Використовується збережений вхід CLI.</p><p>Розробник може змінювати файли проєкту. Перевірка read-only читає файли. Фактичне призначення обирається перед запуском і зберігається в історії.</p></div>`); return; }
-    else if (action === 'connection-info') { modal(id, `<div class="connection-description"><p>Інтеграція ${h(id)} передбачена архітектурою. Цей прототип дозволяє налаштувати склад команди та перевірити взаємодію.</p><p>Підключення до справжніх моделей, перевірка авторизації та потокове виконання — наступний етап.</p><div class="info-note">${icon('shield')}API-ключі у цьому UI не запитуються.</div></div>`); return; }
+    else if (action === 'project-preview') { await showProjectPreview(p); return; }
+    else if (action === 'read-artifact') {
+      const a = execution.resultsFor(p).artifacts.find(item => item.id === id);
+      if (a) modal(a.name, `<pre class="artifact-report">${h(a.text)}</pre>`, `<div class="form-footer">${button('download-artifact', 'Завантажити', 'download', 'btn', `data-id="${h(a.id)}"`)}</div>`);
+      return;
+    }
+    else if (action === 'download-artifact') { const a = execution.resultsFor(p).artifacts.find(a => a.id === id); if (!a) return; download(a.name, a.text, 'text/markdown;charset=utf-8'); return; }
     else if (action === 'confirm-reset') { modal('Відновити демонстраційні дані?', '<p class="modal-text">Ваші локальні проєкти та профілі буде замінено початковим прикладом. Перед цим можна експортувати робочий простір.</p>', `<div class="form-footer">${button('close-modal','Скасувати')}${button('reset','Відновити демо','','btn primary')}</div>`); return; }
-    else if (action === 'reset') { if(execution.history.some(r=>['running','paused'].includes(r.status)))throw new Error('Спочатку завершіть або скасуйте реальні запуски'); state = seed(); $('#modal').close(); toast('Демонстраційні дані відновлено'); }
+    else if (action === 'reset') { if(execution.history.some(r=>['running','paused'].includes(r.status)))throw new Error('Спочатку завершіть або скасуйте реальні запуски'); execution?.stopAllStreams?.(); execution?.clearRoutingStates?.(); state = seed(); $('#modal').close(); toast('Демонстраційні дані відновлено'); }
     else if (action === 'search') { modal('Знайти у просторі', '<label class="search-field">Проєкти та агенти<input id="quick-search" type="search" placeholder="Почніть вводити назву…" autofocus></label><div id="search-results"></div>'); searchResults(''); return; }
     save(); render();
   } catch (error) { toast(error.message); }
 });
 document.addEventListener('submit', event => {
-  if (['creation-project','execution-form'].includes(event.target.id)) return;
-  event.preventDefault(); const form = event.target, data = new FormData(form), p = project();
+  if (['creation-project','execution-form','execution-clarify-form','execution-budget-form'].includes(event.target.id)) return;
+  event.preventDefault();
+  if (!execution?.ready) { toast('Дочекайтеся відновлення даних із сервера'); return; }
+  const form = event.target, data = new FormData(form), p = project();
+  if (form.id === 'project-preview-form') { void showProjectPreview(p, String(data.get('url') ?? '')); return; }
   try {
     if (form.id === 'routing-form') {
       const targetProject = state.projects.find(item => item.id === form.dataset.project) ?? p;
@@ -369,7 +468,7 @@ document.addEventListener('submit', event => {
     save(); $('#modal').close(); render();
   } catch (error) { toast(error.message); }
 });
-function searchResults(value) { const query = value.toLocaleLowerCase(); $('#search-results').innerHTML = state.projects.filter(p => p.name.toLocaleLowerCase().includes(query)).map(p => `<button class="search-result" data-action="open-project" data-id="${h(p.id)}">${icon('layers')}<span>${h(p.name)}<small>Проєкт</small></span>${icon('arrow')}</button>`).join('') + state.agents.filter(a => a.name.toLocaleLowerCase().includes(query)).map(a => `<button class="search-result" data-action="agent-detail" data-id="${h(a.id)}">${avatar(a, true)}<span>${h(a.name)}<small>Агент</small></span>${icon('arrow')}</button>`).join(''); if (!$('#search-results').innerHTML) $('#search-results').innerHTML = '<p class="empty compact">Нічого не знайдено</p>'; }
+function searchResults(value) { const query = value.toLocaleLowerCase(); $('#search-results').innerHTML = state.projects.filter(p => p.name.toLocaleLowerCase().includes(query)).map(p => `<button type="button" class="search-result" data-action="open-project" data-id="${h(p.id)}">${icon('layers')}<span>${h(p.name)}<small>Проєкт</small></span>${icon('arrow')}</button>`).join('') + state.agents.filter(a => a.name.toLocaleLowerCase().includes(query)).map(a => `<button type="button" class="search-result" data-action="agent-detail" data-id="${h(a.id)}">${avatar(a, true)}<span>${h(a.name)}<small>Агент</small></span>${icon('arrow')}</button>`).join(''); if (!$('#search-results').innerHTML) $('#search-results').innerHTML = '<p class="empty compact">Нічого не знайдено</p>'; }
 document.addEventListener('change', event => {
   if(event.target.dataset.agentFilter){agentLibraryFilters[event.target.dataset.agentFilter]=event.target.value;render({executionOnly:true});return;}
   if (event.target.matches?.('#config-form input, #config-form select, #routing-form select')) {
@@ -406,14 +505,26 @@ document.addEventListener('keydown', event => {
 $('#modal').addEventListener('click', event => { if (event.target === $('#modal')) { const rect = event.target.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) event.target.close(); } });
 setInterval(() => { let changed = false; for (const p of state.projects) changed = (p.execution?.mode==='real'?false:tick(p)) || changed; if (changed) { save(); if (!$('#modal').open) render({ executionOnly: true }); } }, 1600);
 const creation = createProjectWizard({ modal, h, icon, button, agents: availableProfiles, notify: toast,
+  listFolders:path=>execution.listFolders(path),
   getCatalog:()=>execution?.catalog,
+  scanConnections:()=>execution?.scan(),
   proposeDraft:(input,signal)=>execution.proposeDraft(input,signal),
-  async onCreate(draft) {
+  async onCreate(draft, { autoStart = false } = {}) {
     const {project:next,profiles}=composeProject(draft,availableProfiles());
     log(next,draft.teamSource?.mode==='ai'?'Прийнято AI-план і точне призначення моделей':'Прийнято демонстраційний план і підбір за правилами');
-    await execution.createPlannedProject({project:next,profiles,...(draft.teamSource?.mode==='ai'?{routingDraftId:draft.proposal.id}:{})});
+    await execution.createPlannedProject({project:next,profiles,projectParent:draft.projectParent,...(draft.teamSource?.mode==='ai'?{routingDraftId:draft.proposal.id}:{})});
     tab='plan';selected=null;route='project';location.hash='project';
-    render();toast('Проєкт створено з прийнятим планом і командою');
+    render();
+    if (autoStart && draft.teamSource?.mode === 'ai' && draft.proposal) {
+      try {
+        await execution.launchProposal(next, draft.proposal);
+        return;
+      } catch (error) {
+        toast(`Проєкт створено, але автозапуск не вдався: ${error.message}`);
+        return;
+      }
+    }
+    toast('Проєкт створено з прийнятим планом і командою');
   }
 });
 execution = createExecutionClient({getState:()=>state,setState:value=>{state=value;},render,saveLocal:()=>save(true),notify:toast,modal,h,button,download});

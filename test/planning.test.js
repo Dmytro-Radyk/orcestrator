@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { seed } from '../apps/web/src/state.js';
 import { demoIdea, demoPlan, demoAssignments, validateIdea, validatePlan, validateAssignments } from '../apps/web/src/planning.js';
 import { plannerConfig, generatePlanning } from '../scripts/planning-service.js';
+import {planningErrorMessage} from '../apps/web/src/planning-errors.js';
 
 const brief={name:'Portal',description:'Кабінет користувача з API та інтерфейсом.'};
 const config={configured:true,label:'test-model',provider:'responses',agent:{provider:'responses',model:'test-model'}};
@@ -28,6 +29,23 @@ test('planner stays unavailable without an explicit model and credentials',()=>{
   assert.equal(plannerConfig({ORCHESTRATOR_PLANNER_MODEL:'x',OPENAI_API_KEY:'test'}).configured,true);
   assert.equal(plannerConfig({ORCHESTRATOR_PLANNER_PROVIDER:'codex',ORCHESTRATOR_PLANNER_MODEL:'x'}).configured,true);
 });
+test('storefront planning adds browser acceptance and working product media from the start',async()=>{
+  const shop={name:'Магазин',description:'Інтернет-магазин смартфонів із порівнянням'};
+  const plan=demoPlan(shop);
+  const {value}=await generatePlanning('plan',shop,config,async(_agent,{prompt})=>{
+    assert.match(prompt,/шести різних моделей/);
+    assert.match(prompt,/локальними URL/);
+    return {text:JSON.stringify(plan)};
+  });
+  const gate=value.tasks.at(-1);
+  assert.equal(gate.id,'storefront-acceptance');
+  assert.deepEqual(gate.dependsOn,['integrate']);
+  assert.match(gate.prompt,/desktop\.png/);
+  assert.match(gate.prompt,/mobile\.png/);
+  assert.equal(value.tasks.length,plan.tasks.length);
+  assert.match(gate.prompt,/Перевірити результати за критеріями/);
+  assert.match(value.tasks.find(task=>task.id==='frontend').acceptanceCriteria.join(' '),/зображення товарів, які завантажуються/);
+});
 test('AI plan and routing use the configured model and preserve provenance',async()=>{
   let captured;
   const result=await generatePlanning('plan',brief,config,async(a,ctx)=>{captured={a,ctx};return{text:JSON.stringify(demoPlan(brief)),usage:{total_tokens:10}};});
@@ -40,6 +58,19 @@ test('AI plan and routing use the configured model and preserve provenance',asyn
 test('unconfigured or malformed AI responses fail without silent demo fallback',async()=>{
   await assert.rejects(generatePlanning('plan',brief,{configured:false}),/налаштуйте/);
   await assert.rejects(generatePlanning('plan',brief,config,async()=>({text:'not JSON'})),SyntaxError);
+});
+
+test('planning errors explain interrupted discovery and timeout without changing other failures',()=>{
+  assert.match(planningErrorMessage(Error('Discovery завершено')),/перевірити доступ до Codex/);
+  assert.match(planningErrorMessage(Object.assign(Error('Internal deadline'),{code:'METADATA_TIMEOUT'})),/квота не підтверджена/);
+  assert.match(planningErrorMessage(new DOMException('Deadline','TimeoutError'),'plan'),/Планування не завершилося/);
+  assert.equal(planningErrorMessage(Error('Quota unavailable')),'Quota unavailable');
+});
+
+test('cancelled planning never invokes a provider after metadata selection',async()=>{
+  const controller=new AbortController();controller.abort();let calls=0;
+  await assert.rejects(generatePlanning('plan',brief,config,async()=>{calls++;},controller.signal),error=>error.name==='AbortError');
+  assert.equal(calls,0);
 });
 
 test('Codex planner uses server-owned schemas, isolated cwd and reasoning provenance',async()=>{

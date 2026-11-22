@@ -76,6 +76,19 @@ test('solar model distinguishes routing proposal models from recommended profile
   assert.deepEqual(routedModel.planets[0].actualModels, []);
 });
 
+test('connector placeholders show the role until a routed or executing model is known',()=>{
+  const state=seed(),project=state.projects[0];project.tasks=[project.tasks.find(t=>t.id==='api')];
+  const placeholder=buildSolarSystemModel(project,state.agents,labels).planets[0];
+  assert.equal(placeholder.name,'Backend engineer');assert.equal(placeholder.model,'Модель ще не вибрана');
+  assert.equal(placeholder.id,'Codex CLI');assert.deepEqual(placeholder.actualModels,[]);
+  const routing={stale:false,proposal:{revision:project.revision,assignments:[{taskId:'api',routeIds:['codex:chosen-model']}],
+    routes:[{id:'codex:chosen-model',backend:'codex',model:'chosen-model'}]}};
+  assert.equal(buildSolarSystemModel(project,state.agents,labels,routing).planets[0].name,'chosen-model');
+  project.execution={mode:'real',agents:[{id:'backend',model:'executing-model',provider:'codex',access:'workspace-write'}]};
+  const actual=buildSolarSystemModel(project,state.agents,labels,routing).planets[0];
+  assert.equal(actual.name,'executing-model');assert.equal(actual.modelSource,'execution');
+});
+
 test('solar model maps nested parentId child subtasks to moons with real model, billing, result, error, and draining state', () => {
   const project = {
     id: 'real-1',

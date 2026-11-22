@@ -54,6 +54,30 @@ test('Codex discovery performs handshake, paginated model metadata and quota rea
   assert.equal(closed,true);assert.equal(result.routes.length,2);assert.equal(result.connection.plan,'pro');
 });
 
+test('Codex allows the full five-hour and weekly allowances while enforcing the reserve for other windows',()=>{
+  const weekly={usedPercent:99,windowDurationMins:10080};
+  const short={usedPercent:99,windowDurationMins:300};
+  const decision=rateLimits=>routeDecision(normalizeCodexMetadata({
+    account:{account:{type:'chatgpt',planType:'plus'}},models:[{model:'model'}],
+    limits:{rateLimits:{...rateLimits,credits:{hasCredits:false,unlimited:false,balance:'0'}}}
+  },{autoReloadDisabled:true}).routes[0]);
+  assert.equal(decision({primary:short,secondary:weekly}).allowed,true);
+  assert.equal(decision({primary:weekly}).allowed,true);
+  assert.equal(decision({primary:{...short,usedPercent:100},secondary:weekly}).code,'quota_exhausted');
+  assert.equal(decision({primary:{usedPercent:90}}).code,'quota_reserve');
+  assert.equal(decision({primary:short,secondary:{...weekly,usedPercent:100}}).code,'quota_exhausted');
+  assert.equal(decision({primary:weekly,rateLimitReachedType:'rate_limit'}).code,'quota_exhausted');
+});
+
+test('a discovery deadline rejects with a timeout reason instead of a successful completion message',async()=>{
+  let rejectRequest,closeReason;
+  await assert.rejects(inspectCodex('ignored',{timeoutMs:10,rpcFactory:()=>({
+    request:()=>new Promise((resolve,reject)=>{rejectRequest=reject;}),initialized(){},
+    async close(reason){if(reason){closeReason=reason;rejectRequest(reason);}}
+  })}),error=>error.code==='METADATA_TIMEOUT'&&!error.message.includes('завершено'));
+  assert.equal(closeReason.code,'METADATA_TIMEOUT');
+});
+
 test('scan coalesces concurrent requests, persists sanitized data and does not trust a cached authorization',async()=>{
   const store={data:{},save(){}};let probes=0,finds=0;
   const registry=createModelRegistry({store,env:{},find:async name=>{finds++;return name==='codex'?'/trusted/codex':null;},inspect:async()=>{
@@ -64,6 +88,25 @@ test('scan coalesces concurrent requests, persists sanitized data and does not t
   assert.equal(store.data.catalog.connections.length,5);assert.ok(!JSON.stringify(store.data).includes('PRIVATE'));
   assert.ok(!JSON.stringify(store.data).includes('/trusted/codex'));
   await assert.rejects(registry.requireRoute('codex:model'),/Automatic reload/);assert.equal(probes,2);
+});
+
+test('Codex inference skips unrelated provider discovery but still makes a fresh subscription check',async()=>{
+  const store={data:{},save(){}};
+  let finds=0,probes=0,calls=0;
+  const registry=createModelRegistry({store,env:{ORCHESTRATOR_CODEX_AUTO_RELOAD_DISABLED:'1'},
+    find:async name=>{finds++;return name==='codex'?'/trusted/codex':null;},
+    inspect:async(_command,options)=>{
+      probes++;
+      return normalizeCodexMetadata({account:{account:{type:'chatgpt',planType:'plus'}},models:[{model:'model'}],
+        limits:{rateLimits:{primary:{usedPercent:probes===3?100:99,windowDurationMins:300},credits:{hasCredits:false,unlimited:false,balance:'0'}}}},options);
+    }});
+  await registry.scan();
+  const execute=withModelPolicy(registry,async()=>{calls++;return {text:'ok'};});
+  const signal=new AbortController().signal;
+  const agent={provider:'codex',model:'model'};
+  assert.equal((await execute(agent,{signal})).text,'ok');
+  await assert.rejects(execute(agent,{signal}),error=>error.decisionCode==='quota_exhausted');
+  assert.equal(calls,1);assert.equal(probes,3);assert.equal(finds,5);
 });
 
 test('provider and planner guards stop disallowed calls before invoking a model',async()=>{
@@ -93,4 +136,13 @@ test('read-only metadata transport rejects inference and server tool requests, h
     assert.equal((await rpc.request('initialize',{})).ready,true);rpc.initialized();
     assert.equal((await rpc.request('account/read',{})).account,null);
   }finally{await rpc.close();}
+});
+
+test('metadata close preserves the actual interruption reason and rejects new work while closing',async()=>{
+  const rpc=metadataRpc(process.execPath,['--input-type=module','-e',"process.stdin.resume();setInterval(()=>{},1000)"],{cwd:process.cwd(),timeoutMs:2000});
+  const reason=Object.assign(Error('Discovery deadline exceeded'),{code:'METADATA_TIMEOUT'});
+  const rejected=assert.rejects(rpc.request('initialize'),error=>error===reason);
+  const closing=rpc.close(reason);
+  try{await rejected;await assert.rejects(rpc.request('account/read'),/закрито/);await Promise.all([closing,rpc.close()]);}
+  finally{await rpc.close();}
 });

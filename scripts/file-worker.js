@@ -1,26 +1,34 @@
-import { readdir,lstat,readFile,mkdir,writeFile,unlink,realpath } from 'node:fs/promises';
-import { resolve,relative,isAbsolute,join,dirname } from 'node:path';
+import { readdir,lstat,readFile,mkdir,writeFile,unlink,realpath,rm } from 'node:fs/promises';
+import { resolve,relative,isAbsolute,join,dirname,sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { runProcess } from '../src/providers.js';
 import { executeOpenCode,OPENCODE_HOME } from './opencode-service.js';
 
 const hash=b=>createHash('sha256').update(b).digest('hex');
-const denied=n=>/^(?:\.git|\.env(?:\..*)?|\.aws|\.codex|\.gemini|\.agents|node_modules)$/i.test(n)||/\.(?:pem|key|p12|pfx|db|sqlite|exe|dll)$/i.test(n);
+const sourceRoots=['src','app','apps','lib','tests','test','config'];
+const workerPromptBytes=48*1024;
+const denied=n=>/^(?:\.git|\.env(?:\..*)?|\.aws|\.codex|\.gemini|\.agents|node_modules)$/i.test(n)||/\.(?:pem|key|p12|pfx|db|sqlite(?:3|-wal|-shm)?|exe|dll)$/i.test(n);
 export function workerPath(root,path) {
-  if(typeof path!=='string'||!path||path.length>240||/[\\\x00-\x1f:]/.test(path)||isAbsolute(path)||path.split('/').some(n=>!n||n==='.'||n==='..'||denied(n)))throw Error('Недопустимий шлях зміни');
-  const actual=resolve(root,path),rel=relative(root,actual);if(!rel||rel.startsWith('..')||isAbsolute(rel))throw Error('Файл виходить за межі worktree');return actual;
+  if(typeof path!=='string'||!path||path.length>240||/[\\\x00-\x1f:]/.test(path)||isAbsolute(path)||path.split('/').some(n=>!n||n==='.'||n==='..'||n.startsWith('-')||denied(n)))throw Error('Недопустимий шлях зміни');
+  const actual=resolve(root,path),rel=relative(root,actual);if(!rel||rel==='..'||rel.startsWith(`..${sep}`)||isAbsolute(rel))throw Error('Файл виходить за межі worktree');return actual;
 }
 async function safeParents(root,path) {
-  let current=resolve(root);for(const part of relative(root,path).split(/[\\/]/)) {
-    current=join(current,part);const info=await lstat(current).catch(e=>{if(e.code==='ENOENT')return null;throw e;});
+  let current=resolve(root);
+  const parts=relative(root,path).split(/[\\/]/);
+  for(let i=0;i<parts.length;i++) {
+    current=join(current,parts[i]);const info=await lstat(current).catch(e=>{if(e.code==='ENOENT')return null;throw e;});
     if(info?.isSymbolicLink())throw Error('Symlink у шляху зміни заборонено');
+    if(i<parts.length-1&&info&&!info.isDirectory())throw Error('Батьківський шлях не є каталогом');
   }
 }
 export async function workerContext(root) {
   const files=[];let bytes=0;
-  async function walk(dir) {for(const entry of await readdir(dir,{withFileTypes:true})) {
+  async function walk(dir) {
+    const entries=await readdir(dir,{withFileTypes:true});
+    if(dir===root)entries.sort((a,b)=>Number(sourceRoots.includes(b.name))-Number(sourceRoots.includes(a.name)));
+    for(const entry of entries) {
     if(denied(entry.name)||entry.isSymbolicLink())continue;const path=join(dir,entry.name);
-    if(entry.isDirectory()){if(files.length<150)await walk(path);continue;}
+    if(entry.isDirectory()){if(files.length<150&&!['.runtime','dist','coverage','.cache'].includes(entry.name))await walk(path);continue;}
     if(!entry.isFile()||files.length>=150)continue;
     const info=await lstat(path);if(info.size>128*1024||bytes+info.size>256*1024)continue;
     const value=await readFile(path);if(value.includes(0))continue;bytes+=value.length;
@@ -29,9 +37,14 @@ export async function workerContext(root) {
 }
 export async function applyWorkerChanges(root,changes) {
   if(!Array.isArray(changes)||changes.length>40)throw Error('Ліміт змін файлів перевищено');
-  const seen=new Set(),operations=[];let bytes=0;
+  const seen=new Set(),normPaths=[],operations=[];let bytes=0;
   for(const item of changes) {
-    const path=workerPath(root,item.path);if(seen.has(path))throw Error('Повторна зміна файлу');seen.add(path);
+    if(!item||typeof item!=='object'||Array.isArray(item))throw Error('Некоректний елемент зміни');
+    if(item.delete!==undefined&&typeof item.delete!=='boolean')throw Error('Поле delete має бути булевим');
+    const path=workerPath(root,item.path);
+    const key=process.platform==='win32'?path.toLowerCase():path;
+    if(seen.has(key))throw Error('Повторна зміна файлу');seen.add(key);
+    normPaths.push(process.platform==='win32'?item.path.toLowerCase():item.path);
     await safeParents(root,path);const info=await lstat(path).catch(e=>{if(e.code==='ENOENT')return null;throw e;});
     if(info&&!info.isFile())throw Error('Змінювати можна лише звичайні файли');
     const before=info?hash(await readFile(path)):null;
@@ -40,7 +53,10 @@ export async function applyWorkerChanges(root,changes) {
     else if(typeof item.content!=='string'||item.content.includes('\0')||(bytes+=Buffer.byteLength(item.content))>1024*1024)throw Error('Некоректний або завеликий вміст зміни');
     operations.push({path,item});
   }
-  for(const {path,item} of operations){if(item.delete)await unlink(path);else{await mkdir(dirname(path),{recursive:true});await writeFile(path,item.content);}}
+  for(let i=0;i<normPaths.length;i++)for(let j=0;j<normPaths.length;j++){
+    if(i!==j&&normPaths[j].startsWith(`${normPaths[i]}/`))throw Error('Конфлікт файлу та каталогу в одному наборі змін');
+  }
+  for(const {path,item} of operations){if(item.delete===true)await unlink(path);else{await mkdir(dirname(path),{recursive:true});await writeFile(path,item.content);}}
   return changes.map(c=>c.path);
 }
 
@@ -52,9 +68,20 @@ export async function sandboxChecks(cwd,testFiles,{signal,access='workspace-writ
   const profile=`permissions.orcestrator_check={extends=":${writable?'workspace':'read-only'}",filesystem={":root"="deny",":minimal"="read",":workspace_roots"={"."="${writable?'write':'read'}"}},network={enabled=false}}`;
   const args=['sandbox','-P','orcestrator_check','-C',root,'--include-managed-config','-c',profile,
     ...(process.platform==='win32'?['--enable','prefer_mxc','-c','windows.sandbox="elevated"']:[]),'--',process.execPath,
-    '--permission',`--allow-fs-read=${root}`,...(writable?[`--allow-fs-write=${root}`]:[]),'--preserve-symlinks','--preserve-symlinks-main','--test-isolation=none','--test-reporter=tap','--test',...tests];
-  try{const result=await run(command,args,{cwd:root,env,prompt:'',signal});return {command:`node --test ${tests.join(' ')}`,status:'passed',required:true,details:result.slice(-10000)};}
-  catch(error){return {command:`node --test ${tests.join(' ')}`,status:/# fail\s+[1-9]/.test(error.stdout??'')?'failed':'not_run',required:true,details:((error.stdout??'')+'\n'+error.message).slice(-10000)};}
+    '--permission',`--allow-fs-read=${root}`,...(writable?[`--allow-fs-write=${root}`]:[]),'--preserve-symlinks','--preserve-symlinks-main','--test-isolation=none','--test-reporter=tap','--test','--', ...tests];
+  try{
+    const result=await run(command,args,{cwd:root,env,prompt:'',signal});
+    const testsMatch=/^# tests\s+(\d+)/m.exec(result??'');
+    const failMatch=/^# fail\s+(\d+)/m.exec(result??'');
+    const cancelMatch=/^# cancelled\s+(\d+)/m.exec(result??'');
+    if(testsMatch&&(Number(testsMatch[1])===0||Number(failMatch?.[1]??0)>0||Number(cancelMatch?.[1]??0)>0)){
+      return {command:`node --test ${tests.join(' ')}`,status:'failed',required:true,details:(result||'Не виконано жодного тесту').slice(-10000)};
+    }
+    return {command:`node --test ${tests.join(' ')}`,status:'passed',required:true,details:result.slice(-10000)};
+  }catch(error){
+    if(signal?.aborted)throw signal.reason??error;
+    return {command:`node --test ${tests.join(' ')}`,status:/# fail\s+[1-9]/.test(error.stdout??'')?'failed':'not_run',required:true,details:((error.stdout??'')+'\n'+error.message).slice(-10000)};
+  }
 }
 
 export async function executeFileWorker(agent,context,{model=executeOpenCode,checks=sandboxChecks}={}) {
@@ -63,11 +90,43 @@ export async function executeFileWorker(agent,context,{model=executeOpenCode,che
 Поверни ТІЛЬКИ JSON: {"status":"completed|blocked|failed|delegated","summary":"...","changes":[{"path":"relative/file.mjs","baseHash":null,"content":"повний вміст"}],"testFiles":["file.test.mjs"],"subtasks":[]}.
 Для наявних файлів baseHash має точно збігатися з контекстом; для нового — null. Для видалення використовуй delete:true замість content. До 40 змін і 1 MB загалом. .git, секрети й зовнішні файли заборонені.
 Для JS/TS коду потрібні реальні тести. testFiles — шляхи до Node.js тестів, команди не приймаються. Результати тестів не вигадуй: сервер запустить їх.
-Не викликай жодних інструментів, навіть для читання файлів або запуску тестів: файли вже наведені нижче як дані; командами керує сервер. Поверни один завершений текстовий JSON.
+Не викликай інструментів. Нижче наведено вибрані файли. Відсутність вмісту файлу не означає, що файл можна створити заново. Якщо для задачі потрібен пропущений файл, назви його шлях у звіті. Поверни один завершений текстовий JSON.
 ${context.canDelegate?'Можна status=delegated і subtasks:[{title,prompt,skills,agentIds:[]}]; тоді changes і testFiles мають бути порожніми.':'Делегування заборонене: status=delegated не допускається.'}
-Поточні файли: ${JSON.stringify(files)}
-Задача: ${context.prompt}`;
-  const output=await model({...agent,access:'read-only'},{...context,prompt:instruction},{home:join(OPENCODE_HOME,'jobs',hash(root).slice(0,24))});
+${context.prompt}
+
+Файли з вмістом: `;
+  const focus=context.prompt.split('\nDependency results:\n')[0].toLowerCase();
+  const words=new Set(focus.match(/[a-z0-9]{3,}/g)??[]);
+  const ranked=files.map(file=>{
+    const path=file.path.toLowerCase();
+    const terms=new Set(path.match(/[a-z0-9]{3,}/g)??[]);
+    const score=(focus.includes(path)?100:0)+[...terms].filter(word=>words.has(word)).length+
+      (path==='package.json'||path==='readme.md'?2:0);
+    return {file,score};
+  }).sort((a,b)=>b.score-a.score);
+  // Count the prompt as an escaped JSON string, including room for the JSONL envelope.
+  const paths=ranked.map(({file})=>file.path);
+  const suffix='\nВиявлені шляхи у робочій папці: '+JSON.stringify(paths);
+  const bytes=value=>Buffer.byteLength(JSON.stringify(value),'utf8')-2;
+  const fixed=bytes(instruction)+2+64;
+  if(fixed>workerPromptBytes)throw Object.assign(Error('Текст задачі перевищує бюджет контексту файлового виконавця'),{code:'WORKER_CONTEXT_TOO_LARGE'});
+  const index=fixed+bytes(suffix)<=workerPromptBytes?suffix:'';
+  let available=workerPromptBytes-fixed-bytes(index);
+  const selected=[];
+  for(const {file} of ranked){
+    const size=bytes(JSON.stringify(file))+(selected.length?1:0);
+    if(size>available)continue;
+    selected.push(file);
+    available-=size;
+  }
+  const prompt=instruction+JSON.stringify(selected)+index;
+  const jobHome=join(OPENCODE_HOME,'jobs',hash(root).slice(0,24));
+  let output;
+  try {
+    output=await model({...agent,access:'read-only'},{...context,prompt},{home:jobHome});
+  } finally {
+    await rm(jobHome,{recursive:true,force:true}).catch(()=>{});
+  }
   try {
   const value=JSON.parse(output.text.trim().replace(/^```(?:json)?\s*|\s*```$/g,''));
   if(typeof value.summary!=='string'||!value.summary.trim()||!['completed','blocked','failed','delegated'].includes(value.status))throw Error('Некоректний звіт файлового виконавця');
@@ -75,7 +134,10 @@ ${context.canDelegate?'Можна status=delegated і subtasks:[{title,prompt,sk
     if(!context.canDelegate||!Array.isArray(value.subtasks)||!value.subtasks.length||value.subtasks.length>10||value.changes?.length||value.testFiles?.length)throw Error('Недопустимий запит делегування');
     return {text:output.text,delegation:value.subtasks,usage:output.usage};
   }
-  if(value.status!=='completed'){const error=new Error(value.summary);error.code=value.status==='blocked'?'WORKER_BLOCKED':'WORKER_FAILED';throw error;}
+  if(value.status!=='completed'){
+    const error=new Error(value.summary);error.code=value.status==='blocked'?'AGENT_BLOCKED':'WORKER_FAILED';
+    error.report={status:value.status,summary:value.summary,files:[],checks:[]};throw error;
+  }
   if(agent.access!=='workspace-write'&&value.changes?.length)throw Error('Read-only виконавець не може змінювати файли');
   if(!Array.isArray(value.testFiles)||value.testFiles.length>30||value.testFiles.some(p=>typeof p!=='string'))throw Error('Некоректний список перевірок');
   const changed=await applyWorkerChanges(root,value.changes??[]);context.signal.throwIfAborted();
@@ -84,7 +146,9 @@ ${context.canDelegate?'Можна status=delegated і subtasks:[{title,prompt,sk
   const testFiles=value.testFiles.length?value.testFiles:needsTests?discovered:[];
   const results=testFiles.length?[await checks(root,testFiles,{signal:context.signal,access:agent.access})]:[];
   if((needsTests&&!testFiles.length)||results.some(c=>c.status!=='passed')) {
-    const error=new Error(needsTests&&!testFiles.length?'Для змін коду не надано тестів':results[0].details);error.code=results.some(c=>c.status==='failed')?'WORKER_FAILED':'CHECKS_BLOCKED';error.usage=output.usage;throw error;
+    const error=new Error(needsTests&&!testFiles.length?'Для змін коду не надано тестів':results[0].details);
+    error.code=results.some(c=>c.status==='failed')?'WORKER_FAILED':'CHECKS_BLOCKED';
+    error.report={status:'blocked',summary:value.summary,files:changed,checks:results};error.usage=output.usage;throw error;
   }
   const report={status:'completed',summary:value.summary,files:changed,checks:results};
   return {text:`${report.summary}\n\nФайли: ${changed.join(', ')||'без змін'}\n${results.map(c=>`${c.command}: ${c.status}\n${c.details}`).join('\n')}`,report,usage:output.usage};

@@ -1,16 +1,38 @@
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { id, assert, makeProject, selectAgents, taskDefaults, validateProject } from './domain.js';
-import { execute } from './providers.js';
+import { dependencyHandoff,workerHandoff } from './execution-context.js';
+import { execute,codexUsageLimitMessage } from './providers.js';
+import { executionReportInstructions,reportNeedsCorrection,workspaceNeedsResolution,verificationBlockers,waitsForVerification } from './execution-report.js';
+import { storefrontAcceptanceId, verifyStorefrontEvidence } from './storefront-quality.js';
 
-const terminal = new Set(['completed', 'failed', 'blocked', 'cancelled', 'interrupted']);
+const terminal = new Set(['completed', 'failed', 'blocked', 'cancelled', 'interrupted', 'deferred']);
+const timedOut=task=>['failed','blocked'].includes(task.status)&&
+  (task.failure?.code==='AGENT_TIMEOUT'||task.failure?.code===23&&/aborted due to timeout/i.test(task.failure.message));
+const accessBlocked=task=>['failed','blocked'].includes(task.status)&&
+  (task.failure?.code==='MODEL_ACCESS_BLOCKED'||task.failure?.code==='AGENT_FAILED'&&
+    task.failure.routeId?.startsWith('codex:')&&codexUsageLimitMessage(task.failure.message));
+export const retryableAccessTasks=(run,taskId)=>run.tasks.filter(task=>(taskId===undefined||task.id===taskId)&&accessBlocked(task));
+export const budgetBlocked=task=>['failed','blocked'].includes(task.status)&&
+  (task.failure?.code==='RUN_CALL_BUDGET' || task.failure?.code==='AGENT_FAILED'&&task.error==='Run call budget exhausted');
+const needsClarification=task=>task.status==='blocked'&&task.failure?.code==='AGENT_BLOCKED';
+const canReply=task=>needsClarification(task)||reportNeedsCorrection(task)||workspaceNeedsResolution(task)||waitsForVerification(task);
+function unblockTasks(tasks,reset) {
+  let changed;do{changed=false;for(const task of tasks){
+    if(task.status!=='blocked'||task.error||task.failure)continue;
+    const children=tasks.filter(t=>t.parentId===task.id),deps=task.dependsOn.map(id=>tasks.find(t=>t.id===id));
+    if(children.some(t=>reset.has(t.id))&&children.every(t=>t.status==='completed'||reset.has(t.id))){task.status='waiting_children';reset.add(task.id);changed=true;}
+    else if(deps.some(t=>reset.has(t.id))&&deps.every(t=>t.status==='completed'||reset.has(t.id))){task.status='pending';reset.add(task.id);changed=true;}
+  }}while(changed);
+}
 export class Engine {
-  constructor(store, provider = execute, {workspaces,recover}={}) {
+  constructor(store, provider = execute, {workspaces,recover,maxIntegrationRetries=0}={}) {
     this.store = store;
     this.provider = provider;
     this.controls = new Map();
     this.workspaceLocks = new Set();
-    this.workspaces=workspaces;this.recover=recover;this.listeners=new Set();
+    this.codexSlotBusy = false;
+    this.workspaces=workspaces;this.recover=recover;this.maxIntegrationRetries=maxIntegrationRetries===1?1:0;this.listeners=new Set();
   }
   createProject(input) {
     const project = makeProject(input);
@@ -26,11 +48,12 @@ export class Engine {
     this.store.save();
     return project;
   }
-  project(key) { const p = this.store.data.projects[key]; assert(p, 'Project not found'); return p; }
-  run(key) { const r = this.store.data.runs[key]; assert(r, 'Run not found'); return r; }
+  project(key) { const p = Object.hasOwn(this.store.data.projects, key) ? this.store.data.projects[key] : undefined; assert(p, 'Project not found'); return p; }
+  run(key) { const r = Object.hasOwn(this.store.data.runs, key) ? this.store.data.runs[key] : undefined; assert(r, 'Run not found'); return r; }
   event(run, type, details = {}) {
     const event={...details,id:run.events.length+1,at:new Date().toISOString(),type};run.events.push(event);
-    this.store.save();
+    if(type==='agent.progress'&&this.store.saveProgress)this.store.saveProgress();
+    else this.store.save();
     for(const listener of this.listeners){try{listener(run,event);}catch{this.listeners.delete(listener);}}
   }
   subscribe(listener){this.listeners.add(listener);return()=>this.listeners.delete(listener);}
@@ -59,10 +82,77 @@ export class Engine {
   cancel(key) {
     const run = this.run(key);
     assert(['running', 'paused'].includes(run.status), 'Run is already terminal');
+    const control = this.controls.get(key);
+    const draining = Boolean(control.active.size || control.recovering);
+    const taskStates = Object.fromEntries(run.tasks.filter(task => !terminal.has(task.status)).map(task => [task.id, task.status]));
     run.status = 'cancelled';
-    for (const task of run.tasks) if (!terminal.has(task.status)) task.status = 'cancelled';
-    this.controls.get(key).controller.abort(new Error('Run cancelled'));
-    this.wake(run); this.event(run, 'run.cancelled'); return run;
+    for (const task of run.tasks) if (Object.hasOwn(taskStates, task.id)) task.status = 'cancelled';
+    control.controller.abort(new Error('Run cancelled'));
+    this.wake(run); this.event(run, 'run.cancelled', { taskStates, draining }); return run;
+  }
+  cancelledRunTasks(run) {
+    if (run.status !== 'cancelled') return [];
+    const cancellation = run.events.findLast(event => event.type === 'run.cancelled');
+    if (!cancellation) return [];
+    // Older runs only recorded the whole-run cancellation and individual task cancellations.
+    const individuallyCancelled = new Set(run.events.filter(event => event.type === 'task.cancelled').map(event => event.taskId));
+    const byId = new Map(run.tasks.map(task => [task.id, task]));
+    const wasIndividuallyCancelled = task => task && (individuallyCancelled.has(task.id) ||
+      (task.parentId && wasIndividuallyCancelled(byId.get(task.parentId))));
+    return run.tasks.filter(task => task.status === 'cancelled' && (cancellation.taskStates
+      ? Object.hasOwn(cancellation.taskStates, task.id)
+      : !wasIndividuallyCancelled(task))).map(task => {
+      const previous = cancellation.taskStates?.[task.id];
+      const lastStartOrDelegation = previous === undefined && run.events.findLast(event =>
+        event.taskId === task.id && ['task.started', 'task.delegated'].includes(event.type));
+      const waitingForChildren = previous === 'waiting_children' || lastStartOrDelegation?.type === 'task.delegated';
+      const draft = task.resumeWorkspace ?? (waitingForChildren ? undefined : task.workspace);
+      return { task, draft, status: waitingForChildren ? 'waiting_children' : 'pending' };
+    });
+  }
+  canResumeCancelled(run) {
+    const control = this.controls.get(run.id);
+    if (run.status !== 'cancelled' || run.project.workspaceMode !== 'isolated' || !this.workspaces ||
+        control?.active.size || control?.recovering || run.calls >= run.project.limits.maxCalls) return false;
+    const candidates = this.cancelledRunTasks(run);
+    if (!candidates.length) return false;
+    if (control) return true;
+    const lastCancellationOrDrain = run.events.findLast(event => ['run.cancelled', 'run.drained'].includes(event.type));
+    // After a restart, require evidence that the old writer stopped before reusing a draft.
+    return lastCancellationOrDrain.type === 'run.drained' ||
+      !(lastCancellationOrDrain.draining ?? candidates.some(({draft}) => draft));
+  }
+  resumeCancelled(key) {
+    const run = this.run(key);
+    assert(this.canResumeCancelled(run), 'Немає скасованих задач, які можна продовжити в межах бюджету');
+    const resumed = this.cancelledRunTasks(run);
+    const at = new Date().toISOString();
+    for (const {task, draft, status} of resumed) {
+      task.history ??= [];
+      task.history.push({reason:'manual-cancelled-resume', at, status:task.status, workspace:task.workspace,
+        outputs:task.outputs, result:task.result, review:task.review, attempts:task.attempts});
+      if (draft) {
+        task.resumeWorkspace = draft;
+        task.resumeFiles = [...new Set([...(task.resumeFiles ?? []), ...task.outputs.flatMap(output => output.report?.files ?? [])])];
+      }
+      task.status = status;
+      task.outputs = [];
+      for (const field of ['workspace', 'result', 'review', 'assignedAgentIds']) delete task[field];
+    }
+    unblockTasks(run.tasks, new Set(resumed.map(({task}) => task.id)));
+    run.status = 'running';
+    run.canResumeCancelled = false;
+    delete run.finishedAt;
+    delete run.files;
+    if (run.recovery) {
+      run.recovery.status = 'idle';
+      delete run.recovery.reason;
+    }
+    this.controls.set(key, {controller:new AbortController(),taskControllers:new Map(),taskWorkspaces:new Map(),active:new Map(),callsActive:0,waiters:[]});
+    this.event(run, 'run.cancelled_resumed', {taskIds:resumed.map(({task}) => task.id),
+      message:'Продовжено скасований запуск. Готові результати, чернетки та витрачені виклики збережено.'});
+    this.pump(run);
+    return run;
   }
   approve(key, taskId) {
     const run = this.run(key), task = run.tasks.find(t => t.id === taskId);
@@ -97,57 +187,239 @@ export class Engine {
     control.recoveryStopped=false;control.manualRecovery=true;this.controls.set(key,control);
     run.status='running';delete run.finishedAt;delete run.files;this.event(run,'recovery.requested',{message:'Запитано відновлення невдалих задач'});this.pump(run);return run;
   }
-  async slot(run, task, agent, cwd=run.project.workspace??process.cwd()) {
+  canIncreaseBudget(run) {
+    const control=this.controls.get(run.id);
+    return ['failed','blocked','cancelled'].includes(run.status)&&!control?.active.size&&!control?.recovering&&run.project.limits.maxCalls<10000;
+  }
+  increaseBudget(key,{maxCalls,previousMaxCalls}={}) {
+    const run=this.run(key),previous=run.project.limits.maxCalls;
+    assert(this.canIncreaseBudget(run),'Ліміт можна збільшити після зупинки активних викликів');
+    assert(previousMaxCalls===previous,'Ліміт уже змінився. Оновіть дані запуску');
+    assert(Number.isSafeInteger(maxCalls)&&maxCalls>previous&&maxCalls<=10000,'Вкажіть більший ліміт, до 10 000 викликів');
+    run.project.limits.maxCalls=maxCalls;
+    this.event(run,'run.budget_increased',{previousMaxCalls:previous,maxCalls,message:`Ліміт викликів збільшено з ${previous} до ${maxCalls}`});
+    return run;
+  }
+  canContinue(run,{accessRetry=false,budgetRetry=false,taskId}={}) {
+    const control=this.controls.get(run.id);
+    return (run.status==='failed'||accessRetry&&run.status==='blocked')&&run.project.workspaceMode==='isolated'&&Boolean(this.workspaces)&&
+      !control?.active.size&&!control?.recovering&&run.calls<run.project.limits.maxCalls&&
+      (accessRetry?retryableAccessTasks(run,taskId).length>0:run.tasks.some(budgetRetry?budgetBlocked:timedOut));
+  }
+  canRetryAccess(run,taskId){return this.canContinue(run,{accessRetry:true,taskId});}
+  canRetryBudget(run){return this.canContinue(run,{budgetRetry:true});}
+  retryBudget(key){return this.continueTimedOut(key,{timeoutMs:this.run(key).project.limits.timeoutMs,budgetRetry:true});}
+  retryAccess(key,taskId,replacement,replacementWorkspace){return this.continueTimedOut(key,{timeoutMs:this.run(key).project.limits.timeoutMs,accessRetry:true,taskId,replacement,replacementWorkspace});}
+  restoreBlockedReports(run) {
+    if(!['failed','blocked'].includes(run.status)||this.controls.get(run.id)?.active.size||this.controls.get(run.id)?.recovering)return;
+    let restored=false;
+    for(const task of run.tasks){
+      if(!['failed','blocked'].includes(task.status)||task.failure?.code!=='AGENT_FAILED'||!task.error?.startsWith('Codex blocked: '))continue;
+      let report;
+      for(const event of run.events.filter(e=>e.taskId===task.id&&e.type==='agent.progress'&&e.kind==='agent_message').reverse()){
+        try{const candidate=JSON.parse(event.message);if(candidate.status==='blocked'&&typeof candidate.summary==='string'&&task.error.startsWith(`Codex blocked: ${candidate.summary}`)&&Array.isArray(candidate.files)&&candidate.files.every(p=>typeof p==='string')&&Array.isArray(candidate.checks)){report=candidate;break;}}catch{/* A truncated progress frame cannot reconstruct a report. */}
+      }
+      task.blockedReport=report??{status:'blocked',summary:task.error.slice('Codex blocked: '.length).split('\n')[0],files:[],checks:[]};
+      task.failure.code='AGENT_BLOCKED';task.status='blocked';restored=true;
+    }
+    if(restored){run.status='blocked';this.event(run,'run.blocked',{message:'Очікуємо уточнення користувача; підготовлені матеріали збережено в ізольованій папці'});}
+  }
+  canClarify(run) {
+    const control=this.controls.get(run.id);
+    return ['blocked','failed'].includes(run.status)&&run.project.workspaceMode==='isolated'&&Boolean(this.workspaces)&&
+      !control?.active.size&&!control?.recovering&&run.calls<run.project.limits.maxCalls&&run.tasks.some(canReply);
+  }
+  hostVerificationTask(run, key) {
+    const control=this.controls.get(run.id);
+    if(!['blocked','failed'].includes(run.status)||run.project.workspaceMode!=='isolated'||!this.workspaces||
+      control?.active.size||control?.recovering)return;
+    const task=run.tasks.find(item=>item.id===key);
+    if(task&&task.workspace&&(verificationBlockers(task).length||
+      task.status==='blocked'&&task.failure?.code==='AGENT_BLOCKED'&&task.blockedReport?.checks?.length)&&
+      !task.reviewerId&&selectAgents(run.project,task).length===1&&
+      !run.tasks.some(item=>item.parentId===task.id))return task;
+  }
+  async acceptHostVerification(run,task,lease,verifiedTree,checks,signal,{testCompletion}={}) {
+    assert(this.hostVerificationTask(run,task.id)===task,'Чернетка більше не очікує перевірки');
+    const deferred=[];
+    if(testCompletion){
+      const ids=testCompletion.deferTasks;
+      assert(Array.isArray(ids)&&ids.length&&new Set(ids).size===ids.length,'Некоректний перелік етапів запуску');
+      const remaining=new Set(ids), dependencies=new Set([task.id]);
+      assert(run.tasks.every(item=>item===task||item.status==='completed'||remaining.has(item.id)),
+        'Є незавершені задачі тестового запуску');
+      while(remaining.size){
+        const item=run.tasks.find(candidate=>remaining.has(candidate.id)&&candidate.dependsOn.some(id=>dependencies.has(id)));
+        assert(item&&['blocked','pending'].includes(item.status)&&!item.attempts&&!item.workspace&&!item.failure&&!item.error,
+          'Етап для відкладення має бути нерозпочатою залежною задачею');
+        deferred.push(item);
+        remaining.delete(item.id);
+        dependencies.add(item.id);
+      }
+    }
+    const summary=testCompletion?'Чернетку прийнято для тестового запуску. Перевірки реального запуску відкладено.':task.blockedReport.summary;
+    const report={...task.blockedReport,status:'completed',summary,checks};
+    if(task.id===storefrontAcceptanceId&&!await verifyStorefrontEvidence(report,lease.cwd))
+      throw Error('Бракує браузерного тесту або двох знімків вітрини');
+    try {
+      const integrated=await this.workspaces.publish(lease,signal,{verifiedTree});
+      task.workspace={...task.workspace,commit:integrated.commit};
+    } catch(error) {
+      if(error.candidateCommit){
+        task.workspace.candidateCommit=error.candidateCommit;
+        task.status='blocked';task.error=error.message;task.failure={code:'WORKSPACE_CONFLICT',message:error.message};
+        task.result=report.summary;
+        task.outputs.push({agentId:'local-verifier',text:report.summary,report,at:new Date().toISOString()});
+        this.event(run,'workspace.verification_conflict',{taskId:task.id,message:error.message});
+      }
+      throw error;
+    }
+    const at=new Date().toISOString();
+    task.history??=[];
+    task.history.push({reason:'host-verification',at,status:task.status,error:task.error,failure:task.failure,report:task.blockedReport});
+    task.outputs.push({agentId:'local-verifier',text:report.summary,report,at});
+    task.result=`${report.summary}\n\nЛокальний верифікатор: ${checks.filter(check=>check.source==='host').map(check=>check.command).join(', ')} — пройдено.`;
+    task.status='completed';
+    for(const field of ['error','failure','blockedReason','blockedRouteId','blockedReport','verificationBlockers','hostVerificationProgress'])delete task[field];
+    if(testCompletion){
+      for(const item of deferred){
+        item.status='deferred';
+        item.result='Відкладено до окремого рішення про реальний запуск.';
+      }
+      run.testCompletion={taskIds:deferred.map(item=>item.id),deferredCheck:testCompletion.deferCheck};
+      run.status='completed';
+      run.finishedAt=at;
+      delete run.files;
+      this.event(run,'run.completed',{taskId:task.id,tree:verifiedTree,commit:task.workspace.commit,testCompletion:run.testCompletion,
+        message:'Тестовий запуск завершено. Реальний пілот і продажі відкладено.'});
+      return run;
+    }
+    unblockTasks(run.tasks,new Set([task.id]));
+    run.status='running';
+    delete run.finishedAt;delete run.files;
+    this.controls.set(run.id,{controller:new AbortController(),taskControllers:new Map(),taskWorkspaces:new Map(),active:new Map(),callsActive:0,waiters:[]});
+    this.event(run,'task.host_verified',{taskId:task.id,tree:verifiedTree,commit:task.workspace.commit,
+      message:'Обов’язкові локальні перевірки пройшли. Чернетку прийнято без виклику моделі.'});
+    this.pump(run);
+    return run;
+  }
+  clarify(key,{taskId,answer,projectScope=false,lease,replacement}={}) {
+    const run=this.run(key);assert(this.canClarify(run),'Run is not waiting for clarification or its call budget is exhausted');
+    assert(typeof answer==='string'&&answer.trim()&&answer.length<=6000,'Потрібне уточнення до 6000 символів');
+    const task=run.tasks.find(t=>t.id===taskId);assert(task&&canReply(task),'Задача не очікує уточнення');
+    const brief=projectScope?[run.project.executionBrief,answer.trim()].filter(Boolean).join('\n\n'):run.project.executionBrief;
+    assert((brief?.length??0)<=12000,'Загальне уточнення перевищує 12000 символів');
+    assert(lease&&(lease.cwd===task.workspace?.path||(workspaceNeedsResolution(task)||replacement)&&lease.resolvedFrom===task.workspace?.path),'Потрібна перевірена папка чернетки');
+    const previousAgentIds=task.agentIds;
+    if(replacement){
+      const agents=run.project.agents.some(agent=>agent.id===replacement.id)?run.project.agents:[...run.project.agents,replacement];
+      validateProject({...run.project,agents,tasks:run.tasks.map(item=>item===task?{...item,agentIds:[replacement.id]}:item)});
+      run.project.agents=agents;task.agentIds=[replacement.id];
+    }
+    task.history??=[];task.history.push({reason:replacement?'resume-with-tools':'user-clarification',at:new Date().toISOString(),status:task.status,error:task.error,failure:task.failure,report:task.blockedReport,workspace:task.workspace,outputs:task.outputs,agentIds:previousAgentIds,attempts:task.attempts});
+    task.clarifications??=[];task.clarifications.push({at:new Date().toISOString(),answer:answer.trim(),projectScope});
+    task.resumeWorkspace={path:lease.cwd,branch:lease.branch,baseCommit:lease.baseCommit,conflicts:lease.conflicts};task.resumeFiles=task.blockedReport?.files??task.outputs.flatMap(o=>o.report?.files??[]);
+    if(lease.conflicts?.length)task.clarifications.at(-1).integrationConflicts=lease.conflicts;
+    task.status='pending';task.attempts=0;task.outputs=[];
+    for(const field of ['error','failure','blockedReport','blockedReason','blockedRouteId','result','review','assignedAgentIds','hostVerificationProgress','verificationBlockers','integrationContext','recoveryContext'])delete task[field];
+    unblockTasks(run.tasks,new Set([task.id]));
+    if(projectScope)run.project.executionBrief=brief;
+    run.status='running';run.canClarify=false;delete run.finishedAt;delete run.files;
+    if(run.recovery){run.recovery.status='idle';delete run.recovery.reason;}
+    this.controls.set(key,{controller:new AbortController(),taskControllers:new Map(),taskWorkspaces:new Map(),active:new Map(),callsActive:0,waiters:[]});
+    this.event(run,'run.clarified',{taskId,message:replacement?`Чернетку передано виконавцю з доступом до робочої папки (${replacement.model})`:'Уточнення користувача збережено; продовжуємо з підготовленої чернетки',projectScope});
+    this.pump(run);return run;
+  }
+  continueTimedOut(key,{timeoutMs=null,accessRetry=false,budgetRetry=false,taskId,replacement,replacementWorkspace}={}) {
+    const run=this.run(key);assert(this.canContinue(run,{accessRetry,budgetRetry,taskId}),'Only a drained retryable run with remaining call budget can continue');
+    const next=structuredClone(run.tasks),reset=new Set();
+    const candidates=accessRetry?retryableAccessTasks({tasks:next},taskId):next.filter(budgetRetry?budgetBlocked:timedOut);
+    assert(!replacement||accessRetry&&taskId&&candidates.length===1,'A replacement requires one access-blocked task');
+    for(const task of candidates){
+      if((accessRetry||budgetRetry)&&task.workspace){task.resumeWorkspace=task.workspace;task.resumeFiles=task.blockedReport?.files??task.history?.findLast(h=>h.report?.files)?.report.files??[];}
+      if(replacementWorkspace)task.resumeWorkspace=replacementWorkspace;
+      task.history??=[];task.history.push({reason:budgetRetry?'manual-budget-retry':accessRetry?'manual-access-retry':'manual-timeout-continuation',at:new Date().toISOString(),status:task.status,error:task.error,failure:task.failure,report:task.blockedReport,workspace:task.workspace,outputs:task.outputs,agentIds:task.agentIds,attempts:task.attempts});
+      if(replacement)task.agentIds=[replacement.id];
+      task.status='pending';task.attempts=0;task.outputs=[];
+      for(const field of ['error','failure','blockedReport','blockedReason','blockedRouteId','workspace','result','review','assignedAgentIds','hostVerificationProgress','verificationBlockers','integrationContext','recoveryContext'])delete task[field];
+      reset.add(task.id);
+    }
+    unblockTasks(next,reset);
+    const agents=replacement&&!run.project.agents.some(agent=>agent.id===replacement.id)?[...run.project.agents,replacement]:run.project.agents;
+    const limits={...run.project.limits,timeoutMs};validateProject({...run.project,agents,limits,tasks:next});
+    const previousTimeoutMs=run.project.limits.timeoutMs;
+    run.project.agents=agents;run.project.limits=limits;run.tasks=next;run.status='running';run.canContinue=false;run.canRetryAccess=false;run.canRetryBudget=false;delete run.finishedAt;delete run.files;
+    if(run.recovery){run.recovery.status='idle';delete run.recovery.reason;}
+    this.controls.set(key,{controller:new AbortController(),taskControllers:new Map(),taskWorkspaces:new Map(),active:new Map(),callsActive:0,waiters:[]});
+    this.event(run,budgetRetry?'run.budget_retried':accessRetry?'run.access_retried':'run.continued',{taskIds:[...reset],previousTimeoutMs,timeoutMs,replacementModel:replacement?.model,
+      message:budgetRetry?'Продовжено задачі в межах збільшеного бюджету':accessRetry?'Доступ перевірено; продовжено заблоковані виклики зі збереженої чернетки':'Продовжено задачі після таймауту; готові результати та витрачені виклики збережено'});
+    this.pump(run);return run;
+  }
+  async slot(run, task, agent, cwd=run.project.workspace??process.cwd(), extraSignal) {
     const control = this.controls.get(run.id);
+    const guardedCodex=agent.provider==='codex'&&(agent.billingBoundary==='subscription_quota_guarded'||agent.billing==='subscription_included');
     // CLI jobs serialize within the same real workspace, including readers: no partial-write races.
     let lock;
-    if (['cli', 'codex', 'claude','opencode'].includes(agent.provider)) {
+    if (['cli', 'codex', 'claude','opencode'].includes(agent.provider) || (agent.provider==='antigravity'&&(agent.fileWorker===true||agent.access==='workspace-write'))) {
       lock = realpathSync(resolve(cwd));
       if (process.platform === 'win32') lock = lock.toLowerCase();
     }
     while (true) {
       control.controller.signal.throwIfAborted();
       control.taskControllers.get(task.id).signal.throwIfAborted();
-      if (run.status === 'running' && control.callsActive < run.project.limits.concurrency && (!lock || !this.workspaceLocks.has(lock))) break;
+      extraSignal?.throwIfAborted();
+      if (run.status === 'running' && control.callsActive < run.project.limits.concurrency &&
+          (!guardedCodex||!this.codexSlotBusy)&&(!lock || !this.workspaceLocks.has(lock))) break;
       await new Promise(resolve => control.waiters.push(resolve));
     }
-    assert(run.calls < run.project.limits.maxCalls, 'Run call budget exhausted');
-    run.calls++; control.callsActive++;
+    if(run.calls>=run.project.limits.maxCalls)throw Object.assign(Error('Run call budget exhausted'),{code:'RUN_CALL_BUDGET'});
+    control.callsActive++;
+    if(guardedCodex)this.codexSlotBusy=true;
     if (lock) this.workspaceLocks.add(lock);
     return () => {
       control.callsActive--;
+      if(guardedCodex)this.codexSlotBusy=false;
       if (lock) this.workspaceLocks.delete(lock);
       for (const r of Object.values(this.store.data.runs)) this.wake(r);
     };
   }
-  async invoke(run, task, agent, prompt, {fork=false}={}) {
+  async invoke(run, task, agent, prompt, {fork=false,canDelegate:allowDelegate,signal:extraSignal}={}) {
     const control = this.controls.get(run.id);
-    const signal = AbortSignal.any([control.controller.signal, control.taskControllers.get(task.id).signal, AbortSignal.timeout(run.project.limits.timeoutMs)]);
     const parent=control.taskWorkspaces.get(task.id),lease=fork&&parent?await this.workspaces.fork(parent,agent.id):parent;
     const cwd=lease?.cwd??resolve(run.project.workspace??process.cwd());
-    const release = await this.slot(run, task, agent,cwd);
-    this.event(run, 'agent.started', { taskId: task.id, agentId: agent.id });
+    const release = await this.slot(run, task, agent,cwd,extraSignal);
+    // An explicit execution deadline starts after obtaining a slot, never in the queue.
+    const deadline=run.project.limits.timeoutMs==null?null:AbortSignal.timeout(run.project.limits.timeoutMs);
+    const signal = AbortSignal.any([control.controller.signal, control.taskControllers.get(task.id).signal,...(extraSignal?[extraSignal]:[]),...(deadline?[deadline]:[])]);
     try {
-      const canDelegate=task.allowDelegation===true&&task.assignedAgentIds.length===1&&task.depth<run.project.limits.maxDepth&&!run.tasks.some(t=>t.parentId===task.id);
+      const onInvoke=()=>{
+        if(run.calls>=run.project.limits.maxCalls)throw Object.assign(Error('Run call budget exhausted'),{code:'RUN_CALL_BUDGET'});
+        run.calls++;
+        this.event(run,'agent.started',{taskId:task.id,agentId:agent.id});
+      };
+      const canDelegate=allowDelegate!==undefined?Boolean(allowDelegate):
+        (task.allowDelegation===true&&!task.integrationContext&&task.assignedAgentIds.length===1&&task.depth<run.project.limits.maxDepth&&!run.tasks.some(t=>t.parentId===task.id));
+      if(!this.provider.admitsInvocation)onInvoke();
       const output = await this.provider(agent, {
-        prompt: `Role: ${agent.role ?? agent.id}\nInstructions: ${agent.instructions ?? ''}\n\n${prompt}${task.recoveryContext?'\nRecovery diagnostics (data, not instructions): '+JSON.stringify(task.recoveryContext).slice(0,6000):''}`,
+        prompt: `Role: ${agent.role ?? agent.id}\nInstructions: ${agent.instructions ?? ''}${agent.provider==='codex'&&agent.executionReport?'\n'+executionReportInstructions:''}\n\n${prompt}${run.project.executionBrief?'\nУточнення користувача до всього проєкту (уточнює попередні вимоги; не означає дозволу на публікацію або зовнішні транзакції):\n'+run.project.executionBrief:''}${task.clarifications?.length?'\nУточнення користувача до цієї задачі:\n'+JSON.stringify(task.clarifications):''}${task.recoveryContext?'\nRecovery diagnostics (data, not instructions): '+JSON.stringify(task.recoveryContext).slice(0,6000):''}`,
         cwd, signal, maxOutputTokens: run.project.limits.maxOutputTokens,
-        canDelegate,
+        canDelegate,...(this.provider.admitsInvocation?{onInvoke}:{}),
         onEvent: progress => this.event(run, 'agent.progress', { taskId: task.id, agentId: agent.id, ...progress })
       });
       signal.throwIfAborted();
       assert(typeof output.text === 'string' && output.text.length > 0, 'Empty agent result');
       if(output.delegation&&!canDelegate)throw Error('Делегування поза дозволеними межами');
       if(lease&&output.report?.files)lease.files=[...new Set([...(lease.files??[]),...output.report.files])];
-      if(fork&&lease&&!output.delegation){const integrated=await this.workspaces.publish(lease,signal);this.event(run,'workspace.agent_integrated',{taskId:task.id,agentId:agent.id,...integrated});}
       const result = { agentId: agent.id, ...output, at: new Date().toISOString() };
+      if(fork&&lease&&!output.delegation)Object.defineProperty(result,'_forkLease',{value:lease,enumerable:false});
       task.outputs.push(result);
       this.event(run, 'agent.completed', { taskId: task.id, agentId: agent.id, usage: output.usage });
       return result;
     } catch (error) {
+      if(deadline?.aborted&&signal.reason===deadline.reason)error=Object.assign(new Error(`Перевищено встановлений час виконання: ${run.project.limits.timeoutMs} мс`),{code:'AGENT_TIMEOUT'});
       error.agentId??=agent.id;
       if(['codex','opencode','antigravity'].includes(agent.provider))error.routeId??=`${agent.provider}:${agent.model}`;
-      this.event(run, 'agent.failed', { taskId: task.id, agentId: agent.id, message: error.message, usage:error.usage,code:error.code,decisionCode:error.decisionCode,routeId:error.routeId });
+      this.event(run, error.code==='AGENT_BLOCKED'?'agent.blocked':'agent.failed', { taskId: task.id, agentId: agent.id, message: error.message, usage:error.usage,code:error.code,decisionCode:error.decisionCode,routeId:error.routeId });
       throw error;
     } finally { release(); }
   }
@@ -155,10 +427,22 @@ export class Engine {
     assert(Array.isArray(requests) && requests.length <= 10, 'Invalid subtask list (maximum 10)');
     assert(parent.depth < run.project.limits.maxDepth, 'Subagent depth exceeded');
     assert(run.tasks.length + requests.length <= run.project.limits.maxTasks, 'Task limit exceeded');
-    const children = requests.map(request => taskDefaults({ id: id(), title: request.title, prompt: request.prompt,
-      skills: request.skills ?? parent.skills, agentIds: request.agentIds?.length?request.agentIds:parent.assignedAgentIds?.slice(0,1)??[], teamSize: request.teamSize ?? 1,
-      parentId: parent.id, depth: parent.depth + 1, status: 'pending', outputs: [], attempts: 0,
-      allowDelegation: parent.allowDelegation === true }));
+    const parentAgents=(parent.assignedAgentIds??parent.agentIds).map(key=>run.project.agents.find(a=>a.id===key)).filter(Boolean);
+    const parentCanWrite=parentAgents.some(a=>a.access==='workspace-write'||a.access===undefined);
+    const parentFreeOnly=parentAgents.length>0&&parentAgents.every(a=>a.billing==='free_tier');
+    const children = requests.map(request => {
+      const chosenIds=Array.isArray(request.agentIds)&&request.agentIds.length?request.agentIds.slice(0,1):parent.assignedAgentIds?.slice(0,1)??[];
+      for(const aid of chosenIds){
+        const target=run.project.agents.find(a=>a.id===aid);
+        assert(target,`Unknown agent: ${aid}`);
+        if(!parentCanWrite&&target.access==='workspace-write')throw new Error('Read-only задача не може делегувати запис файлів');
+        if(parentFreeOnly&&target.billing&&target.billing!=='free_tier')throw new Error('Безкоштовна задача не може делегувати підписному виконавцю');
+      }
+      return taskDefaults({ id: id(), title: request.title, prompt: request.prompt,
+        skills: request.skills ?? parent.skills, agentIds: chosenIds, teamSize: 1,
+        parentId: parent.id, depth: parent.depth + 1, status: 'pending', outputs: [], attempts: 0,
+        allowDelegation: parent.allowDelegation === true });
+    });
     // Validate the entire addition before mutating persisted run state.
     validateProject({ ...run.project, tasks: [...run.tasks, ...children] });
     run.tasks.push(...children);
@@ -168,44 +452,99 @@ export class Engine {
   async work(run, task) {
     task.attempts++;
     const control=this.controls.get(run.id);
+    const continuedDraft = Boolean(task.resumeWorkspace);
     if(this.workspaces&&run.project.workspaceMode==='isolated'){
-      const lease=await this.workspaces.prepare(run,task);control.taskWorkspaces.set(task.id,lease);
-      task.workspace={path:lease.cwd,branch:lease.branch,baseCommit:lease.baseCommit};this.event(run,'workspace.ready',{taskId:task.id,...task.workspace});
+      const lease=task.resumeWorkspace?await this.workspaces.resume(run,task.resumeWorkspace):await this.workspaces.prepare(run,task);
+      if(task.resumeFiles?.length)lease.files=task.resumeFiles;
+      delete task.resumeWorkspace;delete task.resumeFiles;control.taskWorkspaces.set(task.id,lease);
+      task.workspace={path:lease.cwd,branch:lease.branch,baseCommit:lease.baseCommit,...(lease.conflicts?.length?{conflicts:lease.conflicts}:{})};this.event(run,'workspace.ready',{taskId:task.id,...task.workspace});
     }
-    try {
-      await this.workInWorkspace(run,task);
+    let retriedStorefront=false;
+    try {for(let integrationAttempt=0;;integrationAttempt++){
+      await this.workInWorkspace(run,task,{continuedDraft});
       if(task.status!=='running'||run.status==='cancelled')return;
       const lease=control.taskWorkspaces.get(task.id);
       const signal=AbortSignal.any([control.controller.signal,control.taskControllers.get(task.id).signal]);signal.throwIfAborted();
-      if(lease){const integrated=await this.workspaces.publish(lease,signal);task.workspace.commit=integrated.commit;this.event(run,'workspace.integrated',{taskId:task.id,...integrated});}
-      delete task.error;delete task.failure;delete task.blockedReason;delete task.blockedRouteId;
-      task.status='completed';this.event(run,'task.completed',{taskId:task.id});
-    }finally{control.taskWorkspaces.delete(task.id);}
+      if(lease&&task.id===storefrontAcceptanceId){
+        let report=task.outputs.findLast(o=>o.report)?.report;
+        let evidence=await verifyStorefrontEvidence(report,lease.cwd);
+        if(!evidence&&!retriedStorefront&&run.calls<run.project.limits.maxCalls){
+          retriedStorefront=true;
+          this.event(run,'task.storefront_evidence_retry',{taskId:task.id,message:'Оркестратор перевіряє відсутні браузерні докази у збереженій чернетці.'});
+          await this.workInWorkspace(run,task,{continuedDraft:true,storefrontEvidenceRetry:true});
+          signal.throwIfAborted();
+          report=task.outputs.findLast(o=>o.report)?.report;
+          evidence=await verifyStorefrontEvidence(report,lease.cwd);
+        }
+        if(!evidence)throw Object.assign(
+          Error('Бракує браузерного тесту або двох знімків вітрини. Чернетку збережено.'),
+          {code:'AGENT_BLOCKED',report});
+      }
+      if(lease){
+        let integrated;
+        try{integrated=await this.workspaces.publish(lease,signal);}catch(error){
+          if(error.candidateCommit)task.workspace.candidateCommit=error.candidateCommit;
+          if(error.code==='WORKSPACE_CHECK_FAILED')error.report=task.outputs.findLast(o=>o.report?.status==='completed')?.report;
+          const team=selectAgents(run.project,task),needed=team.length+(task.reviewerId?1:0);
+          if(error.code==='WORKSPACE_CONFLICT'&&integrationAttempt<this.maxIntegrationRetries&&team.length===1&&
+            run.calls+needed<=run.project.limits.maxCalls){
+            signal.throwIfAborted();
+            task.history??=[];task.history.push({reason:'integration-conflict',at:new Date().toISOString(),workspace:structuredClone(task.workspace),outputs:structuredClone(task.outputs),result:task.result,review:task.review});
+            const next=await this.workspaces.resolveDraft(run,task.workspace,task.id);signal.throwIfAborted();next.files=lease.files;
+            control.taskWorkspaces.set(task.id,next);
+            task.workspace={path:next.cwd,branch:next.branch,baseCommit:next.baseCommit,conflicts:next.conflicts};
+            task.integrationContext={conflicts:next.conflicts??[],instructions:'Resolve integration conflicts in this combined worktree. Preserve accepted work and this task result. Do not remove other tasks’ files or documentation merely because they were absent from the original draft. Re-run the required checks on the combined result. Git integration remains managed by the orchestrator.'};
+            this.event(run,'workspace.resolving',{taskId:task.id,conflicts:next.conflicts??[],message:'Виконавець узгоджує конфлікт змін в окремій робочій папці; результати збережені, перевірки будуть повторені'});
+            continue;
+          }
+          throw error;
+        }
+        if(run.status==='cancelled'||task.status==='cancelled')return;
+        task.workspace.commit=integrated.commit;this.event(run,'workspace.integrated',{taskId:task.id,...integrated});
+      }
+      for(const field of ['error','failure','blockedReport','blockedReason','blockedRouteId','integrationContext','recoveryContext','hostVerificationProgress','verificationBlockers'])delete task[field];
+      task.status='completed';this.event(run,'task.completed',{taskId:task.id});return;
+    }}finally{control.taskWorkspaces.delete(task.id);}
   }
-  async workInWorkspace(run, task) {
+  async workInWorkspace(run, task, {continuedDraft=false,storefrontEvidenceRetry=false}={}) {
     const team = selectAgents(run.project, task);
     task.assignedAgentIds = team.map(a => a.id);
-    const dependencies = run.tasks.filter(t => task.dependsOn.includes(t.id)).map(t => ({ title: t.title, result: t.result }));
+    const isolated=run.project.workspaceMode==='isolated';
+    const dependencies = run.tasks.filter(t => task.dependsOn.includes(t.id)).map(t=>dependencyHandoff(t,isolated));
     const children = run.tasks.filter(t => t.parentId === task.id);
-    const prompt = `Project: ${run.project.name}\nGoal: ${run.project.goal ?? ''}\nTask: ${task.title}\n${task.prompt}\nAcceptance criteria:\n${JSON.stringify(task.acceptanceCriteria ?? [])}\nDependency results:\n${JSON.stringify(dependencies)}\n${task.review ? `Previous review feedback: ${JSON.stringify(task.review)}\n` : ''}`;
+    const prompt = `Project: ${run.project.name}\nGoal: ${run.project.goal ?? ''}\nTask: ${task.title}\n${task.prompt}\nAcceptance criteria:\n${JSON.stringify(task.acceptanceCriteria ?? [])}\nDependency results:\n${JSON.stringify(dependencies)}\n${continuedDraft?'This worktree contains a saved draft from an earlier attempt. Inspect the existing changes, build on them, and rerun the required checks.\n':''}${storefrontEvidenceRetry?'Оркестратор не отримав успішного обов’язкового браузерного тесту та двох придатних знімків. Виправ тільки відсутні докази у поточній робочій папці.\n':''}${task.review ? `Previous review feedback: ${JSON.stringify(task.review)}\n` : ''}${task.integrationContext?'Integration reconciliation:\n'+JSON.stringify(task.integrationContext)+'\n':''}`;
     if (children.length) {
-      const output = await this.invoke(run, task, team[0], `${prompt}\nCombine child results into a final answer:\n${JSON.stringify(children.map(t => ({ title: t.title, result: t.result })))}`);
+      const output = await this.invoke(run, task, team[0], `${prompt}\nCombine child results into a final answer:\n${JSON.stringify(children.map(t=>dependencyHandoff(t,isolated)))}`,{canDelegate:false});
       task.result = output.text;
     } else {
-      const canDelegate = task.allowDelegation === true && team.length === 1 && task.depth < run.project.limits.maxDepth;
+      const canDelegate = !task.integrationContext&&task.allowDelegation === true && team.length === 1 && task.depth < run.project.limits.maxDepth;
       const delegation = canDelegate ? '\nIf splitting is needed, request subtasks with title,prompt,skills and optional agentIds. Available agents: '+JSON.stringify(run.project.agents.map(a=>({id:a.id,model:a.model,skills:a.skills}))) : '';
       let outputs = [];
       if (task.mode === 'pipeline') {
-        for (const agent of team) outputs.push(await this.invoke(run, task, agent, `${prompt}${delegation}\nPrevious team results:\n${JSON.stringify(outputs)}`));
+        for (const agent of team) outputs.push(await this.invoke(run, task, agent, outputs.length
+          ? `${prompt}${delegation}\nPrevious team results:\n${JSON.stringify(isolated?outputs.map(workerHandoff):outputs)}`
+          : prompt+delegation,{canDelegate}));
       } else {
-        const results = await Promise.allSettled(team.map(agent => this.invoke(run, task, agent, prompt + delegation,{fork:team.length>1})));
+        const control=this.controls.get(run.id);
+        const batchController=new AbortController();
+        const taskSignal=AbortSignal.any([control.controller.signal,control.taskControllers.get(task.id).signal]);
+        const results = await Promise.allSettled(team.map(agent => this.invoke(run, task, agent, prompt + delegation,{fork:team.length>1,canDelegate,signal:batchController.signal}).catch(err=>{batchController.abort(err);throw err;})));
         const failure = results.find(r => r.status === 'rejected');
         if (failure) throw failure.reason;
         outputs = results.map(r => r.value);
+        const parentLease=control.taskWorkspaces.get(task.id);
+        for(const out of outputs){
+          if(out._forkLease){
+            const integrated=await this.workspaces.publish(out._forkLease,taskSignal);
+            if(parentLease&&integrated.commit)parentLease.baseCommit=integrated.commit;
+            if(task.workspace&&integrated.commit)task.workspace.baseCommit=integrated.commit;
+            this.event(run,'workspace.agent_integrated',{taskId:task.id,agentId:out.agentId,...integrated});
+          }
+        }
       }
       if (canDelegate) {
         let parsed;
-        try { parsed = JSON.parse(outputs[0].text.replace(/^```(?:json)?\s*|\s*```$/g, '')); } catch { /* ordinary answer */ }
+        try { parsed = JSON.parse(outputs[0].text.trim().replace(/^```(?:json)?\s*|\s*```$/g, '')); } catch { /* ordinary answer */ }
         const requests=outputs[0].delegation??parsed?.subtasks;
         if (requests?.length) {
           const lease=this.controls.get(run.id).taskWorkspaces.get(task.id);
@@ -218,8 +557,9 @@ export class Engine {
     if (task.reviewerId) {
       const reviewer = run.project.agents.find(a => a.id === task.reviewerId && a.enabled !== false);
       assert(reviewer, 'Reviewer unavailable');
-      const review = await this.invoke(run, task, reviewer, `${prompt}\nReview the candidate result. Return ONLY JSON {"approved":true|false,"feedback":"..."}.\nCandidate:\n${task.result}`);
-      const verdict = JSON.parse(review.text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+      const reviewAgent = reviewer.executionReport ? { ...reviewer, executionReport: false, outputSchema: undefined } : reviewer;
+      const review = await this.invoke(run, task, reviewAgent, `${prompt}\nReview the candidate result. Return ONLY JSON {"approved":true|false,"feedback":"..."}.\nCandidate:\n${task.result}`,{canDelegate:false});
+      const verdict = JSON.parse(review.text.trim().replace(/^```(?:json)?\s*|\s*```$/g, ''));
       task.review = verdict;
       assert(verdict.approved === true, `Review rejected: ${verdict.feedback ?? ''}`);
     }
@@ -242,14 +582,9 @@ export class Engine {
       task.history??=[];task.history.push({round,at:new Date().toISOString(),status:task.status,error:task.error,failure:task.failure,workspace:task.workspace,outputs:task.outputs,agentIds:task.agentIds,attempts:task.attempts});
       task.recoveryContext={round,previousFailure:task.failure,reason:assignment.reason};
       task.agentIds=assignment.agentIds;task.status='pending';task.recoveryAttempts=(task.recoveryAttempts??0)+1;task.attempts=0;task.outputs=[];
-      for(const key of ['error','failure','blockedReason','blockedRouteId','workspace','result','review','assignedAgentIds'])delete task[key];reset.add(task.id);
+      for(const key of ['error','failure','blockedReport','blockedReason','blockedRouteId','workspace','result','review','assignedAgentIds','hostVerificationProgress','verificationBlockers','integrationContext'])delete task[key];reset.add(task.id);
     }
-    let changed;do{changed=false;for(const task of next){
-      if(task.status!=='blocked'||task.error||task.failure)continue;
-      const children=next.filter(t=>t.parentId===task.id),deps=task.dependsOn.map(id=>next.find(t=>t.id===id));
-      if(children.some(t=>reset.has(t.id))&&children.every(t=>t.status==='completed'||reset.has(t.id))){task.status='waiting_children';reset.add(task.id);changed=true;}
-      else if(deps.some(t=>reset.has(t.id))&&deps.every(t=>t.status==='completed'||reset.has(t.id))){task.status='pending';reset.add(task.id);changed=true;}
-    }}while(changed);
+    unblockTasks(next,reset);
     validateProject({...run.project,agents:allAgents,tasks:next});
     run.project.agents=allAgents;run.tasks=next;delete run.files;delete run.finishedAt;
     this.event(run,'recovery.applied',{round,taskIds:assignments.map(a=>a.taskId),resetTaskIds:[...reset],message:'Нові призначення застосовано; готові результати збережені'});return [...reset];
@@ -277,27 +612,47 @@ export class Engine {
         if (run.status === 'cancelled' || task.status === 'cancelled') return;
         task.error = error.message;
         task.failure={code:error.code??'AGENT_FAILED',decisionCode:error.decisionCode,routeId:error.routeId,agentId:error.agentId,message:error.message};
-        task.status = ['WORKSPACE_CONFLICT','WORKER_BLOCKED','CHECKS_BLOCKED','MODEL_ACCESS_BLOCKED'].includes(error.code)?'blocked':task.attempts <= task.retries ? 'pending' : 'failed';
+        if(error.report)task.blockedReport=error.report;
+        task.status = ['AGENT_BLOCKED','WORKSPACE_CONFLICT','WORKER_BLOCKED','CHECKS_BLOCKED','MODEL_ACCESS_BLOCKED','RUN_CALL_BUDGET'].includes(error.code)?'blocked':task.attempts <= task.retries ? 'pending' : 'failed';
         if(error.decisionCode)task.blockedReason=error.decisionCode;
         if(error.routeId)task.blockedRouteId=error.routeId;
-        this.event(run, task.status === 'pending' ? 'task.retrying' : 'task.failed', { taskId: task.id, message: error.message });
-      }).finally(() => { control.active.delete(task.id); control.taskControllers.delete(task.id); this.pump(run);if(terminal.has(run.status)&&!control.active.size)this.event(run,'run.drained'); });
+        this.event(run, error.code==='AGENT_BLOCKED'?'task.blocked':task.status === 'pending' ? 'task.retrying' : 'task.failed', { taskId: task.id, message: error.message });
+      }).finally(() => {
+        control.active.delete(task.id); control.taskControllers.delete(task.id);
+        try { this.pump(run); if (terminal.has(run.status) && !control.active.size) this.event(run, 'run.drained'); }
+        catch (err) { console.error('Engine pump/drain error:', err.message); }
+      });
       control.active.set(task.id, work);
     }
-    // Propagate blocked dependencies regardless of ordering in the input list.
+    // Propagate blocked dependencies and failed child hierarchies regardless of ordering in the task list.
     let changed;
     do {
       changed = false;
-      for (const t of run.tasks) if (t.status === 'pending' && t.dependsOn.some(key => ['failed', 'blocked', 'cancelled'].includes(run.tasks.find(d => d.id === key)?.status))) {
-        t.status = 'blocked'; changed = true;
+      for (const t of run.tasks) {
+        if (t.status === 'pending' && t.dependsOn.some(key => ['failed', 'blocked', 'cancelled'].includes(run.tasks.find(d => d.id === key)?.status))) {
+          t.status = 'blocked'; changed = true;
+        } else if (t.status === 'waiting_children') {
+          const children = run.tasks.filter(c => c.parentId === t.id);
+          if (children.some(c => ['failed', 'blocked', 'cancelled'].includes(c.status))) { t.status = 'blocked'; changed = true; }
+        }
       }
     } while (changed);
     if (!control.active.size && run.tasks.every(t => terminal.has(t.status))) {
+      if(run.tasks.some(task=>needsClarification(task)||workspaceNeedsResolution(task)||waitsForVerification(task))){
+        run.status='blocked';run.finishedAt=new Date().toISOString();
+        this.event(run,'run.blocked',{taskIds:run.tasks.filter(canReply).map(t=>t.id),message:run.tasks.some(waitsForVerification)
+          ?'Обов’язкові перевірки чекають на доступне середовище. Чернетки збережені.'
+          :'Потрібне уточнення або узгодження змін. Підготовлені матеріали збережено; заміна моделі не потрібна.'});return;
+      }
       if(!run.tasks.every(t=>t.status==='completed')&&this.recover&&(run.project.recovery?.enabled===true||control.manualRecovery)&&!control.recoveryStopped){
         control.recovering=true;control.manualRecovery=false;let applied=false;
         control.recoveryWork=Promise.resolve().then(()=>this.recover(run)).then(value=>{applied=value===true;}).catch(error=>{
           if(run.status!=='cancelled')this.event(run,'recovery.failed',{message:error.message});
-        }).finally(()=>{control.recovering=false;if(!applied)control.recoveryStopped=true;this.pump(run);if(terminal.has(run.status)&&!control.active.size)this.event(run,'run.drained');});
+        }).finally(()=>{
+          control.recovering=false;if(!applied)control.recoveryStopped=true;
+          try { this.pump(run); if(terminal.has(run.status)&&!control.active.size)this.event(run,'run.drained'); }
+          catch (err) { console.error('Engine recovery pump error:', err.message); }
+        });
         return;
       }
       run.status = run.tasks.every(t => t.status === 'completed') ? 'completed' : 'failed';

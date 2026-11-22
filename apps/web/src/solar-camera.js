@@ -3,6 +3,8 @@
  * Keeps look-at locked to a moving planet/moon without orbital velocity drift.
  */
 
+export const SUN_RADIUS = 21;
+
 export const DEFAULT_OVERVIEW_CAMERA = Object.freeze({
   yaw: 0.56,
   pitch: 0.42,
@@ -38,7 +40,7 @@ export function computeTargetBounds(targetInfo) {
     return {
       minDistance,
       maxDistance: 780,
-      focusDistance: 105,
+      focusDistance: radius * 6.4,
       nearPlane: 1.2
     };
   }
@@ -48,13 +50,13 @@ export function computeTargetBounds(targetInfo) {
     return {
       minDistance,
       maxDistance: 240,
-      focusDistance: Math.max(minDistance * 1.45, radius * 5.6),
+      focusDistance: Math.max(minDistance * 1.65, radius * 6.2),
       nearPlane: 0.45
     };
   }
 
   const minDistance = Math.max(16, radius * 2.15, envelope * 1.18);
-  const focusDistance = Math.max(minDistance * 1.35, radius * (targetInfo.hasRing ? 5.2 : 4.2));
+  const focusDistance = Math.max(minDistance * 1.5, radius * (targetInfo.hasRing ? 6.2 : 5.4));
   return {
     minDistance,
     maxDistance: 560,
@@ -119,7 +121,7 @@ export function reconcileTargetWithModel(selected, focusRef, model) {
 /**
  * Finds the current world-space coordinates and bounding info for the focused target.
  */
-export function resolveTargetPositionAndBounds(focusRef, planetPositions, sunRadius = 17) {
+export function resolveTargetPositionAndBounds(focusRef, planetPositions, sunRadius = SUN_RADIUS) {
   if (focusRef?.kind === 'planet') {
     const ps = planetPositions.find(p => p.planet.id === focusRef.id);
     if (ps) {

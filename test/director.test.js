@@ -2,6 +2,25 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDirector,routingCandidates,validateRouteAssignments,planFingerprint } from '../scripts/director-service.js';
 import { routeDecision } from '../src/model-policy.js';
+import {readFile} from 'node:fs/promises';
+import {balanceWorkerCandidates} from '../scripts/worker-routing.js';
+
+test('balanced routing splits compatible work across Codex and Gemini and preserves tool requirements',()=>{
+  const tasks=[
+    {id:'a',title:'Write Markdown docs',dependsOn:[]},
+    {id:'b',title:'Prepare frontend component',dependsOn:[]},
+    {id:'c',title:'Run database integration tests',dependsOn:['a']},
+    {id:'d',title:'Додати політики, SEO та аналітику воронки',skills:['frontend'],dependsOn:['b']}
+  ];
+  const codex={id:'codex:fixture',backend:'codex',capabilities:{tools:true}},gemini={id:'antigravity:gemini-fixture',backend:'antigravity',model:'gemini-fixture'};
+  const choices=new Map(tasks.map(({id})=>[id,[codex,gemini]]));
+  const result=balanceWorkerCandidates(tasks,choices,{c:{tools:true}},{priority:'balanced',maxAgentsPerTask:1});
+  assert.deepEqual(result.get('a'),[gemini]);
+  assert.deepEqual(result.get('b'),[codex]);
+  assert.deepEqual(result.get('c'),[codex]);
+  assert.deepEqual(result.get('d'),[codex]);
+  assert.equal(balanceWorkerCandidates(tasks,choices,{}, {priority:'quality',maxAgentsPerTask:1}),choices);
+});
 
 const plan=()=>({summary:'Test project',assumptions:[],risks:[],tasks:[{id:'a',title:'Concept',prompt:'Describe the concept',skills:['planning'],dependsOn:[],acceptanceCriteria:['Clear scope']},
   {id:'b',title:'Review',prompt:'Review the concept',skills:['review'],dependsOn:['a'],acceptanceCriteria:['Risks checked']}]});
@@ -72,4 +91,61 @@ test('worker billing requirements keep subscription directors separate from excl
   const filtered=routingCandidates(plan(),f.routes,{a:{billing:'free_tier',excludeRouteIds:['opencode:opencode/a']}});
   assert.deepEqual(filtered.get('a').map(r=>r.id),['opencode:opencode/b']);
   for(const excludeRouteIds of ['bad',[null],['duplicate','duplicate']])assert.throws(()=>routingCandidates(plan(),f.routes,{a:{excludeRouteIds}}),/Некоректні/);
+});
+
+test('UI routing repairs a wrong model ID once using the current task candidates and records both calls',async()=>{
+  let calls=0,reserved=0;const results=[];
+  const f=fixture(async(agent,ctx)=>{
+    calls++;
+    if(calls===1){const bad=selection();bad.assignments[0].routeIds=['Codex CLI'];return{text:JSON.stringify(bad),usage:{input_tokens:10}};}
+    assert.match(ctx.prompt,/RoutingRepairDiagnostics/);assert.match(ctx.prompt,/Codex CLI/);
+    return{text:JSON.stringify(selection()),usage:{input_tokens:7}};
+  });
+  const result=await f.director.propose({plan:plan(),maxAgentsPerTask:2,repairInvalid:true},AbortSignal.timeout(3000),{onInvoke:()=>{reserved++;},onResult:r=>results.push(r)});
+  assert.equal(calls,2);assert.equal(reserved,2);assert.equal(results.length,2);assert.equal(result.provenance.repairCount,1);
+  assert.deepEqual(result.provenance.attempts.map(a=>a.usage.input_tokens),[10,7]);assert.equal(result.assignments[0].routeIds[0],'opencode:opencode/a');
+});
+
+test('UI routing reselects after a tariff change without weakening the original free-only requirement',async()=>{
+  let calls=0;
+  const f=fixture(async(agent,ctx)=>{
+    calls++;
+    if(calls===1){Object.assign(f.routes[0],{billing:'subscription_included',subscriptionConfirmed:true,includedAccessConfirmed:true});return{text:JSON.stringify(selection())};}
+    const brief=JSON.parse(ctx.prompt.split('TaskBrief: ')[1]);assert.ok(brief.tasks.every(t=>t.candidateRouteIds.length===1&&t.candidateRouteIds[0]==='opencode:opencode/b'));
+    return{text:JSON.stringify({assignments:brief.tasks.map(t=>({taskId:t.id,routeIds:['opencode:opencode/b'],reason:'A permitted free replacement'}))})};
+  });
+  const result=await f.director.propose({plan:plan(),maxAgentsPerTask:2,repairInvalid:true,requirements:{a:{billing:'free_tier'},b:{billing:'free_tier'}}});
+  assert.equal(calls,2);assert.ok(result.routes.every(r=>r.billing==='free_tier'));assert.equal(result.provenance.repairCount,1);
+});
+
+test('UI routing repair is bounded and never accepts repeated invented IDs',async()=>{
+  let calls=0;const f=fixture(async()=>{calls++;const value=selection();value.assignments[0].routeIds=['paid:excluded'];return{text:JSON.stringify(value)};});
+  await assert.rejects(f.director.propose({plan:plan(),maxAgentsPerTask:2,repairInvalid:true}),error=>error.code==='ROUTING_INVALID_RESPONSE'&&error.details.taskId==='a');
+  assert.equal(calls,2);
+});
+
+test('Codex routing uses a strict schema containing exact permitted route IDs and task IDs',async()=>{
+  const f=fixture(async agent=>{
+    const schema=JSON.parse(await readFile(agent.outputSchema,'utf8')),item=schema.properties.assignments.items;
+    assert.deepEqual(item.properties.taskId.enum,['a','b']);assert.ok(item.properties.routeIds.items.enum.includes('opencode:opencode/a'));
+    assert.ok(!item.properties.routeIds.items.enum.includes('paid:excluded'));assert.equal(item.properties.routeIds.maxItems,2);
+    return{text:JSON.stringify(selection())};
+  });
+  f.routes.unshift(route('codex:manager',{backend:'codex',model:'manager',capabilities:{structuredOutput:true}}));
+  await f.director.propose({plan:plan(),maxAgentsPerTask:2,managerRouteId:'codex:manager'});
+});
+
+test('an automatic director can be reselected when its quota is exhausted; a manual pin stays blocked',async()=>{
+  let calls=0,reserved=0;
+  const f=fixture(async(agent,ctx)=>{
+    calls++;assert.notEqual(agent.model,'exhausted');
+    if(ctx.prompt.includes('PlannerSelectionBrief:'))return{text:JSON.stringify({routeId:'opencode:opencode/b',reason:'Available project planner after quota exhaustion'}),usage:{input_tokens:3}};
+    assert.equal(agent.model,'opencode/b');return{text:JSON.stringify(selection()),usage:{input_tokens:4}};
+  });
+  f.routes.unshift(route('codex:exhausted',{backend:'codex',model:'exhausted',availability:'quota_exhausted'}));
+  const input={plan:plan(),managerRouteId:'codex:exhausted',maxAgentsPerTask:2};
+  await assert.rejects(f.director.propose(input),/Обраний маршрут/);assert.equal(calls,0);
+  const result=await f.director.propose({...input,allowManagerFallback:true},undefined,{onInvoke:()=>{reserved++;}});
+  assert.equal(calls,2);assert.equal(reserved,2);assert.equal(result.managerRouteId,'opencode:opencode/b');
+  assert.equal(result.provenance.selection.replacedRouteId,'codex:exhausted');assert.equal(result.provenance.attempts.length,2);
 });

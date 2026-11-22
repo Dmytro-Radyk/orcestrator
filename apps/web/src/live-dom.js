@@ -55,12 +55,12 @@ export function patchLiveDom(root, html) {
     const isDetails = current.tagName === 'DETAILS';
 
     for (const attribute of [...current.attributes]) {
-      if (preserveControl && ['value', 'checked'].includes(attribute.name)) continue;
+      if (preserveControl && ['value', 'checked', 'data-user-edited'].includes(attribute.name)) continue;
       if (isDetails && attribute.name === 'open') continue;
       if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
     }
     for (const attribute of next.attributes) {
-      if (preserveControl && ['value', 'checked'].includes(attribute.name)) continue;
+      if (preserveControl && ['value', 'checked', 'data-user-edited'].includes(attribute.name)) continue;
       if (isDetails && attribute.name === 'open') continue;
       if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
     }

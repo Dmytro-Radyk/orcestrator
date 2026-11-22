@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+const unsafeKeys = new Set(['__proto__', 'constructor', 'prototype']);
+export const safeKey = value => typeof value === 'string' && value.length > 0 && !unsafeKeys.has(value);
 export const id = () => randomUUID();
 export function assert(value, message) {
   if (!value) throw new Error(message);
@@ -9,6 +11,7 @@ export function integer(value, min, max, label) {
 }
 export function validateProject(project) {
   assert(typeof project.name === 'string' && project.name.trim(), 'Project name is required');
+  if(project.executionBrief!==undefined)assert(typeof project.executionBrief==='string'&&project.executionBrief.length<=12000,'Invalid execution clarification');
   assert(Array.isArray(project.agents) && project.agents.length, 'At least one agent is required');
   assert(Array.isArray(project.tasks) && project.tasks.length, 'At least one task is required');
   if(project.workspaceMode!==undefined)assert(['shared','isolated'].includes(project.workspaceMode),'Invalid workspace mode');
@@ -22,12 +25,12 @@ export function validateProject(project) {
   integer(project.limits.maxCalls, 1, 10000, 'maxCalls');
   integer(project.limits.maxDepth, 0, 8, 'maxDepth');
   integer(project.limits.maxTasks, 1, 1000, 'maxTasks');
-  integer(project.limits.timeoutMs, 10, 3600000, 'timeoutMs');
+  if(project.limits.timeoutMs!==null)integer(project.limits.timeoutMs, 10, 3600000, 'timeoutMs');
   integer(project.limits.maxOutputTokens, 16, 100000, 'maxOutputTokens');
   assert(project.tasks.length <= project.limits.maxTasks, 'Task limit exceeded');
   const agents = new Set();
   for (const a of project.agents) {
-    assert(typeof a.id === 'string' && a.id && !agents.has(a.id), 'Agent IDs must be unique');
+    assert(safeKey(a.id) && !agents.has(a.id), 'Agent IDs must be unique');
     agents.add(a.id);
     assert(Array.isArray(a.skills) && a.skills.every(s => typeof s === 'string'), `Invalid skills: ${a.id}`);
     assert(['demo', 'responses', 'chat', 'codex', 'claude', 'cli','opencode','antigravity'].includes(a.provider), `Unknown provider: ${a.provider}`);
@@ -42,10 +45,12 @@ export function validateProject(project) {
     }
     assert(!a.apiKey, 'Use apiKeyEnv instead of storing API keys');
     if (a.access) assert(['read-only', 'workspace-write'].includes(a.access), 'Invalid agent access');
+    if (a.reasoningEffort !== undefined) assert(typeof a.reasoningEffort === 'string' && a.reasoningEffort.length <= 40, 'Invalid reasoning effort');
+    if (a.windowsSandbox !== undefined) assert(['elevated', 'unelevated'].includes(a.windowsSandbox), 'Invalid Windows sandbox mode');
   }
   const tasks = new Map();
   for (const t of project.tasks) {
-    assert(typeof t.id === 'string' && t.id && !tasks.has(t.id), 'Task IDs must be unique');
+    assert(safeKey(t.id) && !tasks.has(t.id), 'Task IDs must be unique');
     tasks.set(t.id, t);
     assert(typeof t.title === 'string' && t.title.trim(), 'Task title is required');
     assert(typeof t.prompt === 'string' && t.prompt.trim(), 'Task prompt is required');
@@ -77,7 +82,7 @@ export function makeProject(input, previous) {
   const project = {
     ...input,
     id: previous?.id ?? id(), revision: (previous?.revision ?? 0) + 1,
-    limits: { concurrency: 4, maxCalls: 50, maxDepth: 2, maxTasks: 100, timeoutMs: 120000, maxOutputTokens: 4096, ...input.limits },
+    limits: { concurrency: 4, maxCalls: 50, maxDepth: 2, maxTasks: 100, timeoutMs: null, maxOutputTokens: 4096, ...input.limits },
     tasks: (input.tasks ?? []).map(taskDefaults),
     updatedAt: new Date().toISOString()
   };

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execute, runProcess } from '../src/providers.js';
@@ -83,7 +83,10 @@ test('Codex execution reports reject blocked work and checks that did not pass',
   });`);
   const agent={provider:'codex',command:process.execPath,executionReport:true};
   for(const status of ['blocked','failed']) {
-    await assert.rejects(execute(agent,{...context(),cwd,prompt:JSON.stringify({status,summary:'Work was not done',files:[],checks:[]})}),new RegExp(status));
+    await assert.rejects(execute(agent,{...context(),cwd,prompt:JSON.stringify({status,summary:'Work was not done',files:[],checks:[]})}),error=>{
+      assert.match(error.message,new RegExp(status));assert.equal(error.report.status,status);
+      assert.equal(error.code,status==='blocked'?'AGENT_BLOCKED':'WORKER_FAILED');assert.equal(error.usage.output_tokens,3);return true;
+    });
   }
   await assert.rejects(execute(agent,{...context(),cwd,prompt:JSON.stringify({status:'completed',summary:'No tests',files:[],checks:[{command:'node --test',status:'not_run',details:'permission denied'}]})}),/blocked/);
   const progress=[];
@@ -94,4 +97,51 @@ test('Codex execution reports reject blocked work and checks that did not pass',
     {command:'node --test',status:'passed',required:true,details:'passed'},
     {command:'git status',status:'failed',required:false,details:'not a Git workspace'}]})});
   assert.equal(diagnostic.report.status,'completed');
+  const negative=await execute(agent,{...context(),cwd,prompt:JSON.stringify({status:'completed',summary:'Ready for development; commerce remains off',files:[],checks:[
+    {command:'node check-ready.mjs --require-ready',status:'failed',required:true,details:'Expected refusal while stock is empty',kind:'exit_code',expectedExitCode:1,actualExitCode:1}]})});
+  assert.equal(negative.report.checks[0].status,'passed');
+  await assert.rejects(execute(agent,{...context(),cwd,prompt:JSON.stringify({status:'completed',summary:'Model claimed success',files:[],checks:[
+    {command:'node broken-test.mjs',status:'passed',required:true,details:'Unexpected failure',kind:'exit_code',expectedExitCode:0,actualExitCode:1}]})}),error=>{
+      assert.equal(error.code,'WORKER_FAILED');assert.match(error.message,/node broken-test.mjs/);return true;
+    });
+});
+
+test('Codex execution schema requires every property, including nested subagent assignments',async()=>{
+  const schema=JSON.parse(await readFile(new URL('../scripts/schemas/execution.json',import.meta.url),'utf8'));
+  function strict(node){
+    if(node.type==='object'){
+      assert.equal(node.additionalProperties,false);
+      assert.deepEqual([...node.required].sort(),Object.keys(node.properties).sort());
+      Object.values(node.properties).forEach(strict);
+    }
+    if(node.items)strict(node.items);
+  }
+  strict(schema);assert.ok(schema.required.includes('subtasks'));
+});
+
+test('Codex nonzero exit exposes the final structured failure without leaking stdout or credentials',async t=>{
+  const cwd=await mkdtemp(join(tmpdir(),'orcestrator-error-'));t.after(()=>rm(cwd,{recursive:true,force:true}));
+  await writeFile(join(cwd,'exec'),`process.stdin.resume();process.stdin.on('end',()=>{
+    for(const event of [
+      {type:'item.completed',item:{type:'agent_message',text:'Private response must not become an error'}},
+      {type:'error',message:'Retrying connection'},
+      {type:'turn.failed',error:{message:JSON.stringify({error:{code:'invalid_json_schema',message:'Invalid schema: missing subtasks. api_key=fixture-secret Bearer fixture-bearer'}})}}
+    ])process.stdout.write(JSON.stringify(event)+'\\n');
+    process.exitCode=1;
+  });`);
+  await assert.rejects(execute({provider:'codex',command:process.execPath},{...context(),cwd}),error=>{
+    assert.match(error.message,/Invalid schema: missing subtasks/);
+    assert.doesNotMatch(error.message,/Private response|fixture-secret|fixture-bearer|Retrying/);
+    assert.equal(error.exitCode,1);assert.equal(error.code,'EXECUTION_SCHEMA_INVALID');assert.equal(error.stdout,undefined);return true;
+  });
+});
+
+test('Codex usage exhaustion is an access block eligible for a fresh entitlement check',async t=>{
+  const cwd=await mkdtemp(join(tmpdir(),'orcestrator-quota-'));t.after(()=>rm(cwd,{recursive:true,force:true}));
+  await writeFile(join(cwd,'exec'),`process.stdin.resume();process.stdin.on('end',()=>{
+    console.log(JSON.stringify({type:'turn.failed',error:{message:'You’ve hit your usage limit. Visit billing to purchase credits.'}}));
+    process.exitCode=1;
+  });`);
+  await assert.rejects(execute({provider:'codex',command:process.execPath},{...context(),cwd}),error=>
+    error.code==='MODEL_ACCESS_BLOCKED'&&error.decisionCode==='quota_exhausted'&&!error.message.includes('purchase'));
 });

@@ -1,14 +1,14 @@
 {
   "type":"object", "additionalProperties":false,
-  "required":["status","summary","files","checks"],
+  "required":["status","summary","files","checks","subtasks"],
   "properties":{
     "status":{"type":"string","enum":["completed","blocked","failed","delegated"]},
-    "subtasks":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["title","prompt","skills"],"properties":{"title":{"type":"string"},"prompt":{"type":"string"},"skills":{"type":"array","items":{"type":"string"}},"agentIds":{"type":"array","items":{"type":"string"}}}}},
+    "subtasks":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["title","prompt","skills","agentIds"],"properties":{"title":{"type":"string"},"prompt":{"type":"string"},"skills":{"type":"array","items":{"type":"string"}},"agentIds":{"type":"array","items":{"type":"string"}}}}},
     "summary":{"type":"string"},
     "files":{"type":"array","items":{"type":"string"}},
     "checks":{"type":"array","items":{"type":"object","additionalProperties":false,
-      "required":["command","status","required","details"],
-      "properties":{"command":{"type":"string"},"status":{"type":"string","enum":["passed","failed","not_run"]},"required":{"type":"boolean"},"details":{"type":"string"}}
+      "required":["command","status","required","details","kind","expectedExitCode","actualExitCode"],
+      "properties":{"command":{"type":"string"},"status":{"type":"string","enum":["passed","failed","not_run"]},"required":{"type":"boolean"},"details":{"type":"string"},"kind":{"type":"string","enum":["assertion","exit_code"]},"expectedExitCode":{"type":["integer","null"]},"actualExitCode":{"type":["integer","null"]}}
     }}
   }
 }

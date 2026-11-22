@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "routeId": { "type": "string" },
+    "reason": { "type": "string" }
+  },
+  "required": ["routeId", "reason"],
+  "additionalProperties": false
+}

@@ -1,11 +1,3 @@
-const billingLabels = {
-  free_tier: 'Безкоштовний маршрут',
-  subscription_included: 'Підписка',
-  metered: 'Оплата за фактом',
-  unknown: 'Тариф не підтверджено',
-  local: 'Локально'
-};
-
 export function formatBillingBadge(billing, billingBoundary) {
   if (billing === 'subscription_included') {
     return {
@@ -243,7 +235,7 @@ export function renderRoutingSection(project, routingEntry, catalog, { h, icon, 
             <span class="badge ${stale ? 'pending' : 'done'}"><i></i>${stale ? 'Застаріла пропозиція' : 'Актуальна пропозиція · v' + proposal.revision}</span>
             <span>Директор: <strong>${h(proposal.provenance?.model ?? proposal.provenance?.routeId)}</strong> (${h(proposal.provenance?.provider ?? 'ai')})</span>
             <span>Час: ${h(new Date(proposal.provenance?.at ?? Date.now()).toLocaleString('uk-UA'))}</span>
-            ${proposal.provenance?.usage ? `<span>Токени: ${proposal.provenance.usage.input_tokens ?? 0} → ${proposal.provenance.usage.output_tokens ?? 0}</span>` : ''}
+            ${proposal.provenance?.usage ? `<span>Токени: ${Number(proposal.provenance.usage.input_tokens) || 0} → ${Number(proposal.provenance.usage.output_tokens) || 0}</span>` : ''}
           </div>
 
           <div class="routing-assignment-grid">

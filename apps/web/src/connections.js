@@ -1,13 +1,5 @@
 import { catalogManager, formatBillingBadge } from './routing-ui.js';
 
-const billingNames = {
-  free_tier: 'Безкоштовно',
-  subscription_included: 'Включено у підписку',
-  metered: 'Оплата за використання',
-  unknown: 'Тариф не підтверджено',
-  local: 'Локальне виконання'
-};
-
 const authNames = {
   anonymous: 'Анонімний доступ (без входу)',
   google: 'Вхід через Google · квота підписки',

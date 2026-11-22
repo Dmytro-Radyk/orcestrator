@@ -66,6 +66,7 @@ test('headless execution pins the model, disables credits/tools and only accepts
   const home=await folder(t),agent={command:'agy',model:'gemini-4-hydrogen-high',access:'read-only'},context={prompt:'/do not expand a skill',signal:AbortSignal.timeout(5000)};
   const execute=events=>executeAntigravity(agent,context,{home,run:async(_cmd,args,o)=>{
     const settings=JSON.parse(args[args.indexOf('--settings')+1]);assert.equal(settings.useG1Credits,false);assert.equal(settings.modelProvider,'');
+    assert.equal(args[args.indexOf('--print-timeout')+1],'0s');assert.equal(o.signal,context.signal);
     assert.ok(settings.permissions.deny.includes('read_file(*)'));assert.ok(args.includes('--disable-slash-commands'));assert.ok(!args.includes('--dangerously-skip-permissions'));
     assert.equal(JSON.parse(o.prompt).message.content,context.prompt);for(const event of events)o.onLine(JSON.stringify(event));return '';
   }});
