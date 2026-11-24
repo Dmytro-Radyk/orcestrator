@@ -1,22 +1,8 @@
-import { readFile, lstat, realpath } from 'node:fs/promises';
-import { join, relative, isAbsolute, sep } from 'node:path';
-
 export const storefrontAcceptanceId = 'storefront-acceptance';
-const evidenceDirectory = 'artifacts/storefront-acceptance';
-const auditFile = `${evidenceDirectory}/audit.json`;
-const previews = [
-  { file: `${evidenceDirectory}/desktop.png`, minWidth: 1024, maxWidth: 4096 },
-  { file: `${evidenceDirectory}/mobile.png`, minWidth: 320, maxWidth: 480 }
-];
 
-const inside = (root, target) => {
-  const rel = relative(root, target);
-  return Boolean(rel) && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-};
-
-export function isStorefrontBrief({ name = '', description = '' } = {}) {
+export function isStorefrontBrief({ name = '', description = '', idea } = {}) {
   return /інтернет[ -]?магазин|онлайн[ -]?магазин|інтернет[ -]?крамниц|вітрин[аиуою]\s+товар|\b(?:online store|webshop|storefront|e-commerce|ecommerce|phone shop|mobile store)\b/i
-    .test(`${name} ${description}`) || /^(?:магазин|крамниця)(?:\s|$)/i.test(name);
+    .test(`${name} ${description} ${idea?.summary??''}`) || /^(?:магазин|крамниця|книгарня)(?:[\s.!?]|$)/i.test(name.trim());
 }
 
 export const productPlanningInstructions = [
@@ -74,7 +60,10 @@ export function withStorefrontAcceptance(plan) {
   const promptParts = [
     'Запусти з поточної версії той самий локальний перегляд, який відкриватиме користувач. Перевір і дошліфуй візуальний дизайн, наповнення каталогу, унікальні зображення кожної моделі та повний сценарій покупки в межах узгодженого плану.',
     'Виконай браузерний smoke- та візуальний тест каталогу, картки товару, порівняння, кошика й оформлення замовлення. Перевір, що всі зображення завантажилися (naturalWidth > 0) і різні моделі НЕ використовують однаковий плейсхолдер, ціни та перемикання конфігурацій працюють, кошик й оформлення не заблоковані, а на телефоні (390px) немає горизонтального виходу за межі екрана.',
-    `Додай у files PNG-знімки справді запущеного браузера: ${previews.map(item => item.file).join(', ')} (ширини 1280 і 390 px) та JSON-аудит ${auditFile} формату {"modelsCount":12,"uniqueProductImages":12,"brokenImages":0,"mobileHorizontalOverflow":false,"checkoutFlowPassed":true}. У checks запиши фактичну обов’язкову браузерну команду з кодом 0; назва команди або її скрипта має містити browser, playwright чи webdriver. Залиш коротку команду для запуску локального перегляду в підсумку. Якщо перегляд або потрібні докази недоступні, поверни status=blocked з причиною.`
+    'Збережи локальну збірку, що відкривається кореневим index.html (dist, build, out, apps/web/dist, apps/web, public або корінь). Включи всі потрібні локальні файли збірки до files, якщо вони ігноруються Git.',
+    'Додай стабільні атрибути на реальні елементи вітрини: data-product-model=ID моделі на видимій картці з img, кнопки data-storefront-compare і data-storefront-add у картці. ID стабільний для різних конфігурацій однієї моделі, містить лише латиницю, цифри, крапку, підкреслення або дефіс. У головній навігації додай data-storefront-compare-open і data-storefront-cart.',
+    'У порівнянні познач видимі заголовки data-compared-model=ID, перемикач data-storefront-differences з aria-pressed, однакові рядки data-comparison-same, відмінні рядки data-comparison-different. У режимі відмінностей залишай видимими характеристики з різними значеннями в комірках (td, role=cell або role=gridcell). У кошику додай data-cart-model=ID і data-storefront-checkout, у формі оформлення — data-checkout-form.',
+    'Оркестратор сам відкриє локальну збірку у Chromium на 1280 і 390 px, перевірить 12 різних моделей, локальні фото, порівняння, мобільну ширину, кошик і форму оформлення та збереже власні знімки й результати. Не генеруй докази від імені верифікатора.'
   ];
   if (existing?.prompt) {
     const baseLen = promptParts.join('\n').length + 1;
@@ -90,50 +79,8 @@ export function withStorefrontAcceptance(plan) {
     acceptanceCriteria: [
       'У локальному перегляді каталог містить багатий вибір моделей різних брендів, унікальні деталізовані зображення кожної моделі завантажуються без помилок, а дизайн виглядає як сучасний комерційний магазин.',
       'На десктопі (1280px) і телефоні (390px) картки, фільтри, картка товару, порівняння (з режимом відмінностей), кошик і оформлення замовлення працюють без збоїв і без горизонтального переповнення.',
-      'Збережено два браузерні PNG-знімки, звіт аудиту та фактичний успішний результат браузерного тесту.',
+      'Незалежна перевірка оркестратора пройшла на точній версії збірки та зберегла два знімки й аудит.',
       ...(existing?.acceptanceCriteria ?? []).slice(0, 27)
     ]
   }] };
-}
-
-const normalizeRelPath = value => typeof value === 'string' ? value.replaceAll('\\', '/').replace(/^\.\//, '') : '';
-
-export async function verifyStorefrontEvidence(report, cwd) {
-  if (!report?.checks?.some(check => check.required !== false && check.status === 'passed' &&
-      check.kind === 'exit_code' && check.expectedExitCode === 0 && check.actualExitCode === 0 &&
-      /browser|playwright|webdriver/i.test(check.command))) return false;
-  const reportedFiles = new Set((report.files ?? []).map(normalizeRelPath));
-  const rootReal = await realpath(cwd);
-  const buffers = [];
-  for (const { file, minWidth, maxWidth } of previews) {
-    if (!reportedFiles.has(file)) return false;
-    const path = join(cwd, file);
-    const info = await lstat(path).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    if (!info?.isFile() || info.size < 48 || info.size > 8 * 1024 * 1024) return false;
-    const actual = await realpath(path);
-    if (!inside(rootReal, actual)) return false;
-    const png = await readFile(actual);
-    if (png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a' ||
-        png.toString('ascii', 12, 16) !== 'IHDR') return false;
-    const width = png.readUInt32BE(16);
-    if (width < minWidth || width > maxWidth || png.readUInt32BE(20) < 360) return false;
-    buffers.push(png);
-  }
-  if (buffers.length === 2 && buffers[0].equals(buffers[1])) return false;
-  const auditPath = join(cwd, auditFile);
-  const auditInfo = await lstat(auditPath).catch(error => { if (error.code !== 'ENOENT') throw error; });
-  if (auditInfo) {
-    if (!auditInfo.isFile() || auditInfo.size > 512 * 1024) return false;
-    const actualAudit = await realpath(auditPath);
-    if (!inside(rootReal, actualAudit)) return false;
-    let audit;
-    try { audit = JSON.parse(await readFile(actualAudit, 'utf8')); } catch { return false; }
-    if (!audit || typeof audit !== 'object') return false;
-    if (!Number.isFinite(audit.modelsCount) || audit.modelsCount < 6) return false;
-    if (!Number.isFinite(audit.uniqueProductImages) || audit.uniqueProductImages < 6) return false;
-    if (audit.brokenImages !== 0) return false;
-    if (audit.mobileHorizontalOverflow !== false) return false;
-    if (audit.checkoutFlowPassed !== true) return false;
-  }
-  return true;
 }

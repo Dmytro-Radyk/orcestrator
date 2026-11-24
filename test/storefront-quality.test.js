@@ -1,31 +1,66 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verifyStorefrontEvidence } from '../src/storefront-quality.js';
+import { createProjectPreview } from '../scripts/project-preview.js';
+import { auditStorefront, storefrontBrowser } from '../scripts/storefront-browser.js';
 
-test('storefront acceptance requires a browser check and evidence at both viewport sizes', async () => {
-  const cwd = await mkdtemp(join(tmpdir(), 'storefront-evidence-'));
-  const directory = 'artifacts/storefront-acceptance';
-  await mkdir(join(cwd, directory), { recursive: true });
-  const files = [`${directory}/desktop.png`, `${directory}/mobile.png`];
-  const check = { command: 'node scripts/check-storefront-browser.mjs', kind: 'exit_code',
-    status: 'passed', required: true, expectedExitCode: 0, actualExitCode: 0 };
-  const report = { files, checks: [check] };
-  const pngHeader = width => {
-    const data = Buffer.alloc(48);
-    data.set(Buffer.from('89504e470d0a1a0a', 'hex'));
-    data.write('IHDR', 12);
-    data.writeUInt32BE(width, 16);
-    data.writeUInt32BE(720, 20);
-    return data;
-  };
-  assert.equal(await verifyStorefrontEvidence(report, cwd), false);
-  await writeFile(join(cwd, files[0]), pngHeader(1280));
-  await writeFile(join(cwd, files[1]), pngHeader(1280));
-  assert.equal(await verifyStorefrontEvidence(report, cwd), false);
-  await writeFile(join(cwd, files[1]), pngHeader(390));
-  assert.equal(await verifyStorefrontEvidence({ ...report, checks: [{ ...check, actualExitCode: 1 }] }, cwd), false);
-  assert.equal(await verifyStorefrontEvidence(report, cwd), true);
+test('a configured server preview is never launched from a candidate worktree', async t=>{
+  const directory=await mkdtemp(join(tmpdir(),'storefront-preview-'));
+  t.after(()=>rm(directory,{recursive:true,force:true}));
+  await writeFile(join(directory,'preview-commands.json'),JSON.stringify({projects:{fixture:{script:'missing.mjs'}}}));
+  const preview=createProjectPreview(directory);
+  t.after(()=>preview.close());
+  const candidate=await preview.open('fixture',directory,'http://127.0.0.1',{candidate:true});
+  assert.equal(candidate.url,null);
+  assert.match(candidate.reason,/ізольоване середовище/);
+});
+
+test('independent Chromium checks real product media, comparison and checkout', {skip:!storefrontBrowser(),timeout:60000}, async t=>{
+  const directory=await mkdtemp(join(tmpdir(),'storefront-browser-'));
+  const preview=createProjectPreview(directory);
+  t.after(async()=>{preview.close();await rm(directory,{recursive:true,force:true});});
+  const ids=Array.from({length:12},(_,index)=>`model-${index}`);
+  const catalog=(count,broken=false,hideAll=false)=>`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+    <nav><button data-storefront-compare-open>Compare</button><button data-storefront-cart>Cart</button></nav>
+    <main>${ids.slice(0,count).map((id,index)=>`<article data-product-model="${id}"><img width="28" height="28" src="/${broken?'missing':id}.svg">
+    <button data-storefront-compare>Compare</button><button data-storefront-add>Add</button></article>`).join('')}</main>
+    <script>
+      const main=document.querySelector('main'),comparison=new Set();
+      let cart;
+      document.addEventListener('click', event=>{
+        const button=event.target;
+        if(button.matches('[data-storefront-compare]')) comparison.add(button.closest('[data-product-model]').dataset.productModel);
+        if(button.matches('[data-storefront-compare-open]'))main.innerHTML=[...comparison].map(id=>'<p data-compared-model="'+id+'">'+id+'</p>').join('')+
+          '<table><tr data-comparison-same><td>Same</td><td>Same</td></tr><tr data-comparison-different><td>128 GB</td><td>256 GB</td></tr></table><button aria-pressed="false" data-storefront-differences>Differences</button>';
+        if(button.matches('[data-storefront-differences]')){
+          button.setAttribute('aria-pressed','true');main.querySelector('[data-comparison-same]').hidden=true;
+          if(${hideAll})main.querySelector('[data-comparison-different]').hidden=true;
+        }
+        if(button.matches('[data-storefront-add]'))cart=button.closest('[data-product-model]').dataset.productModel;
+        if(button.matches('[data-storefront-cart]'))main.innerHTML='<p data-cart-model="'+cart+'">'+cart+'</p><button data-storefront-checkout>Checkout</button>';
+        if(button.matches('[data-storefront-checkout]'))main.innerHTML='<form data-checkout-form><label>Name<input required></label></form>';
+      });
+    </script></html>`;
+  for(const [index,id] of ids.entries()){
+    await writeFile(join(directory,id+'.svg'),`<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><rect width="28" height="28" fill="rgb(${index},40,210)"/></svg>`);
+  }
+  const index=join(directory,'index.html'),output=join(directory,'audit');
+  await writeFile(index,catalog(12));
+  const session=await preview.open('fixture',directory,'http://127.0.0.1',{candidate:true});
+  const good=await auditStorefront(session.url,{output});
+  assert.deepEqual(good.issues,[]);
+  assert.equal(good.status,'passed');
+  assert.deepEqual(good.surfaces.map(({width,uniqueImages})=>[width,uniqueImages]),[[1280,12],[390,12]]);
+  assert.equal(JSON.parse(await readFile(join(output,'audit.json'))).status,'passed');
+  await writeFile(index,catalog(12,false,true));
+  const hidden=await auditStorefront(session.url);
+  assert.equal(hidden.status,'failed');
+  assert.match(hidden.issues.join(' '),/режим відмінностей/);
+  await writeFile(index,catalog(1,true));
+  const poor=await auditStorefront(session.url);
+  assert.equal(poor.status,'failed');
+  assert.match(poor.issues.join(' '),/1 різних моделей, потрібно 12/);
+  assert.match(poor.issues.join(' '),/1 відсутніх або пошкоджених/);
 });

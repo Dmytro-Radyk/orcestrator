@@ -3,12 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "ui": "node scripts/ui-server.js",
     "start": "node src/cli.js serve",
     "demo": "node src/cli.js demo",
     "test": "node --test",
-    "check": "node --check src/engine.js && node --check src/providers.js && node --check src/server.js"
+    "check": "node -e \"import('node:fs').then(async fs=>{const p=await import('node:path'),cp=await import('node:child_process');const walk=d=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(p.join(d,e.name)):/\\.(?:js|mjs)$/.test(e.name)?[p.join(d,e.name)]:[]);for(const dir of ['src','scripts','apps/web/src','test'])for(const f of walk(dir))cp.execFileSync(process.execPath,['--check',f],{stdio:'inherit'});})\""
+  },
+  "dependencies": {
+    "semver": "^7.8.6",
+    "yaml": "^2.9.1"
   }
 }
