@@ -39,9 +39,10 @@ export function routeDecision(route,{now=Date.now(),policy=DEFAULT_MODEL_POLICY}
   return {allowed:true,code:'allowed',reason:route.billing==='free_tier'?'Підтверджений безкоштовний маршрут':route.billingBoundary==='subscription_quota_guarded'?'Підписка ChatGPT · контроль квоти, без API-ключа':'Включено у підтверджену підписку'};
 }
 
-export function chooseManager(routes,{preferredId,now=Date.now()}={}) {
+export function chooseManager(routes,{preferredId,billing,now=Date.now()}={}) {
   const candidates=routes.filter(r=>routeDecision(r,{now}).allowed&&(r.capabilities?.structuredOutput===true||r.capabilities?.jsonOutput==='prompt_validated'));
   if(preferredId)return candidates.find(r=>r.id===preferredId)??null;
+  const filtered=billing?candidates.filter(r=>r.billing===billing):candidates;
   // A provider default is evidence of its default, not an invented quality ranking.
-  return candidates.find(r=>r.isDefault)??candidates[0]??null;
+  return filtered.find(r=>r.isDefault)??filtered[0]??null;
 }

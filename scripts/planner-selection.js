@@ -11,7 +11,12 @@ export async function selectProjectPlanner({kind,input,registry,invoke,plannerCo
   const catalog=candidates.map(r=>({routeId:r.id,name:r.name,model:r.model,backend:r.backend,billing:r.billing,
     description:(r.description??'').slice(0,1000),specialty:r.specialty??null,capabilities:r.capabilities,contextTokens:r.limit?.context??null}));
   let picked,usage=null,selectorInfo=null;
-  if(candidates.length===1)picked={routeId:candidates[0].id,reason:'Єдина доступна модель зі структурованою відповіддю в підтвердженому каталозі.'};
+  const economical=input.priority==='economy';
+  if(economical){
+    const route=chooseManager(candidates.filter(candidate=>candidate.billing==='free_tier'))??candidates.find(candidate=>candidate.id===selector.routeId)??candidates[0];
+    picked={routeId:route.id,reason:'Режим економії обирає доступного керівника за правилами каталогу без окремого модельного запиту.'};
+  }
+  else if(candidates.length===1)picked={routeId:candidates[0].id,reason:'Єдина доступна модель зі структурованою відповіддю в підтвердженому каталозі.'};
   else {
     const brief={stage:kind,name:input.name,description:input.description,priority:input.priority??'quality',
       idea:input.idea??null,feedback:input.feedback??'',previousPlan:kind==='plan'?input.plan??null:null};
@@ -37,7 +42,7 @@ PlannerSelectionBrief: ${JSON.stringify(brief).slice(0,60000)}`;
   if(!picked||typeof picked.routeId!=='string'||!candidates.some(r=>r.id===picked.routeId)||
     typeof picked.reason!=='string'||!picked.reason.trim()||picked.reason.length>3000)throw Error('AI-підбір керівника повернув невідому модель або некоректне пояснення');
   signal.throwIfAborted();
-  const selected=await plannerConfig({refresh:true,preferred:picked.routeId});
+  const selected=await plannerConfig({refresh:!economical&&candidates.length>1,preferred:picked.routeId});
   if(!selected.configured)throw Error('Обрана для проєкту модель стала недоступною. Повторіть автоматичний підбір.');
   signal.throwIfAborted();
   return {...selected,selection:{mode:'project',stage:kind,reason:picked.reason,selector:selectorInfo,usage,at:new Date().toISOString()}};

@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual, createHash } from 'node:crypto';
 import { mkdir, realpath, readdir, readFile, stat, lstat } from 'node:fs/promises';
 import { resolve, relative, isAbsolute, join, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,21 +9,38 @@ import { validateTasks } from '../apps/web/src/state.js';
 import { validatePlan } from '../apps/web/src/planning.js';
 import { createModelRegistry,withModelPolicy } from './model-registry.js';
 import { createDirector,planFingerprint,routingCandidates,validateRouteAssignments,suits } from './director-service.js';
-import { isGeminiWorker,geminiByHeadroom,suitsManagedWorker } from './worker-routing.js';
-import { WorkspaceManager } from '../src/workspaces.js';
+import { isGeminiWorker,geminiByHeadroom,quotaUse,suitsManagedWorker } from './worker-routing.js';
+import { WorkspaceManager,unsafePathSegment } from '../src/workspaces.js';
 import { streamRun } from '../src/run-stream.js';
 import { executionAgent } from './execution-agent.js';
 import { createRecoveryHandler } from './recovery-service.js';
 import { readJsonBody } from '../src/http-body.js';
-import { reportNeedsCorrection,workspaceNeedsResolution,verificationBlockers,waitsForVerification } from '../src/execution-report.js';
+import { missingWorkerFileContext,reportNeedsCorrection,workspaceNeedsResolution,verificationBlockers,waitsForVerification } from '../src/execution-report.js';
 import { plannedCalls } from '../apps/web/src/call-budget.js';
 import { createHostVerifier } from './host-verifier.js';
 import { storefrontAcceptanceId } from '../src/storefront-quality.js';
 import { createProjectPreview, localPreviewUrl } from './project-preview.js';
+import { createTaskExtensions } from './task-extensions.js';
+import { auditStorefront } from './storefront-browser.js';
+import { createProjectComputer } from './project-computer.js';
+import { localTestRuntime } from './project-test-runtime.js';
+import { createConnectionRecovery } from './connection-recovery.js';
+import { recentRunNotifications } from '../src/run-notifications.js';
+import { createProjectChat } from './project-chat.js';
 
-const inside = (root, path) => { const rel=relative(root,path); return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel); };
-const excluded = name => /^(?:\.git|\.env(?:\..*)?|node_modules|\.codex|\.gemini|\.agents|\.aws)$/i.test(name) || /\.(?:pem|key|p12|pfx|db|sqlite(?:3|-wal|-shm)?)$/i.test(name);
+const samePath = (a, b) => process.platform === 'win32' ? String(a).toLowerCase() === String(b).toLowerCase() : a === b;
+const inside = (root, path) => {
+  const a=process.platform==='win32'?resolve(root).toLowerCase():resolve(root);
+  const b=process.platform==='win32'?resolve(path).toLowerCase():resolve(path);
+  const rel=relative(a,b);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+};
+const excluded = part => {
+  const name=part.replace(/[. ]+$/,'');
+  return unsafePathSegment(part)||/^(?:\.git|\.env(?:\..*)?|node_modules|\.codex|\.gemini|\.agents|\.aws)$/i.test(name) || /\.(?:pem|key|p12|pfx|db|sqlite(?:3|-wal|-shm)?)$/i.test(name);
+};
 const root = fileURLToPath(new URL('../.orchestrator/', import.meta.url));
+const repoRoot = fileURLToPath(new URL('../', import.meta.url));
 
 export function executorConfig(env=process.env) {
   const model=env.ORCHESTRATOR_EXECUTOR_MODEL ?? 'gpt-6.1-sol';
@@ -39,10 +56,11 @@ export function executorConfig(env=process.env) {
 }
 export async function workspaceFiles(directory) {
   const result=[];
+  let truncated=false;
   async function walk(dir) {
     for (const entry of await readdir(dir,{withFileTypes:true})) {
       if (excluded(entry.name) || entry.isSymbolicLink()) continue;
-      if(result.length>=200) return;
+      if(result.length>=2000){truncated=true;return;}
       const path=join(dir,entry.name);
       if(entry.isDirectory()) await walk(path);
       else if(entry.isFile()) {
@@ -52,28 +70,105 @@ export async function workspaceFiles(directory) {
       }
     }
   }
-  await walk(directory); return result;
+  await walk(directory);
+  if(truncated)Object.defineProperty(result,'truncated',{value:true,enumerable:false});
+  return result;
 }
-export function createExecutionService({directory=join(root,'ui'),workspaces=join(root,'workspaces'),config=executorConfig(),provider,registry:injectedRegistry,
-  hostVerifier=createHostVerifier(join(directory,'host-verification.json'))}={}) {
+export function createExecutionService({directory=join(root,'ui'),workspaces=join(root,'workspaces'),config=executorConfig(),provider,registry:injectedRegistry,origin,reviewRuns=true,
+  testNode=origin?localTestRuntime():null,hostVerifier=createHostVerifier(join(directory,'host-verification.json'),{testNode})}={}) {
   const store=new Store(directory);
-  const projectPreview=createProjectPreview(directory);
+  const projectPreview=createProjectPreview(directory,{previewRuntime:testNode?.preview});
+  const projectComputer=createProjectComputer({origin,preview:projectPreview,testNode});
   const registry=injectedRegistry??createModelRegistry({store,env:{...process.env,ORCHESTRATOR_EXECUTOR_COMMAND:config.command}});
   const director=createDirector({registry,provider});
+  const connectionRecovery=origin?createConnectionRecovery():undefined;
+  function reviewAuthors(run){
+    const authorIds=new Set(run.tasks.filter(item=>!item.projectReview).flatMap(item=>item.assignedAgentIds??item.agentIds));
+    for(const event of run.events)if(event.type==='agent.started'&&!event.review)authorIds.add(event.agentId);
+    return run.project.agents.filter(agent=>authorIds.has(agent.id));
+  }
+  function reviewRoute(authors,need){
+    const models=new Set(authors.map(agent=>agent.model.toLowerCase()));
+    const authorRoutes=new Set(authors.map(agent=>`${agent.provider}:${agent.model}`));
+    return registry.snapshot().routes.filter(route=>['codex','opencode','antigravity'].includes(route.backend)&&
+      !models.has(route.model.toLowerCase())&&!authorRoutes.has(route.id)&&suits(route,need))
+      .sort((a,b)=>Number(Boolean(b.capabilities?.tools))-Number(Boolean(a.capabilities?.tools))||
+        Number(b.billing==='free_tier')-Number(a.billing==='free_tier')||quotaUse(a)-quotaUse(b)||
+        Number(Boolean(b.isDefault))-Number(Boolean(a.isDefault)))[0];
+  }
+  const projectReviewer=route=>executionAgent(route,{access:'read-only',role:'Незалежний рецензент проєкту',config});
   const projectLocation=id=>store.data.projectLocations&&Object.hasOwn(store.data.projectLocations,id)?store.data.projectLocations[id]:null;
+  function routingRequirement(run,task) {
+    const requirements=run.project.routingRequirements??{};
+    for(let current=task;current;current=run.tasks.find(parent=>parent.id===current.parentId)){
+      if(Object.hasOwn(requirements,current.id))return requirements[current.id];
+    }
+    return {};
+  }
+  function taskRequiresFree(run,task){
+    const req=routingRequirement(run,task);
+    if(req.billing)return req.billing==='free_tier';
+    if(run.project.planning?.freeWorkers===true)return true;
+    const assigned=(task.assignedAgentIds??task.agentIds??[]).map(id=>run.project.agents.find(a=>a.id===id)).filter(Boolean);
+    return assigned.length>0&&assigned.every(a=>a.billing==='free_tier');
+  }
+  function isFreeTierRun(run){
+    if(run.project.planning?.freeWorkers===true)return true;
+    const roots=run.tasks.filter(t=>!t.projectReview&&!t.parentId);
+    return roots.length>0&&roots.every(t=>taskRequiresFree(run,t));
+  }
   const engine=new Engine(store,withModelPolicy(registry,provider),{workspaces:new WorkspaceManager(join(workspaces,'.runs'),
-    {allowedRoot:workspaces,projectLocation}),maxIntegrationRetries:1});
+    {allowedRoot:workspaces,projectLocation,forbiddenRoots:[directory]}),maxIntegrationRetries:1,
+    taskExtensions:createTaskExtensions(join(directory,'task-extensions.json'),{ensureConnection:connectionRecovery}),projectComputer,
+    async selectProjectReviewer(run,task){
+      const authors=reviewAuthors(run);
+      const models=new Set(authors.map(agent=>agent.model.toLowerCase()));
+      const authorRoutes=new Set(authors.map(agent=>`${agent.provider}:${agent.model}`));
+      const need=run.project.routingRequirements?.[task.id]??{workspaceWrite:false,...(isFreeTierRun(run)?{billing:'free_tier'}:{tools:true})};
+      if(task.explicitReviewerRouteId){
+        let explicit=registry.snapshot().routes.find(r=>r.id===task.explicitReviewerRouteId);
+        if(!explicit||!suits(explicit,{workspaceWrite:false})){await registry.scan();explicit=registry.snapshot().routes.find(r=>r.id===task.explicitReviewerRouteId);}
+        if(!explicit||models.has(explicit.model.toLowerCase())||authorRoutes.has(explicit.id)||!suits(explicit,{workspaceWrite:false}))
+          throw Object.assign(Error('Обрана модель для фінального рев’ю недоступна або вже була виконавцем проєкту.'),{code:'AGENT_BLOCKED',decisionCode:'reviewer_unavailable'});
+        const reviewer=projectReviewer(explicit);
+        if(!run.project.agents.some(agent=>agent.id===reviewer.id))run.project.agents.push(reviewer);
+        return reviewer;
+      }
+      let route=reviewRoute(authors,need);
+      if(!route){await registry.scan();route=reviewRoute(authors,need);}
+      if(!route){
+        if(need.billing==='free_tier'){
+          throw Object.assign(Error('Очікує другу сумісну безкоштовну модель для незалежного фінального рев’ю. Перехід на підписку потребує явного вибору користувача.'),
+            {code:'AGENT_BLOCKED',decisionCode:'free_reviewer_unavailable'});
+        }
+        throw Object.assign(Error('Для фінального рев’ю потрібна доступна модель, відмінна від моделей-виконавців.'),{code:'AGENT_BLOCKED',decisionCode:'reviewer_unavailable'});
+      }
+      const reviewer=projectReviewer(route);
+      if(!run.project.agents.some(agent=>agent.id===reviewer.id))run.project.agents.push(reviewer);
+      return reviewer;
+    },
+    async storefrontVerifier(run,cwd,signal){
+      const session=await projectPreview.open(run.project.uiProjectId,cwd,'http://127.0.0.1',{candidate:true});
+      if(!session.url)return {status:session.reason?'unavailable':'failed',
+        issues:[session.reason??'Копія не містить зібраної вітрини з index.html, яку можна відкрити в оркестраторі.']};
+      try{return await auditStorefront(session.url,{signal,output:join(directory,'storefront-audits',run.id)});}
+      finally{session.close();}
+    }});
   const token=randomBytes(32).toString('hex');
   const launching=new Set();
   const hostChecks=new Map();
   const hostQueued=new Set();
   let closing=false;
   const isHostChecking=run=>hostQueued.has(run.id)||hostChecks.has(run.id);
+  const hasAnotherActiveRun=run=>Object.values(store.data.runs).some(other=>
+    other.id!==run.id&&other.project.uiProjectId===run.project.uiProjectId&&
+    (['running','paused'].includes(other.status)||engine.controls.get(other.id)?.active.size||engine.controls.get(other.id)?.recovering||isHostChecking(other)));
   const routingControls=new Map();
   const draftProposals=new Map(),draftRoutingKey=Symbol('draft-routing');
   const streams=new Set();
   const routingPlan=p=>({summary:p.description||p.name,assumptions:[],risks:[],tasks:p.tasks.filter(t=>!t.parentId).map(t=>({
-    id:t.id,title:t.title,prompt:t.prompt,skills:t.skills??[],dependsOn:t.dependsOn,acceptanceCriteria:t.acceptanceCriteria??[]}))});
+    id:t.id,title:t.title,prompt:t.prompt,skills:t.skills??[],dependsOn:t.dependsOn,
+    acceptanceCriteria:t.acceptanceCriteria?.length?t.acceptanceCriteria:['Виконати інструкцію задачі та перевірити результат']}))});
   const currentPlanError=run=>{
     const p=store.data.ui?.workspace.projects.find(p=>p.id===run.project.uiProjectId);
     if(!p)return 'План змінився під час відновлення: проєкт видалено з робочого простору';
@@ -81,8 +176,8 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     if((p.executionBrief??'')!==(run.project.executionBrief??''))return 'План змінився під час відновлення: змінено уточнення вимог';
     if(planFingerprint(routingPlan(p))===run.project.uiPlanFingerprint)return null;
     if((p.description||p.name)!==run.project.goal)return 'План змінився під час відновлення: змінено опис проєкту';
-    const tasks=p.tasks.filter(t=>!t.parentId);
-    if(tasks.length!==run.project.tasks.length||tasks.some((t,i)=>t.id!==run.project.tasks[i]?.id))return 'План змінився під час відновлення: змінено список або порядок задач';
+    const tasks=p.tasks.filter(t=>!t.parentId),originalTasks=run.project.tasks.filter(task=>!task.projectReview);
+    if(tasks.length!==originalTasks.length||tasks.some((t,i)=>t.id!==originalTasks[i]?.id))return 'План змінився під час відновлення: змінено список або порядок задач';
     const labels={title:'назва',prompt:'інструкція',skills:'навички',dependsOn:'залежності',acceptanceCriteria:'критерії готовності'};
     for(const task of tasks){const original=run.project.tasks.find(t=>t.id===task.id);
       for(const [key,label] of Object.entries(labels))if(JSON.stringify(task[key]??[])!==JSON.stringify(original[key]??[]))return `План змінився під час відновлення: задача «${task.title}», ${label}`;
@@ -97,11 +192,113 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     const fresh=await engine.workspaces.prepare(run,task);
     return {...fresh,resolvedFrom:lease.cwd};
   }
+  function queueFileContextRecovery(run){
+    if(run.project.recovery?.enabled===false||!engine.canClarify(run))return;
+    const task=run.tasks.find(task=>missingWorkerFileContext(task)&&!task.reviewerId&&
+      !run.tasks.some(item=>item.parentId===task.id)&&selectAgents(run.project,task).length===1&&
+      selectAgents(run.project,task)[0].fileWorker===true);
+    if(!task)return;
+    const projectId=run.project.uiProjectId;
+    if(launching.has(projectId)||hasAnotherActiveRun(run))return;
+    launching.add(projectId);
+    queueMicrotask(async()=>{
+      try {
+        const access=selectAgents(run.project,task)[0].access;
+        const need={...routingRequirement(run,task),...(taskRequiresFree(run,task)?{billing:'free_tier'}:{}),tools:true,workspaceWrite:access==='workspace-write'};
+        const candidate=()=>registry.snapshot().routes.find(route=>route.backend==='codex'&&suits(route,need)&&
+          run.project.agents.some(agent=>agent.provider==='codex'&&agent.model===route.model&&agent.access===access&&!agent.fileWorker));
+        let route=candidate();
+        if(!route){await registry.scan();route=candidate();}
+        if(!route||closing||!isCurrentRun(run)||!engine.canClarify(run))return;
+        const replacement=run.project.agents.find(agent=>agent.provider==='codex'&&agent.model===route.model&&agent.access===access&&!agent.fileWorker);
+        const draft=await engine.workspaces.resume(run,task.workspace);
+        const lease=await refreshEmptyDraft(run,task,draft);
+        if(closing||!isCurrentRun(run))return;
+        engine.clarify(run.id,{taskId:task.id,lease,replacement,
+          answer:'Попередньому файловому виконавцю забракло контексту. Прочитай потрібні наявні файли безпосередньо в цій робочій папці та виконай початкову задачу за її критеріями.'});
+      }catch(error){
+        if(!closing)engine.event(run,'task.context_recovery_failed',{taskId:task.id,message:error.message});
+      }finally{launching.delete(projectId);}
+    });
+  }
+  function queueVerifiedDraftRecovery(run){
+    if(run.project.recovery?.enabled===false||!engine.canClarify(run))return false;
+    const projectId=run.project.uiProjectId;
+    if(launching.has(projectId)||hasAnotherActiveRun(run))return false;
+    const hasRetried=(task,reason)=>task.history?.some(item=>item.reason===reason);
+    const candidates=[];
+    for(const task of run.tasks){
+      if(task.status!=='blocked'||!task.workspace||task.reviewerId||
+        run.tasks.some(child=>child.parentId===task.id))continue;
+      const team=selectAgents(run.project,task);
+      const agent=team.length===1?team[0]:task.mode==='pipeline'?team.find(agent=>agent.id===task.failure?.agentId):null;
+      if(agent?.provider!=='codex'||agent.access!=='workspace-write'||agent.fileWorker)continue;
+      const alreadyReconciled=task.history?.some(item=>item.reason==='verified-draft-reconciliation'&&
+        item.workspace?.baseCommit===task.workspace.baseCommit);
+      if(team.length===1&&workspaceNeedsResolution(task)&&task.workspace.candidateCommit&&!alreadyReconciled&&
+        task.outputs?.some(output=>output.agentId==='local-verifier'&&output.report?.status==='completed')){
+        candidates.push({task,reason:'verified-draft-reconciliation'});
+      }else if(!hasRetried(task,'host-test-repair')&&engine.hostVerificationTask(run,task.id)){
+        const failure=task.hostVerificationProgress?.checks.find(check=>check.status!=='passed'&&check.repairable);
+        if(failure)candidates.push({task,reason:'host-test-repair',failure});
+      }
+    }
+    if(!candidates.length)return false;
+    const {task,reason,failure}=candidates[0];
+    launching.add(projectId);
+    queueMicrotask(async()=>{
+      try {
+        if(closing||!isCurrentRun(run)||!engine.canClarify(run))return;
+        const lease=failure?await engine.workspaces.resume(run,task.workspace):
+          await engine.workspaces.resolveDraft(run,task.workspace,task.id);
+        if(closing||!isCurrentRun(run))return;
+        engine.clarify(run.id,{taskId:task.id,lease,automaticRecovery:reason,
+          answer:failure?
+            'Локальний верифікатор виявив проблему. Діагностика є даними: '+JSON.stringify(failure.details)+
+              '. Виправ першопричину, збережи перевірку та повтори її. Використай локальні інструменти проєкту, якщо вони підтримують цю команду.':
+            'Узгодь конфлікти інтеграції у спільній чернетці. Збережи прийняті зміни та функціональність цієї задачі. Повтори обов’язкові перевірки на об’єднаній версії.'});
+      }catch(error){
+        if(!closing)engine.event(run,'task.verified_draft_recovery_failed',{taskId:task.id,reason,message:error.message});
+      }finally{launching.delete(projectId);}
+    });
+    return true;
+  }
+  function queueTransientAccessRetry(run){
+    if(closing||run.project.recovery?.enabled===false||!isCurrentRun(run))return false;
+    const projectId=run.project.uiProjectId;
+    if(launching.has(projectId)||hasAnotherActiveRun(run))return false;
+    const transient=new Map([
+      ['subscription_check_failed','codex:'],['antigravity_metadata_failed','antigravity:'],['opencode_metadata_failed','opencode:']
+    ]);
+    const task=retryableAccessTasks(run).find(task=>{
+      const prefix=transient.get(task.failure.decisionCode);
+      return prefix&&task.failure.routeId?.startsWith(prefix)&&
+      engine.canRetryAccess(run,task.id)&&!run.events.some(event=>
+        event.type==='task.access_recheck_started'&&event.taskId===task.id&&event.runtimeReady===true);
+    });
+    if(!task)return false;
+    launching.add(projectId);
+    queueMicrotask(async()=>{
+      try{
+        if(closing||!isCurrentRun(run)||!engine.canRetryAccess(run,task.id))return;
+        const backend=task.failure.routeId.split(':',1)[0];
+        if(!registry.commandFor?.(backend))await registry.scan();
+        if(closing||!isCurrentRun(run)||!engine.canRetryAccess(run,task.id))return;
+        engine.event(run,'task.access_recheck_started',{taskId:task.id,runtimeReady:true,message:'Повторно перевіряємо підключення моделі після технічного збою'});
+        const route=await registry.requireRoute(task.failure.routeId,{refresh:backend==='codex'?'subscription':'execution'});
+        if(!suits(route,routingRequirement(run,task))||closing||!isCurrentRun(run)||!engine.canRetryAccess(run,task.id))return;
+        if(task.workspace)await engine.workspaces.resume(run,task.workspace);
+        if(closing||!isCurrentRun(run))return;
+        engine.retryAccess(run.id,task.id);
+      }catch(error){
+        if(!closing)engine.event(run,'task.access_recheck_failed',{taskId:task.id,message:error.message});
+      }finally{launching.delete(projectId);}
+    });
+    return true;
+  }
   async function verifyOnHost(run,task,plan,{automatic=false,preflightKey}={}) {
     const projectId=run.project.uiProjectId;
-    if(launching.has(projectId)||!isCurrentRun(run)||engine.hostVerificationTask(run,task.id)!==task||
-      Object.values(store.data.runs).some(other=>other.id!==run.id&&other.project.uiProjectId===projectId&&
-        (['running','paused'].includes(other.status)||engine.controls.get(other.id)?.active.size||engine.controls.get(other.id)?.recovering)))
+    if(launching.has(projectId)||!isCurrentRun(run)||engine.hostVerificationTask(run,task.id)!==task||hasAnotherActiveRun(run))
       throw Error('Проєкт змінився або вже виконується');
     const controller=new AbortController(),signal=controller.signal;
     launching.add(projectId);hostChecks.set(run.id,controller);
@@ -137,8 +334,9 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         task.hostVerificationProgress={tree,attempt:task.attempts,checks:local};
         const failed=local.find(check=>check.status==='failed');
         if(failed)throw Error(failed.details);
+        const unavailable=local.find(check=>check.environmentUnavailable);
         engine.event(run,'task.host_verification_partial',{taskId:task.id,tree,
-          message:'Доступні локальні перевірки пройшли. Залишилися обов’язкові перевірки.'});
+          message:unavailable?.details??'Доступні локальні перевірки пройшли. Залишилися обов’язкові перевірки.'});
         return run;
       }
       if(test)throw Error('Політика тестового завершення не підтверджена. Реальні етапи залишилися відкладеними.');
@@ -161,11 +359,15 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       let plan;
       try { plan=hostVerifier.plan(run,task,{partial:true}); } catch { return; }
       if(!plan?.automatic)continue;
-      const preflightKey=plan.preflights.length||plan.testCompletion?createHash('sha256').update(JSON.stringify(
-        [plan.preflights.map(({command})=>[command,plan.checks.get(command)]),plan.testCompletion])).digest('hex'):undefined;
+      const policyChecks=[...plan.preflights.map(({command})=>command),...(plan.additionalChecks??[])];
+      const dockerReadiness=[...plan.checks.values()].some(check=>check.isolatedNode||check.isolatedScript);
+      const preflightKey=policyChecks.length||plan.testCompletion||dockerReadiness?createHash('sha256').update(JSON.stringify(
+        [policyChecks.map(command=>[command,plan.checks.get(command)]),plan.testCompletion??null,
+          ...(dockerReadiness?['docker-engine-readiness']:[]),...(plan.runtimeVersion?[plan.runtimeVersion]:[])])).digest('hex'):undefined;
+      const taskStart=run.events.findLastIndex(event=>event.taskId===task.id&&event.type==='task.started');
       const started=run.events.findLastIndex(event=>event.taskId===task.id&&event.attempt===task.attempts&&
         event.automatic===true&&event.preflightKey===preflightKey&&event.type==='task.host_verification_started');
-      if(started>=0&&run.events.slice(started+1).some(event=>event.taskId===task.id&&event.type==='task.host_verification_finished'))continue;
+      if(started>taskStart&&run.events.slice(started+1).some(event=>event.taskId===task.id&&event.type==='task.host_verification_finished'))continue;
       hostQueued.add(run.id);
       queueMicrotask(()=>{
         hostQueued.delete(run.id);
@@ -173,9 +375,11 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       });
       return;
     }
+    if(!queueVerifiedDraftRecovery(run)&&!queueTransientAccessRetry(run))queueFileContextRecovery(run);
   }
   engine.subscribe((run,event)=>{
     if(event.type==='run.blocked')queueHostVerification(run);
+    if(event.type==='run.drained'&&run.status==='failed')queueTransientAccessRetry(run);
   });
   const latestRuns=new Map();
   for(const run of Object.values(store.data.runs)){
@@ -183,7 +387,10 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     if(!latestRuns.has(projectId)||run.createdAt>latestRuns.get(projectId).createdAt)latestRuns.set(projectId,run);
   }
   for(const run of latestRuns.values()){
-    if(run.events.some(event=>event.type==='run.drained'))queueHostVerification(run);
+    if(run.events.some(event=>event.type==='run.drained')){
+      if(run.status==='failed')queueTransientAccessRetry(run);
+      else queueHostVerification(run);
+    }
   }
   const runtimes=()=>registry.snapshot().routes.filter(r=>['codex','opencode','antigravity'].includes(r.backend)).flatMap(r=>[
     ...(r.capabilities?.workspaceWrite?[{id:`${r.id}#write`,name:`${r.backend} · розробка`,provider:r.backend,model:r.model,routeId:r.id,billing:r.billing,billingBoundary:r.billingBoundary,access:'workspace-write',allowed:r.decision.allowed,reason:r.decision.reason}]:[]),
@@ -222,17 +429,14 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
   }
   async function workspace(key) {
     const chosen=projectLocation(key);
-    if(chosen){
-      if(await realpath(chosen)!==chosen)throw Error('Робочу папку проєкту переміщено або замінено');
-      return chosen;
-    }
+    if(chosen)return engine.workspaces.assertBase(chosen,key);
     await mkdir(workspaces,{recursive:true});
     const base=await realpath(workspaces);
     const path=join(base,createHash('sha256').update(key).digest('hex').slice(0,24));
     await mkdir(path,{recursive:true});
     const actual=await realpath(path);
     if(!inside(base,actual)) throw new Error('Робоча папка виходить за межі каталогу проєктів');
-    return actual;
+    return engine.workspaces.assertBase(actual,key);
   }
   async function localDirectory(path) {
     if(typeof path!=='string'||path.length>1024||/[\x00-\x1f]/.test(path)||
@@ -286,27 +490,57 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     run.canIncreaseBudget=engine.canIncreaseBudget(run)&&isCurrentRun(run);
     run.canResumeCancelled=engine.canResumeCancelled(run)&&isCurrentRun(run);
     run.canClarify=engine.canClarify(run)&&isCurrentRun(run);
+    run.canRetryProjectReview=engine.canRetryProjectReview(run)&&isCurrentRun(run);
+    const finalReview=run.tasks.find(item=>item.projectReview);
+    run.projectReviewAwaitingFreeModel=Boolean(finalReview?.blockedReason==='free_reviewer_unavailable');
+    if(run.canRetryProjectReview&&run.projectReviewAwaitingFreeModel){
+      const authors=reviewAuthors(run);
+      const authorModels=new Set(authors.map(a=>a.model.toLowerCase()));
+      const authorRoutes=new Set(authors.map(a=>`${a.provider}:${a.model}`));
+      run.subscriptionReviewRoutes=registry.snapshot().routes
+        .filter(r=>r.billing==='subscription_included'&&!authorModels.has(r.model.toLowerCase())&&!authorRoutes.has(r.id)&&suits(r,{workspaceWrite:false}))
+        .map(r=>({id:r.id,model:r.model,backend:r.backend,billing:r.billing,billingBoundary:r.billingBoundary}));
+    }else delete run.subscriptionReviewRoutes;
     run.hostChecking=isHostChecking(run);
-    run.canBalanceGemini=registry.snapshot().routes.some(isGeminiWorker)&&unstartedTasks(run).some(task=>
+    const gemini=registry.snapshot().routes.filter(isGeminiWorker);
+    run.canBalanceGemini=unstartedTasks(run).some(task=>
+      !taskRequiresFree(run,task)&&
       run.project.agents.some(agent=>agent.id===task.agentIds[0]&&agent.provider==='codex')&&
-      suitsManagedWorker(task,run.project.routingRequirements?.[task.id]));
-    if(!['running','paused'].includes(run.status) && !run.files && !run.draining) {
-      const before=new Map((run.beforeFiles??[]).map(f=>[f.path,f]));
-      const current=await workspaceFiles(run.project.workspace),presentSet=new Set(current.map(f=>f.path));
-      if(!['running','paused'].includes(run.status)&&!engine.controls.get(run.id)?.active.size&&!engine.controls.get(run.id)?.recovering){
-        run.files=[...current.map(f=>({...f,change:!before.has(f.path)?'created':before.get(f.path).hash!==f.hash?'modified':'unchanged'})),
-          ...[...before.values()].filter(f=>!presentSet.has(f.path)).map(f=>({...f,change:'deleted'}))];
-        store.save();
+      suitsManagedWorker(task,run.project.routingRequirements?.[task.id])&&
+      gemini.some(route=>!run.project.routingRequirements?.[task.id]?.allowedRouteIds||
+        run.project.routingRequirements[task.id].allowedRouteIds.includes(route.id)));
+    if(!['running','paused'].includes(run.status) && !run.files && !run.draining && !run.hostChecking && !hasAnotherActiveRun(run)) {
+      const safeDir=await engine.workspaces.assertBase(run.project.workspace,run.project.uiProjectId).catch(()=>null);
+      if(safeDir){
+        const before=new Map((run.beforeFiles??[]).map(f=>[f.path,f]));
+        const current=await workspaceFiles(safeDir),presentSet=new Set(current.map(f=>f.path));
+        if(!['running','paused'].includes(run.status)&&!engine.controls.get(run.id)?.active.size&&!engine.controls.get(run.id)?.recovering&&!isHostChecking(run)){
+          run.files=[...current.map(f=>({...f,change:!before.has(f.path)?'created':before.get(f.path).hash!==f.hash?'modified':'unchanged'})),
+            ...(current.truncated?[]:[...before.values()].filter(f=>!presentSet.has(f.path)).map(f=>({...f,change:'deleted'})))];
+          store.save();
+        }
       }
     }
     return run;
   }
   const hasActiveRun=(projectId,ignoreRunId)=>Object.values(store.data.runs).some(other=>other.id!==ignoreRunId&&other.project.uiProjectId===projectId&&
-    (['running','paused'].includes(other.status)||engine.controls.get(other.id)?.active.size||engine.controls.get(other.id)?.recovering));
+    (['running','paused'].includes(other.status)||engine.controls.get(other.id)?.active.size||engine.controls.get(other.id)?.recovering||isHostChecking(other)));
   const summary=run=>({id:run.id,projectId:run.projectId,uiProjectId:run.project.uiProjectId,uiRevision:run.project.uiRevision,
-    name:run.project.name,status:run.status,calls:run.calls,createdAt:run.createdAt,finishedAt:run.finishedAt});
+    name:run.project.name,status:run.status,calls:run.calls,createdAt:run.createdAt,finishedAt:run.finishedAt,
+    kind:run.project.projectChatId?'project-chat':undefined});
   const readBody=req=>readJsonBody(req,{maxBytes:5*1024*1024,limitMessage:'Завеликий запит'});
   const storedRouting=projectId=>store.data.routing&&Object.hasOwn(store.data.routing,projectId)?store.data.routing[projectId]:null;
+  function isFreeTierProject(projectId){
+    const routing=storedRouting(projectId);
+    const reqValues=Object.values(routing?.requirements??{});
+    if(reqValues.length)return reqValues.every(need=>need?.billing==='free_tier');
+    const p=store.data.ui?.workspace.projects.find(item=>item.id===projectId);
+    if(p?.planning?.freeWorkers===true)return true;
+    const latest=Object.values(store.data.runs)
+      .filter(r=>r.project.uiProjectId===projectId&&!r.project.projectChatId)
+      .sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0];
+    return latest?isFreeTierRun(latest):false;
+  }
   async function saveWorkspace(input) {
     if(input.revision!==(store.data.ui?.revision??0)) throw new Error('Конфлікт збереження: оновіть сторінку, щоб отримати актуальні дані');
     const value=input.workspace;
@@ -314,6 +548,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     const ids=new Set();
     for(const p of value.projects) {
       if(!safeKey(p.id)||ids.has(p.id)||typeof p.name!=='string'||!p.name.trim()||!Array.isArray(p.tasks)||p.tasks.length>100)throw new Error('Некоректний проєкт');
+      if(p.revision!==undefined&&(!Number.isSafeInteger(p.revision)||p.revision<1))throw new Error('Некоректна ревізія проєкту');
       if(p.executionBrief!==undefined&&(typeof p.executionBrief!=='string'||p.executionBrief.length>12000))throw Error('Некоректне уточнення вимог');
       ids.add(p.id);validateTasks(p.tasks);
     }
@@ -328,10 +563,21 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       if(draftProposals.get(input.routingDraftId)!==draft||draft.expiresAt<=Date.now())throw Error('Підбір команди застарів: повторіть його в майстрі');
       adopted={...draft.proposal,projectId:p.id,revision:p.revision};
     }
-    for(const key of hostChecks.keys()){
+    for(const key of new Set([...hostQueued,...hostChecks.keys()])){
       const run=engine.run(key),previous=uiProject(run.project.uiProjectId),next=value.projects.find(p=>p.id===previous.id);
       if(!next||next.revision!==previous.revision||(next.executionBrief??'')!==(previous.executionBrief??'')||
         planFingerprint(routingPlan(next))!==planFingerprint(routingPlan(previous)))throw Error('Дочекайтеся завершення локальної перевірки перед зміною плану');
+    }
+    for(const previous of store.data.ui?.workspace.projects??[]){
+      if(launching.has(previous.id)){
+        const next=value.projects.find(p=>p.id===previous.id);
+        if(!next||next.revision!==previous.revision||(next.executionBrief??'')!==(previous.executionBrief??'')||
+          planFingerprint(routingPlan(next))!==planFingerprint(routingPlan(previous)))throw Error('Дочекайтеся завершення поточної операції перед зміною плану');
+      }
+    }
+    for(const run of Object.values(store.data.runs)){
+      if(run.project.projectChatId&&(['running','paused'].includes(run.status)||engine.controls.get(run.id)?.active.size)&&
+        !value.projects.some(p=>p.id===run.project.uiProjectId))throw Error('Дочекайтеся завершення правок із чату перед видаленням проєкту');
     }
     if(input.projectLocation!==undefined){
       const {projectId,parent}=input.projectLocation??{};
@@ -339,17 +585,23 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       if(!pending||projectLocation(projectId)||store.data.ui?.workspace.projects.some(old=>old.id===projectId))
         throw Error('Папку можна вибрати лише для нового проєкту');
       const base=await localDirectory(parent);
+      const storeReal=await realpath(directory).catch(()=>resolve(directory));
+      const repoReal=await realpath(repoRoot).catch(()=>resolve(repoRoot));
+      if(samePath(base,storeReal)||inside(storeReal,base)||samePath(base,repoReal))
+        throw Error('Оберіть окрему папку поза службовим каталогом і коренем оркестратора');
       if(input.revision!==(store.data.ui?.revision??0))throw Error('Конфлікт збереження: оновіть сторінку');
       const name=pending.name.replace(/[<>:"/\\|?*\x00-\x1f]/g,'-').replace(/[. ]+$/g,'').trim().slice(0,64)||'Проєкт';
       const hash=createHash('sha256').update(projectId).digest('hex').slice(0,8);
       const destination=join(base,`${name} - ${hash}`);
       await mkdir(destination);
       const actual=await realpath(destination);
-      if(!inside(base,actual)||input.revision!==(store.data.ui?.revision??0))throw Error('Папку або робочий простір змінено. Повторіть створення.');
+      if(!inside(base,actual)||samePath(actual,storeReal)||inside(storeReal,actual)||input.revision!==(store.data.ui?.revision??0))throw Error('Папку або робочий простір змінено. Повторіть створення.');
       store.data.projectLocations??={};
       store.data.projectLocations[projectId]=actual;
     }
     if(adopted){store.data.routing??={};store.data.routing[adopted.projectId]=adopted;}
+    for(const oldId of Object.keys(store.data.projectChats??{}))if(!ids.has(oldId)){delete store.data.projectChats[oldId];projectChat.remove?.(oldId);}
+    for(const oldId of Object.keys(store.data.routing??{}))if(!ids.has(oldId))delete store.data.routing[oldId];
     store.data.ui={revision:input.revision+1,workspace:structuredClone(value)};store.save();
     if(adopted)draftProposals.delete(input.routingDraftId);
     return store.data.ui;
@@ -389,29 +641,99 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       if(!ids.length)throw Error('Призначте виконавців задач');
       if(t.id===storefrontAcceptanceId&&(ids.length!==1||!agents.some(agent=>agent.id===ids[0]&&agent.access==='workspace-write'&&!agent.fileWorker)))
         throw Error('Для браузерного приймання потрібен один виконавець із браузерними інструментами й доступом до запису');
-      tasks.push({id:t.id,title:t.title,prompt:t.prompt,skills:t.skills??[],agentIds:ids,dependsOn:t.dependsOn,
+      tasks.push({id:t.id,title:t.title,prompt:t.prompt,skills:t.skills??[],agentIds:ids,dependsOn:t.dependsOn,...(reviewRuns?{selfReview:true}:{}),
         acceptanceCriteria:t.acceptanceCriteria??[],mode:t.mode??'pipeline',
         allowDelegation:t.id!==storefrontAcceptanceId&&p.allowDelegation!==false&&t.allowDelegation!==false});
     }
+    const requirements=structuredClone(proposal?.requirements??{});
+    const allFree=Boolean(p.planning?.freeWorkers)||(tasks.length>0&&tasks.every(task=>
+      requirements[task.id]?.billing==='free_tier'||task.agentIds.every(id=>agents.find(a=>a.id===id)?.billing==='free_tier')));
+    if(allFree){
+      for(const task of tasks)requirements[task.id]={workspaceWrite:true,...requirements[task.id],billing:'free_tier'};
+    }
+    if(reviewRuns){
+      const finalId=`project-review-${randomUUID()}`;
+      const need={workspaceWrite:false,...(allFree?{billing:'free_tier'}:{tools:true})};
+      const route=reviewRoute(agents,need);
+      const reviewer=route?projectReviewer(route):null;
+      if(reviewer)agents.push(reviewer);
+      requirements[finalId]=need;
+      tasks.push({id:finalId,title:'Незалежне фінальне рев’ю проєкту',prompt:'Перевірити інтегрований проєкт і надати незалежний висновок.',
+        agentIds:reviewer?[reviewer.id]:[],dependsOn:tasks.map(task=>task.id),projectReview:true,allowDelegation:false});
+    }
     const dir=await workspace(p.id);
     const maxCalls=input.maxCalls??p.maxCalls;
-    if(input.maxCalls!==undefined&&(!Number.isSafeInteger(maxCalls)||maxCalls<plannedCalls(tasks)||maxCalls>10000))
+    if((reviewRuns||input.maxCalls!==undefined)&&(!Number.isSafeInteger(maxCalls)||maxCalls<plannedCalls(tasks)||maxCalls>10000))
       throw Error(`Для призначеної команди потрібно щонайменше ${plannedCalls(tasks)} викликів (максимум 10 000)`);
     const recoveryManager=p.recovery?.managerRouteId??proposal?.managerRouteId;
     const inputProject={name:p.name,goal:p.description,executionBrief:p.executionBrief??'',uiProjectId:p.id,uiRevision:p.revision,planning:p.planning,
-      uiPlanFingerprint:planFingerprint(routingPlan(p)),routingRequirements:structuredClone(proposal?.requirements??{}),
+      uiPlanFingerprint:planFingerprint(routingPlan(p)),routingRequirements:requirements,
       recovery:{enabled:p.recovery?.enabled??true,maxAttempts:p.recovery?.maxAttempts??2,...(recoveryManager?{managerRouteId:recoveryManager}:{})},
       workspace:dir,workspaceMode:'isolated',agents,tasks,...(proposal?{routingProposalId:proposal.id}:{}),
-      limits:{concurrency:p.concurrency,maxCalls,timeoutMs:config.timeoutMs??null,maxOutputTokens:12000,maxDepth:p.allowDelegation===false?0:p.maxDepth??2,maxTasks:p.maxTasks??100}};
-    const previous=Object.values(store.data.projects).find(v=>v.uiProjectId===p.id);
+      limits:{concurrency:p.concurrency,maxCalls,timeoutMs:config.timeoutMs??null,maxOutputTokens:12000,maxDepth:p.allowDelegation===false?0:p.maxDepth??2,maxTasks:Math.min(1000,(p.maxTasks??100)+Number(reviewRuns))}};
+    const previous=Object.values(store.data.projects).find(v=>v.uiProjectId===p.id&&!v.projectChatId);
     const project=previous?engine.updateProject(previous.id,{...inputProject,revision:previous.revision}):engine.createProject(inputProject);
     const beforeFiles=await workspaceFiles(dir);
-    const run=engine.start(project.id);run.beforeFiles=beforeFiles;store.save();return run;
+    return engine.start(project.id,{beforeFiles});
   }
   async function launch(input) {
     if(launching.has(input.projectId))throw new Error('Запуск цього проєкту вже готується');
     launching.add(input.projectId);
     try{return await launchReady(input);}finally{launching.delete(input.projectId);}
+  }
+  const projectChat=createProjectChat({store,engine,launching,
+    isBusy:projectId=>hasActiveRun(projectId)||[...hostQueued,...hostChecks.keys()].some(id=>engine.run(id).project.uiProjectId===projectId),
+    async launch(projectId,message,earlier,shouldWait){
+      const dir=await workspace(uiProject(projectId).id);
+      const beforeFiles=await workspaceFiles(dir);
+      const freeOnly=isFreeTierProject(projectId)&&message.allowSubscription!==true;
+      const requirements=()=>{
+        const explicit=Object.values(storedRouting(projectId)?.requirements??{}).filter(need=>need.workspaceWrite!==false);
+        const allowed=!message.allowSubscription&&explicit.length&&explicit.every(need=>need.allowedRouteIds)?[...new Set(explicit.flatMap(need=>need.allowedRouteIds))]:null;
+        const billing=freeOnly?'free_tier':(!message.allowSubscription&&explicit[0]?.billing&&explicit.every(need=>need.billing===explicit[0].billing)?explicit[0].billing:undefined);
+        return {workspaceWrite:true,...(allowed?{allowedRouteIds:allowed}:{}),...(billing?{billing}:{})};
+      };
+      const candidates=need=>registry.snapshot().routes.filter(route=>
+        ['codex','opencode','antigravity'].includes(route.backend)&&suits(route,need));
+      if(!candidates(requirements()).length)await registry.scan();
+      if(shouldWait())return;
+      const p=uiProject(projectId);
+      const maxCalls=Math.min(p.maxCalls??4,reviewRuns?4:3);
+      if(reviewRuns&&maxCalls<2)throw Error('Для правки з самоперевіркою потрібно щонайменше два виклики.');
+      const need=requirements();
+      let route;
+      if(message.routeId){
+        route=await registry.requireRoute(message.routeId,{refresh:false});
+        if(isFreeTierProject(projectId)&&route.billing!=='free_tier'&&message.allowSubscription!==true)
+          throw Object.assign(Error('Чат проєкту зберігає безкоштовний режим (free_tier). Перехід на підписку потребує явного підтвердження користувача.'),{decisionCode:'free_chat_subscription_required'});
+        if(!suits(route,{workspaceWrite:true,...(freeOnly?{billing:'free_tier'}:{})}))
+          throw Error('Обрана модель для чату недоступна або не має права запису файлів.');
+      }else{
+        route=candidates(need).sort((a,b)=>Number(Boolean(b.capabilities?.tools))-Number(Boolean(a.capabilities?.tools))||
+          quotaUse(a)-quotaUse(b)||Number(Boolean(b.isDefault))-Number(Boolean(a.isDefault)))[0];
+      }
+      if(!route){
+        if(freeOnly)throw Object.assign(Error('Проєкт працює в безкоштовному режимі (free_tier), а зараз немає доступної безкоштовної моделі з правом запису. Перехід на підписку потребує явного вибору користувача.'),
+          {decisionCode:'free_chat_unavailable'});
+        throw Error('Немає доступної моделі з правом запису й підтвердженим тарифом. Перевірте підключення та повторіть запуск.');
+      }
+      const agent=executionAgent(route,{role:'Розробник',config});
+      const taskId=`chat-${message.id}`;
+      const prior=Object.values(store.data.projects).find(project=>project.projectChatId===message.id);
+      const input={name:p.name,goal:p.description,executionBrief:p.executionBrief??'',uiProjectId:p.id,uiRevision:p.revision,
+        ...(freeOnly?{planning:{...p.planning,freeWorkers:true}}:p.planning?{planning:p.planning}:{}),
+        projectChatId:message.id,uiPlanFingerprint:planFingerprint(routingPlan(p)),routingRequirements:{[taskId]:need},
+        recovery:{enabled:p.recovery?.enabled??true,maxAttempts:1,...(p.recovery?.managerRouteId?{managerRouteId:p.recovery.managerRouteId}:{})},
+        workspace:dir,workspaceMode:'isolated',agents:[agent],tasks:[{id:taskId,title:'Правки з чату проєкту',
+          prompt:`Внеси зміни з повідомлення нижче в поточну версію проєкту. Переглянь наявну реалізацію, збережи роботу поза межами запиту, виконай відповідні тести й опиши зміни українською.\n\n${earlier.length?`Попередні виконані запити для контексту (не повторюй їх):\n${JSON.stringify(earlier)}\n\n`:''}Поточний запит користувача:\n${message.text}`,
+          agentIds:[agent.id],allowDelegation:false,...(reviewRuns?{selfReview:true}:{})}],
+        limits:{concurrency:1,maxCalls,maxDepth:0,maxTasks:1,timeoutMs:config.timeoutMs??null,maxOutputTokens:12000}};
+      const project=prior?engine.updateProject(prior.id,{...input,revision:prior.revision}):engine.createProject(input);
+      engine.start(project.id,{beforeFiles});
+    }});
+  for(const run of latestRuns.values()){
+    const projectId=run.project.uiProjectId;
+    if(run.status==='interrupted'&&!hasActiveRun(projectId)&&isCurrentRun(run))engine.resumeCheckpoint(run);
   }
   const handler=async(req,res)=>{
     const send=(status,data)=>{
@@ -425,10 +747,18 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       const fetchSite=req.headers['sec-fetch-site'];
       if(!host||!/^127\.0\.0\.1:\d+$/.test(host)||(req.headers.origin&&req.headers.origin!==`http://${host}`)||(fetchSite&&!['same-origin','none'].includes(fetchSite)))return send(403,{error:'Лише локальний same-origin доступ'});
       const url=new URL(req.url,'http://localhost');
-      if(req.method==='GET'&&url.pathname==='/api/execution/status')return send(200,{token,runtimes:runtimes(),reasoningEffort:config.reasoningEffort,timeouts:{task:config.timeoutMs??null,recovery:config.recoveryTimeoutMs??null},capabilities:{recovery:{automatic:true,defaultAttempts:2,maxAttempts:3}}});
+      if(await projectComputer.handle(req,res,url.pathname))return;
+      if(req.method==='GET'&&url.pathname==='/api/execution/status')return send(200,{token,runtimes:runtimes(),reasoningEffort:config.reasoningEffort,timeouts:{task:config.timeoutMs??null,recovery:config.recoveryTimeoutMs??null},capabilities:{reviews:reviewRuns,recovery:{automatic:true,defaultAttempts:2,maxAttempts:3}}});
       const supplied=Buffer.from(req.headers['x-execution-token']??''),expected=Buffer.from(token);
       if(supplied.length!==expected.length||!timingSafeEqual(supplied,expected))return send(403,{error:'Оновіть сторінку для доступу до виконання'});
+      if(req.method==='GET'&&url.pathname==='/api/execution/notifications')
+        return send(200,{items:recentRunNotifications(Object.values(store.data.runs))});
       if(['POST','PUT'].includes(req.method)&&!req.headers['content-type']?.startsWith('application/json'))return send(415,{error:'Потрібен JSON'});
+      if(url.pathname==='/api/execution/project-chat'&&['GET','POST'].includes(req.method)){
+        const projectId=uiProject(url.searchParams.get('projectId')).id;
+        if(req.method==='GET')return send(200,{messages:projectChat.history(projectId)});
+        return send(202,{messages:projectChat.send(projectId,await readBody(req))});
+      }
       if(req.method==='GET'&&url.pathname==='/api/connections')return send(200,registry.snapshot());
       if(req.method==='POST'&&url.pathname==='/api/connections/scan')return send(200,await registry.scan());
       if(req.method==='POST'&&url.pathname==='/api/routing/draft'){
@@ -486,8 +816,10 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         const input=await readBody(req),project=uiProject(input.projectId);
         const appOrigin=`http://${req.headers.host}`;
         if(input.url)return send(200,{url:localPreviewUrl(input.url,appOrigin).href});
-        const result=await projectPreview.open(project.id,await workspace(project.id),appOrigin);
-        return send(200,{url:result.url});
+        const directory=await workspace(project.id);
+        const revision=await engine.workspaces.git(directory,['rev-parse','HEAD']).catch(()=>undefined);
+        const result=await projectPreview.open(project.id,directory,appOrigin,{revision});
+        return send(200,{url:result.url,...(result.demo?{demo:true}:{})});
       }
       if(url.pathname==='/api/execution/preview'&&req.method==='POST') {
         await registry.scan();
@@ -506,11 +838,49 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         if(req.method==='GET'&&action==='events') {
           let close;close=streamRun(engine,run,req,res,{present,hostChecking:()=>isHostChecking(run),onClose:()=>streams.delete(close)});if(!res.writableEnded)streams.add(close);return;
         }
-        if(req.method==='POST'&&['pause','resume','cancel'].includes(action))return send(200,await present(engine[action](run.id)));
+        if(req.method==='POST'&&['pause','resume','cancel'].includes(action)){
+          if(action==='cancel'&&isHostChecking(run)&&!['running','paused'].includes(run.status)){
+            hostQueued.delete(run.id);
+            hostChecks.get(run.id)?.abort(new Error('Локальну перевірку скасовано користувачем'));
+            return send(200,await present(run));
+          }
+          if(action==='cancel'){hostQueued.delete(run.id);hostChecks.get(run.id)?.abort(new Error('Run cancelled'));}
+          return send(200,await present(engine[action](run.id)));
+        }
+        if(req.method==='POST'&&action==='retry-project-review'){
+          const projectId=run.project.uiProjectId;
+          if(!isCurrentRun(run)||launching.has(projectId)||isHostChecking(run)||hasActiveRun(projectId,run.id))throw Error('План змінився або проєкт уже виконується');
+          const body=await readBody(req).catch(()=>({}))??{};
+          const finalTask=run.tasks.find(item=>item.projectReview);
+          if(!finalTask)throw Error('Фінальне рев’ю для цього запуску не налаштоване');
+          if(body.routeId!==undefined){
+            if(typeof body.routeId!=='string'||!body.routeId.trim())throw Error('Вкажіть коректний маршрут моделі для рев’ю');
+            const need=run.project.routingRequirements?.[finalTask.id]??{workspaceWrite:false};
+            const freeReview=need.billing==='free_tier'||isFreeTierRun(run);
+            await registry.scan();
+            const chosen=await registry.requireRoute(body.routeId,{refresh:false});
+            if(freeReview&&chosen.billing!=='free_tier'&&body.allowSubscription!==true)
+              throw Error('Перехід фінального рев’ю з безкоштовного режиму на підписку потребує явного вибору користувача');
+            const authors=reviewAuthors(run);
+            if(authors.some(a=>a.model.toLowerCase()===chosen.model.toLowerCase()||`${a.provider}:${a.model}`===chosen.id))
+              throw Error('Фінальний рецензент має відрізнятися від моделей-виконавців проєкту');
+            if(!suits(chosen,{workspaceWrite:false}))throw Error('Обрана модель не підходить для режиму рецензування');
+            const reviewer=projectReviewer(chosen);
+            if(!run.project.agents.some(a=>a.id===reviewer.id))run.project.agents.push(reviewer);
+            finalTask.explicitReviewerRouteId=chosen.id;
+            finalTask.agentIds=[reviewer.id];
+            if(chosen.billing!=='free_tier'){
+              run.project.routingRequirements[finalTask.id]={...need,billing:chosen.billing,allowedRouteIds:[chosen.id],explicitSubscriptionApproval:true};
+              engine.event(run,'task.project_review_subscription_selected',{taskId:finalTask.id,routeId:chosen.id,model:chosen.model,
+                message:`Користувач явно обрав модель підписки для фінального рев’ю: ${chosen.model}`});
+            }
+          }
+          return send(202,await present(engine.retryProjectReview(run)));
+        }
         if(req.method==='POST'&&action==='budget'){
           const input=await readBody(req),projectId=run.project.uiProjectId;
           if(!isCurrentRun(run))throw Error('План змінився: ліміт старого запуску не можна редагувати');
-          if(launching.has(projectId))throw Error('Дочекайтеся завершення поточної операції із запуском');
+          if(launching.has(projectId)||isHostChecking(run))throw Error('Дочекайтеся завершення поточної операції із запуском');
           return send(200,await present(engine.increaseBudget(run.id,input)));
         }
         if(req.method==='POST'&&action==='verify-host'){
@@ -521,7 +891,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         }
         if(req.method==='POST'&&action==='balance-gemini'){
           const projectId=run.project.uiProjectId;
-          if(launching.has(projectId)||!unstartedTasks(run).length)throw Error('Запуск активний або немає нерозпочатих задач');
+          if(launching.has(projectId)||isHostChecking(run)||!unstartedTasks(run).length)throw Error('Запуск активний або немає нерозпочатих задач');
           launching.add(projectId);
           try {
             await registry.scan();
@@ -548,7 +918,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
           if(typeof input.answer!=='string'||!input.answer.trim()||input.answer.length>6000||!['task','project',undefined].includes(input.scope))throw Error('Потрібне уточнення до 6000 символів і допустима область застосування');
           if(!isCurrentRun(run))throw Error('План змінився: уточнювати старий запуск не можна');
           if(!engine.canClarify(run))throw Error('Запуск не очікує уточнення або бюджет вичерпано');
-          if(launching.has(projectId)||Object.values(store.data.runs).some(other=>other.id!==run.id&&other.project.uiProjectId===projectId&&(['running','paused'].includes(other.status)||engine.controls.get(other.id)?.active.size||engine.controls.get(other.id)?.recovering)))throw Error('Інший запуск цього проєкту вже активний');
+          if(launching.has(projectId)||isHostChecking(run)||hasActiveRun(projectId,run.id))throw Error('Інший запуск або локальна перевірка цього проєкту вже активні');
           const task=run.tasks.find(t=>t.id===input.taskId&&(t.failure?.code==='AGENT_BLOCKED'&&t.status==='blocked'||reportNeedsCorrection(t)||workspaceNeedsResolution(t)||waitsForVerification(t)));
           if(!task?.workspace)throw Error('Не знайдено чернетку задачі, яка очікує уточнення');
           launching.add(projectId);
@@ -560,8 +930,12 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
               if(typeof input.routeId!=='string'||input.scope==='project'||team.length!==1||!team[0].fileWorker||task.failure?.code!=='AGENT_BLOCKED')
                 throw Error('Заміна доступна для заблокованої чернетки одного файлового виконавця');
               const route=await registry.requireRoute(input.routeId);
+              if(taskRequiresFree(run,task)&&route.billing!=='free_tier'&&input.allowSubscription!==true)
+                throw Error('Задача працює в безкоштовному режимі (free_tier). Перехід на підписку потребує явного вибору користувача.');
               const access=team[0].access;
-              if(route.backend!=='codex'||!suits(route,{...run.project.routingRequirements?.[task.id],tools:true,workspaceWrite:access==='workspace-write'}))
+              const baseNeed={...routingRequirement(run,task),tools:true,workspaceWrite:access==='workspace-write'};
+              if(input.allowSubscription===true&&baseNeed.billing==='free_tier')delete baseNeed.billing;
+              if(route.backend!=='codex'||!suits(route,baseNeed))
                 throw Error('Маршрут не має підтвердженого доступу до потрібних інструментів');
               replacement=executionAgent(route,{access,role:task.title,skills:task.skills,config});
               lease=await refreshEmptyDraft(run,task,lease);
@@ -574,21 +948,21 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         }
         if(req.method==='POST'&&['continue','retry-access','retry-budget','resume-cancelled'].includes(action)){
           const accessRetry=action==='retry-access';
-          const {taskId,routeId}=accessRetry?(await readBody(req)??{}):{};
+          const {taskId,routeId,allowSubscription}=accessRetry?(await readBody(req)??{}):{};
           if(routeId!==undefined&&(typeof routeId!=='string'||typeof taskId!=='string'))throw Error('Потрібні точні ідентифікатори задачі та моделі');
           const budgetRetry=action==='retry-budget';
           const cancelledResume=action==='resume-cancelled';
           const projectId=run.project.uiProjectId;
           if(!isCurrentRun(run))throw Error('План змінився: продовжувати старий запуск не можна');
-          if(launching.has(projectId)||Object.values(store.data.runs).some(other=>other.id!==run.id&&other.project.uiProjectId===projectId&&(['running','paused'].includes(other.status)||engine.controls.get(other.id)?.active.size||engine.controls.get(other.id)?.recovering)))throw Error('Інший запуск цього проєкту вже активний');
+          if(launching.has(projectId)||isHostChecking(run)||hasActiveRun(projectId,run.id))throw Error('Інший запуск або локальна перевірка цього проєкту вже активні');
           const eligible=cancelledResume?engine.canResumeCancelled(run):budgetRetry?engine.canRetryBudget(run):accessRetry?engine.canRetryAccess(run,taskId):engine.canContinue(run);
           if(!eligible)throw Error('Немає відповідних задач, які можна продовжити в межах бюджету');
           launching.add(projectId);
           try{
-            const dir=run.project.workspace;
+            const dir=await engine.workspaces.assertBase(run.project.workspace,projectId);
             const uninitialized=cancelledResume&&run.calls===0&&!run.tasks.some(task=>task.workspace||task.resumeWorkspace)&&
               !(await lstat(join(dir,'.git')).catch(error=>{if(error.code!=='ENOENT')throw error;return null;}));
-            if(!uninitialized&&(resolve(await engine.workspaces.git(dir,['rev-parse','--show-toplevel']))!==resolve(dir)||await engine.workspaces.git(dir,['status','--porcelain'])))throw Error('Прийнята робоча папка змінилася; перевірте зміни перед продовженням');
+            if(!uninitialized&&(!samePath(resolve(await engine.workspaces.git(dir,['rev-parse','--show-toplevel'])),resolve(dir))||await engine.workspaces.git(dir,['status','--porcelain'])))throw Error('Прийнята робоча папка змінилася; перевірте зміни перед продовженням');
             let replacement,replacementWorkspace;
             if(cancelledResume||accessRetry||budgetRetry){
               const candidates=cancelledResume?engine.cancelledRunTasks(run):
@@ -600,7 +974,11 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
                 if(routeId!==undefined){
                   if(agents.length!==1||!agents[0].fileWorker)throw Error('Заміна доступна для одного файлового виконавця');
                   const route=await registry.requireRoute(routeId,{refresh:false}),access=agents[0].access;
-                  if(route.backend!=='codex'||!suits(route,{...run.project.routingRequirements?.[task.id],tools:true,workspaceWrite:access==='workspace-write'}))
+                  if(taskRequiresFree(run,task)&&route.billing!=='free_tier'&&allowSubscription!==true)
+                    throw Error('Задача працює в безкоштовному режимі (free_tier). Перехід на підписку потребує явного вибору користувача.');
+                  const baseNeed={...routingRequirement(run,task),tools:true,workspaceWrite:access==='workspace-write'};
+                  if(allowSubscription===true&&baseNeed.billing==='free_tier')delete baseNeed.billing;
+                  if(route.backend!=='codex'||!suits(route,baseNeed))
                     throw Error('Маршрут не має підтвердженого доступу до потрібних інструментів');
                   replacement=executionAgent(route,{access,role:task.title,skills:task.skills,config});
                   agents=[replacement];
@@ -629,14 +1007,14 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         }
         if(req.method==='POST'&&action==='recover'){
           if(!isCurrentRun(run))throw Error('План змінився: відновлювати старий запуск не можна');
-          if(launching.has(run.project.uiProjectId)||Object.values(store.data.runs).some(other=>other.id!==run.id&&other.project.uiProjectId===run.project.uiProjectId&&(['running','paused'].includes(other.status)||engine.controls.get(other.id)?.active.size||engine.controls.get(other.id)?.recovering)))throw Error('Інший запуск цього проєкту вже активний');
+          if(launching.has(run.project.uiProjectId)||isHostChecking(run)||hasActiveRun(run.project.uiProjectId,run.id))throw Error('Інший запуск або локальна перевірка цього проєкту вже активні');
           return send(202,engine.requestRecovery(run.id));
         }
         if(req.method==='POST'&&action==='cancel-task')return send(200,engine.cancelTask(run.id,(await readBody(req)).taskId));
         if(req.method==='GET'&&action==='file') {
           const path=url.searchParams.get('path');
           if(!path||(process.platform==='win32'&&path.includes(':'))||path.split(/[\\/]/).some(excluded))throw new Error('Недоступний файл');
-          const base=await realpath(run.project.workspace);
+          const base=await engine.workspaces.assertBase(run.project.workspace,run.project.uiProjectId);
           let actual;
           try { actual=await realpath(resolve(base,path)); } catch { throw new Error('Файл не знайдено'); }
           if(!inside(base,actual))throw new Error('Файл виходить за межі проєкту');
@@ -653,5 +1031,5 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       send(error.statusCode??400,{error:error.message});
     }
   };
-  return {handler,engine,store,registry,director,close(){closing=true;projectPreview.close();for(const stream of streams)stream();for(const controller of routingControls.values())controller.abort();for(const controller of hostChecks.values())controller.abort();for(const run of Object.values(store.data.runs))if(['running','paused'].includes(run.status))engine.cancel(run.id);store.flush?.();}};
+  return {handler,engine,store,registry,director,close(){closing=true;projectChat.close();projectComputer.close();projectPreview.close();connectionRecovery?.close?.();for(const stream of streams)stream();for(const controller of routingControls.values())controller.abort();for(const controller of hostChecks.values())controller.abort();for(const run of Object.values(store.data.runs))if(['running','paused'].includes(run.status))engine.cancel(run.id);store.flush?.();}};
 }

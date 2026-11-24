@@ -53,6 +53,15 @@ test('only one permitted model needs no extra AI selection call; unavailable cat
   assert.equal(calls,0);
 });
 
+test('economy chooses a verified free planner without a selector call',async()=>{
+  let calls=0;
+  const f=fixture(async()=>{calls++;throw Error('Unexpected inference');});
+  const chosen=await f.director.selectPlanner({kind:'plan',input:{...input,priority:'economy'}});
+  assert.equal(chosen.routeId,'opencode:general');
+  assert.equal(chosen.selection.selector,null);
+  assert.equal(calls,0);
+});
+
 test('an aborted automatic selection cannot start model work',async()=>{
   let calls=0;const f=fixture(async()=>{calls++;}),controller=new AbortController();controller.abort();
   await assert.rejects(f.director.selectPlanner({kind:'idea',input},controller.signal),error=>error.name==='AbortError');assert.equal(calls,0);

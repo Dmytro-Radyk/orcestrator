@@ -12,12 +12,12 @@ catch (error) { if (error.code !== 'ENOENT') throw error; }
 const root = await realpath(fileURLToPath(new URL('../apps/web/', import.meta.url)));
 const inside = (base, target) => { const rel = relative(base, target); return Boolean(rel) && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel); };
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' };
-const execution = createExecutionService();
+const port = process.env.UI_PORT === undefined || process.env.UI_PORT === '' ? 4311 : Number(process.env.UI_PORT);
+if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('UI_PORT must be an integer 1..65535');
+const execution = createExecutionService({origin:`http://127.0.0.1:${port}`});
 // A pinned director is optional. Automatic selection uses only verified, allowed routes.
 const planning = planningHandler({resolve:options=>execution.director.plannerConfig(options),managerCatalog:()=>execution.registry.snapshot().routes,
   select:(request,signal)=>execution.director.selectPlanner(request,signal)},execution.director.invoke);
-const port = process.env.UI_PORT === undefined || process.env.UI_PORT === '' ? 4311 : Number(process.env.UI_PORT);
-if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('UI_PORT must be an integer 1..65535');
 const server = createServer(async (req, res) => {
   try {
     const boundPort = server.address()?.port ?? port;

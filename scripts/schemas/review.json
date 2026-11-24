@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approved", "feedback"],
+  "properties": {
+    "approved": { "type": "boolean" },
+    "feedback": { "type": "string" }
+  }
+}

@@ -1,6 +1,6 @@
 const isCodex=route=>route.backend==='codex';
 export const isGeminiWorker=route=>route.backend==='antigravity'&&/^gemini-/i.test(route.model);
-const quotaUse=route=>Math.max(0,...[route.quota?.primary,route.quota?.secondary,...(route.quota?.extra??[])]
+export const quotaUse=route=>Math.max(0,...[route.quota?.primary,route.quota?.secondary,...(route.quota?.extra??[])]
   .map(window=>window?.usedPercent).filter(Number.isFinite));
 const specialty=task=>[task.title,...(task.skills??[])].join(' ').toLowerCase();
 const needsNativeTools=task=>/\b(?:backend|devops|ci\/cd|database|security|playwright|migration|browser|deploy|seo|analytics)\b|автентиф|транзакц|баз[иа] даних|безпек|інтеграц|тестуван|резервн|розгортан|реліз|платіж|браузер|аналітик/.test(specialty(task));
@@ -11,31 +11,32 @@ export function suitsManagedWorker(task,need={}) {
   return !needsNativeTools(task)&&/\b(?:docs?|documentation|content|planning|research|copywriting|markdown|frontend|ux)\b|документ|плануван|контент|аналіз вимог|інструкц|текстов|специфікац|валідація форм/.test(specialty(task));
 }
 
-export function balanceWorkerCandidates(tasks,candidates,requirements,{priority,maxAgentsPerTask}){
-  if(priority==='quality'||maxAgentsPerTask!==1)return candidates;
+export function balanceWorkerCandidates(tasks,candidates,requirements,{priority}){
   const choices=new Map(candidates);
-  if(priority==='economy'){
-    for(const [id,routes] of choices){
-      const free=routes.filter(route=>route.billing==='free_tier');
-      if(free.length)choices.set(id,free);
-    }
-  }
-  if(tasks.length<2)return choices;
-  const ordered=[...tasks].sort((a,b)=>a.dependsOn.length-b.dependsOn.length);
   const load={codex:0,gemini:0};
-  for(const task of ordered){
-    const routes=choices.get(task.id),codex=routes.filter(isCodex),gemini=routes.filter(isGeminiWorker);
-    if(!codex.length||!gemini.length)continue;
+  const flexible=[];
+  for(const task of tasks){
+    let routes=choices.get(task.id);
     const need=requirements[task.id];
-    if(need?.workspaceWrite!==false&&needsNativeTools(task)){
+    if(need?.workspaceWrite!==false&&needsNativeTools(task)&&routes.some(isCodex)&&routes.some(isGeminiWorker)){
       const native=routes.filter(route=>route.capabilities?.tools===true);
-      if(native.length)choices.set(task.id,native);
-      continue;
+      if(native.length)routes=native;
     }
-    if(!suitsManagedWorker(task,need))continue;
+    if(priority==='economy'){
+      const free=routes.filter(route=>route.billing==='free_tier');
+      if(free.length)routes=free;
+    }
+    choices.set(task.id,routes);
+    const codex=routes.filter(isCodex),gemini=routes.filter(isGeminiWorker);
+    if(codex.length===routes.length)load.codex++;
+    else if(gemini.length===routes.length)load.gemini++;
+    else if(codex.length&&gemini.length&&suitsManagedWorker(task,need))flexible.push({task,codex,gemini});
+  }
+  for(const {task,codex,gemini} of flexible.sort((a,b)=>a.task.dependsOn.length-b.task.dependsOn.length)){
     const loadScore=(pool,options)=>(load[pool]+1)/Math.max(1,100-Math.min(...options.map(quotaUse)));
     const chosen=loadScore('gemini',gemini)<=loadScore('codex',codex)?'gemini':'codex';
-    choices.set(task.id,chosen==='gemini'?gemini:codex);
+    const workerPool=chosen==='gemini'?gemini:codex;
+    choices.set(task.id,workerPool.sort((a,b)=>quotaUse(a)-quotaUse(b)));
     load[chosen]++;
   }
   return choices;

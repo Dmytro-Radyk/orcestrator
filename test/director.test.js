@@ -16,10 +16,14 @@ test('balanced routing splits compatible work across Codex and Gemini and preser
   const choices=new Map(tasks.map(({id})=>[id,[codex,gemini]]));
   const result=balanceWorkerCandidates(tasks,choices,{c:{tools:true}},{priority:'balanced',maxAgentsPerTask:1});
   assert.deepEqual(result.get('a'),[gemini]);
-  assert.deepEqual(result.get('b'),[codex]);
+  assert.deepEqual(result.get('b'),[gemini]);
   assert.deepEqual(result.get('c'),[codex]);
   assert.deepEqual(result.get('d'),[codex]);
-  assert.equal(balanceWorkerCandidates(tasks,choices,{}, {priority:'quality',maxAgentsPerTask:1}),choices);
+  const quality=balanceWorkerCandidates(tasks,choices,{c:{tools:true}}, {priority:'quality',maxAgentsPerTask:2});
+  assert.deepEqual(quality.get('b'),[gemini]);
+  assert.deepEqual(quality.get('d'),[codex]);
+  gemini.quota={primary:{usedPercent:96}};
+  assert.deepEqual(balanceWorkerCandidates(tasks,choices,{c:{tools:true}},{priority:'balanced'}).get('a'),[codex]);
 });
 
 const plan=()=>({summary:'Test project',assumptions:[],risks:[],tasks:[{id:'a',title:'Concept',prompt:'Describe the concept',skills:['planning'],dependsOn:[],acceptanceCriteria:['Clear scope']},
@@ -35,6 +39,35 @@ function fixture(provider) {
 }
 const selection=()=>({assignments:[{taskId:'a',routeIds:['opencode:opencode/a'],reason:'Concept model; quality has not been measured'},
   {taskId:'b',routeIds:['opencode:opencode/a','opencode:opencode/b'],reason:'Two independent text reviewers'}]});
+
+test('manually chosen models filter task candidates without dropping tool and billing constraints',()=>{
+  const f=fixture();
+  const allowedRouteIds=['opencode:opencode/b','paid:excluded'];
+  assert.deepEqual(routingCandidates(plan(),f.routes,{a:{allowedRouteIds}}).get('a').map(r=>r.id),['opencode:opencode/b']);
+  assert.throws(()=>routingCandidates(plan(),f.routes,{a:{allowedRouteIds,tools:true}}),/Немає обраної моделі.*потрібні інструменти/);
+});
+
+test('one eligible selected route per task skips the director invocation',async()=>{
+  let calls=0;
+  const f=fixture(async()=>{calls++;throw Error('Unexpected inference');});
+  const proposal=await f.director.propose({plan:plan(),priority:'balanced',
+    requirements:{a:{allowedRouteIds:['opencode:opencode/a']},b:{allowedRouteIds:['opencode:opencode/b']}}});
+  assert.deepEqual(proposal.assignments.map(a=>a.routeIds[0]),['opencode:opencode/a','opencode:opencode/b']);
+  assert.equal(proposal.provenance.method,'rules');
+  assert.equal(proposal.provenance.usage,null);
+  assert.equal(calls,0);
+});
+
+test('one economy task resolves several compatible models without a director invocation',async()=>{
+  const f=fixture(async()=>assert.fail('A single task should use rule-based routing'));
+  f.routes[0].quota={primary:{usedPercent:65}};
+  f.routes[1].quota={primary:{usedPercent:20}};
+  const project=plan();project.tasks=project.tasks.slice(0,1);
+  const proposal=await f.director.propose({plan:project,priority:'economy',maxAgentsPerTask:1});
+  assert.equal(proposal.provenance.method,'rules');
+  assert.equal(proposal.provenance.usage,null);
+  assert.deepEqual(proposal.assignments[0].routeIds,['opencode:opencode/b']);
+});
 
 test('director receives only permitted task candidates and returns exact route IDs, reasons and provenance',async()=>{
   const f=fixture(async(agent,ctx)=>{assert.equal(agent.command,'trusted');assert.ok(!ctx.prompt.includes('paid:excluded'));

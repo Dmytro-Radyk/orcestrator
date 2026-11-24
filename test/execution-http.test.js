@@ -2,22 +2,24 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { resolve,join,relative,isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createExecutionService,executorConfig } from '../scripts/execution-service.js';
 import { seed } from '../apps/web/src/state.js';
 import { applyExecutionRun } from '../apps/web/src/execution.js';
 
-async function fixture(t,provider) {
+async function fixture(t,provider,options={}) {
   const base=resolve('.orchestrator/tests');await mkdir(base,{recursive:true});const dir=await mkdtemp(join(base,'execution-'));
   const trusted={id:'codex:fake-model',backend:'codex',model:'fake-model',decision:{allowed:true,reason:'Test-only verified route'},
     checkedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+300000).toISOString(),availability:'ready',
     billing:'free_tier',freeConfirmed:true,billingBoundary:'included_only',runtimeSupported:true,reasoningEfforts:['low','high'],capabilities:{structuredOutput:true,tools:true,workspaceWrite:true}};
-  const registry={snapshot:()=>({routes:[trusted],connections:[]}),scan:async()=>registry.snapshot(),requireRoute:async id=>{
-    assert.equal(id,trusted.id);return {...trusted,command:'trusted-executable'};
+  const catalog=[trusted,...(options.reviewRuns?[{...trusted,id:'codex:review-model',model:'review-model'}]:[])];
+  const registry={snapshot:()=>({routes:catalog,connections:[]}),scan:async()=>registry.snapshot(),requireRoute:async id=>{
+    const route=catalog.find(item=>item.id===id);assert.ok(route);return {...route,command:'trusted-executable'};
   }};
-  const service=createExecutionService({directory:join(dir,'data'),workspaces:join(dir,'workspaces'),config:{model:'fake-model',command:'trusted-executable',reasoningEffort:'high'},provider,registry});
+  const service=createExecutionService({directory:join(dir,'data'),workspaces:join(dir,'workspaces'),config:{model:'fake-model',command:'trusted-executable',reasoningEffort:'high'},provider,registry,reviewRuns:false,...options});
   const server=createServer(service.handler);server.listen(0,'127.0.0.1');await once(server,'listening');
   t.after(async()=>{service.close();server.closeAllConnections();server.close();const rel=relative(base,dir);assert.ok(rel&&!rel.startsWith('..')&&!isAbsolute(rel));await rm(dir,{recursive:true,force:true});});
   const url=`http://127.0.0.1:${server.address().port}`;
@@ -31,6 +33,158 @@ async function fixture(t,provider) {
 }
 async function until(predicate){for(let i=0;i<1500;i++){if(await predicate())return;await delay(10);}throw Error('Timed out');}
 
+test('real runs review each candidate with its author and require a separate reviewer after integration',async t=>{
+  const calls=[];
+  let selfReviews=0,finalReviews=0;
+  const f=await fixture(t,async(agent,context)=>{
+    const {cwd,prompt,review}=context;
+    calls.push({model:agent.model,review});
+    if(review==='project'){
+      assert.equal(agent.access,'read-only');
+      assert.equal(await readFile(join(cwd,'candidate.txt'),'utf8'),'corrected');
+      return {text:JSON.stringify({approved:++finalReviews===2,feedback:'Окремий висновок'})};
+    }
+    if(review==='self'){
+      assert.equal(agent.access,'read-only');
+      assert.ok(await readFile(join(cwd,'candidate.txt'),'utf8'));
+      return {text:JSON.stringify({approved:++selfReviews>1,feedback:'Уточніть реалізацію'})};
+    }
+    await writeFile(join(cwd,'candidate.txt'),calls.length===1?'draft':'corrected');
+    if(calls.length===3)assert.match(prompt,/Виправ зауваження самоперевірки/);
+    return {text:'Зміни виконано'};
+  },{reviewRuns:true});
+  const payload={projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-write'},maxCalls:8};
+  assert.match((await f.call('/api/execution/runs','POST',{...payload,maxCalls:4})).value.error,/щонайменше 5/);
+  const started=await f.call('/api/execution/runs','POST',payload);
+  assert.equal(started.status,202,JSON.stringify(started.value));
+  const run=f.service.engine.run(started.value.id);
+  await until(()=>run.events.some(event=>event.type==='run.drained'));
+  assert.equal(run.status,'blocked');
+  assert.deepEqual(calls.slice(0,-1).map(call=>call.review),[undefined,'self',undefined,'self',undefined,'self']);
+  assert.ok(calls.slice(0,-1).every(call=>call.model==='fake-model'));
+  assert.deepEqual(calls.at(-1),{model:'review-model',review:'project'});
+  assert.equal(run.tasks.at(-1).review.approved,false);
+  assert.equal((await f.call(`/api/execution/runs/${run.id}/retry-project-review`,'POST',{})).status,202);
+  await until(()=>run.status==='completed');
+  assert.equal(run.tasks.at(-1).review.approved,true);
+  assert.equal(run.calls,8);
+});
+
+test('local verification integrates the exact draft approved by its author before final review',async t=>{
+  const file='tests/local-http.test.mjs',steps=[];
+  const f=await fixture(t,async(_agent,{cwd,review})=>{
+    steps.push(review??'implementation');
+    if(review){
+      assert.equal(await readFile(join(cwd,file),'utf8'),'approved draft');
+      return {text:'{"approved":true,"feedback":"Чернетку перевірено"}'};
+    }
+    await mkdir(join(cwd,'tests'),{recursive:true});
+    await writeFile(join(cwd,file),'approved draft');
+    throw Object.assign(Error('No loopback in worker'),{code:'AGENT_BLOCKED',report:{status:'blocked',summary:'Saved draft',files:[file],
+      checks:[{command:`node --test ${file}`,required:true,status:'failed',details:'connect EACCES 127.0.0.1:5000'}]}});
+  },{reviewRuns:true,testNode:async(cwd,files)=>{
+    steps.push('local-check');assert.deepEqual(files,[file]);
+    assert.equal(await readFile(join(cwd,file),'utf8'),'approved draft');
+    return {exitCode:0,output:'ok'};
+  }});
+  f.p.tasks=f.p.tasks.slice(0,1);
+  assert.equal((await f.call('/api/workspace','PUT',{revision:1,workspace:f.workspace})).status,200);
+  const started=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-write'},maxCalls:3});
+  assert.equal(started.status,202,JSON.stringify(started.value));
+  const run=f.service.engine.run(started.value.id);
+  await until(()=>run.status==='completed'||run.status==='failed');
+  assert.equal(run.status,'completed');
+  assert.deepEqual(steps,['implementation','self','local-check','project']);
+});
+
+test('project chat queues during execution and applies follow-ups to the same workspace',async t=>{
+  const initial=Promise.withResolvers();
+  const calls=[];
+  const f=await fixture(t,async(_agent,{cwd,prompt,signal})=>{
+    if(prompt.includes('Task: Правки з чату проєкту')){
+      calls.push(prompt);
+      const current=await readFile(join(cwd,'result.txt'),'utf8');
+      if(prompt.includes('Поточний запит користувача:\nОнови результат\nAcceptance criteria:')){
+        assert.equal(current,'initial');
+        await writeFile(join(cwd,'result.txt'),'updated');
+      }else{
+        assert.match(prompt,/Поточний запит користувача:\nВидали зайвий файл\nAcceptance criteria:/);
+        assert.match(prompt,/Попередні виконані запити[\s\S]*Онови результат/);
+        assert.equal(current,'updated');
+        await unlink(join(cwd,'obsolete.txt'));
+      }
+      return {text:'Правки внесено'};
+    }
+    await Promise.race([initial.promise,once(signal,'abort')]);
+    signal.throwIfAborted();
+    await writeFile(join(cwd,'result.txt'),'initial');
+    await writeFile(join(cwd,'obsolete.txt'),'old');
+    return {text:'Початковий проєкт готовий'};
+  });
+  t.after(()=>initial.resolve());
+  const main=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-write'}});
+  assert.equal(main.status,202);
+  const chat=projectId=>`/api/execution/project-chat?projectId=${encodeURIComponent(projectId)}`;
+  const url=chat(f.p.id), message={id:randomUUID(),text:'Онови результат'};
+  const sent=await f.call(url,'POST',message);
+  assert.equal(sent.status,202);
+  assert.equal(sent.value.messages[0].status,'queued');
+  assert.equal((await f.call(url,'POST',message)).value.messages.length,1);
+  assert.equal((await f.call(url,'POST',{id:randomUUID(),text:' '})).status,400);
+  assert.deepEqual((await f.call(chat(f.workspace.projects[1].id))).value.messages,[]);
+  initial.resolve();
+  let history;
+  await until(async()=>{
+    history=(await f.call(url)).value.messages;
+    assert.ok(['queued','running','completed'].includes(history[0].status),JSON.stringify(history[0]));
+    return history[0].status==='completed';
+  });
+  assert.equal(history[0].result,'Правки внесено');
+  assert.equal((await f.call(url,'POST',{id:randomUUID(),text:'Видали зайвий файл'})).status,202);
+  await until(async()=>{
+    history=(await f.call(url)).value.messages;
+    assert.ok(['queued','running','completed'].includes(history[1].status),JSON.stringify(history[1]));
+    return history[1].status==='completed';
+  });
+  assert.equal(calls.length,2);
+  const run=f.service.engine.run(main.value.id);
+  assert.equal(run.status,'completed');
+  assert.equal(await readFile(join(run.project.workspace,'result.txt'),'utf8'),'updated');
+  await assert.rejects(readFile(join(run.project.workspace,'obsolete.txt')),{code:'ENOENT'});
+  const runs=(await f.call('/api/execution/runs')).value;
+  assert.equal(runs.find(item=>item.id===main.value.id).kind,undefined);
+  assert.equal(runs.filter(item=>item.kind==='project-chat').length,2);
+  const saved=JSON.parse(await readFile(f.service.store.path,'utf8'));
+  assert.equal(saved.projectChats[f.p.id].length,2);
+});
+
+test('a failed isolated test returns to the agent and gates its dependency without user input',async t=>{
+  const file='tests/http.test.mjs',command='node --test '+file;
+  let calls=0,checks=0;
+  const f=await fixture(t,async(_agent,context)=>{
+    calls++;
+    if(calls===3)return {text:'Dependent task completed'};
+    if(calls===2)assert.match(context.prompt,/expected: 200.*actual: 500/);
+    await mkdir(join(context.cwd,'tests'),{recursive:true});
+    await writeFile(join(context.cwd,file),calls===1?'broken':'fixed');
+    throw Object.assign(Error('Worker loopback unavailable'),{code:'AGENT_BLOCKED',report:{status:'blocked',
+      summary:'Saved draft',files:[file],checks:[{command,required:true,status:'failed',details:'connect EACCES 127.0.0.1:5000'}]}});
+  },{testNode:async(cwd,files)=>{
+    checks++;
+    assert.deepEqual(files,[file]);
+    const fixed=await readFile(join(cwd,file),'utf8')==='fixed';
+    return {exitCode:fixed?0:1,output:fixed?'ok':'not ok 1\n  expected: 200\n  actual: 500'};
+  }});
+  const started=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-write'}});
+  assert.equal(started.status,202);
+  const run=f.service.engine.run(started.value.id);
+  await until(()=>run.status==='completed');
+  assert.equal(calls,3);
+  assert.equal(checks,2);
+  assert.ok(run.events.some(event=>event.type==='run.draft_recovery_started'));
+  assert.ok(run.events.some(event=>event.type==='task.host_verified'));
+});
+
 test('UI execution and recovery deadlines are opt-in and reported by the status endpoint',async t=>{
   assert.equal(executorConfig({}).timeoutMs,null);assert.equal(executorConfig({}).recoveryTimeoutMs,null);
   assert.equal(executorConfig({ORCHESTRATOR_EXECUTOR_TIMEOUT_MS:'600000'}).timeoutMs,600000);
@@ -41,6 +195,10 @@ test('UI execution and recovery deadlines are opt-in and reported by the status 
   const started=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-write'}});
   assert.equal(started.status,202);const run=f.service.engine.run(started.value.id);
   await until(()=>run.status==='completed');assert.equal(run.project.limits.timeoutMs,null);
+  const response=await f.call('/api/execution/notifications');
+  assert.equal(response.status,200);
+  assert.deepEqual(response.value.items.map(item=>item.kind),['stage','stage','completed']);
+  assert.equal(new Set(response.value.items.map(item=>item.id)).size,3);
 });
 
 test('a new project uses its selected folder for execution and static preview',async t=>{
@@ -82,6 +240,31 @@ test('a new project uses its selected folder for execution and static preview',a
   assert.equal(await page.text(),'<h1>Магазин</h1>');
   assert.equal((await fetch(new URL('.private.json',preview.value.url))).status,404);
   assert.equal((await f.call('/api/project-preview','POST',{projectId:project.id,url:'https://example.com'})).status,400);
+});
+
+test('execution resolves a matching MCP server from local settings and records its id',async t=>{
+  const observed=[];
+  const f=await fixture(t,async(_agent,context)=>{
+    observed.push(context);
+    if(observed.length===1)await writeFile(join(context.cwd,'package.json'),JSON.stringify({scripts:{test:'node --test'}}));
+    return {text:'done'};
+  });
+  const setting={id:'docs',terms:['integration docs'],url:'http://127.0.0.1:3000/mcp',tools:['search']};
+  await writeFile(join(f.dir,'data','task-extensions.json'),JSON.stringify({skills:[],mcpServers:[setting]}));
+  f.p.tasks[0].skills=['integration docs'];
+  assert.equal((await f.call('/api/workspace','PUT',{revision:1,workspace:f.workspace})).status,200);
+  const launch=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:f.p.revision,bindings:{backend:'codex-write'}});
+  assert.equal(launch.status,202);
+  const run=f.service.engine.run(launch.value.id);
+  await until(()=>['completed','failed'].includes(run.status));
+  assert.equal(run.status,'completed');
+  const mcp=observed.map(({mcpServers})=>mcpServers).filter(servers=>servers.length);
+  assert.deepEqual(mcp,[[{id:'docs',url:setting.url,tools:['search']}]]);
+  assert.equal(run.events.find(event=>event.type==='agent.extensions')?.message,'MCP дозволено: docs');
+  assert.match(observed[1].hooks[0].text,/npm run test/);
+  assert.ok(run.events.some(event=>event.type==='agent.started'&&Number.isFinite(event.timing?.queueMs)));
+  assert.ok(run.events.some(event=>event.type==='agent.completed'&&Number.isFinite(event.timing?.executionMs)));
+  assert.equal(run.calls,2);
 });
 
 test('saved Codex reasoning reaches the executor and unsupported levels stop before model invocation',async t=>{
@@ -133,6 +316,8 @@ test('browser pause drains work, resume starts dependencies and cancellation abo
   const f=await fixture(t,async(a,{signal})=>{started++;await new Promise((res,rej)=>{finish=res;signal.addEventListener('abort',()=>rej(signal.reason),{once:true});});return{text:'done'};});
   const {value:run}=await f.call('/api/execution/runs','POST',{projectId:f.p.id,revision:1,bindings:{backend:'codex-write'}});
   await until(()=>started===1);
+  const preview=await f.call('/api/project-preview','POST',{projectId:f.p.id,url:'http://127.0.0.1:3000/'});
+  assert.deepEqual(preview,{status:200,value:{url:'http://127.0.0.1:3000/'}});
   assert.equal((await f.call(`/api/execution/runs/${run.id}/pause`,'POST',{})).value.status,'paused');
   finish();await until(()=>f.service.engine.run(run.id).tasks[0].status==='completed');await delay(25);assert.equal(started,1);
   await f.call(`/api/execution/runs/${run.id}/resume`,'POST',{});await until(()=>started===2);

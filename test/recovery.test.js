@@ -21,7 +21,7 @@ async function fixture(t,{policy={enabled:true,maxAttempts:2},maxCalls=8,failCod
   const registry={snapshot:()=>({routes,connections:[]}),scan:async()=>registry.snapshot(),requireRoute:async id=>{
     const found=routes.find(r=>r.id===id);assert.ok(found,id);return {...found,command:'fixture-executable'};
   }};
-  const service=createExecutionService({directory:join(dir,'data'),workspaces:join(dir,'workspaces'),registry,provider:async(agent,ctx)=>{
+  const service=createExecutionService({directory:join(dir,'data'),workspaces:join(dir,'workspaces'),registry,reviewRuns:false,provider:async(agent,ctx)=>{
     if(ctx.prompt.includes('TaskBrief:')){
       managerCalls++;const brief=JSON.parse(ctx.prompt.split('TaskBrief: ')[1]);
       managerModels.push(agent.model);
@@ -508,6 +508,26 @@ for(const automatic of [false,true])test(`${automatic?'automatic':'one-click'} h
   assert.equal(f.invocations.filter(invocation=>invocation.id==='failed').length,1);
   assert.equal(f.run.tasks[1].outputs.at(-1).report.checks[0].source,'host');
   assert.equal(await readFile(join(f.run.project.workspace,'recovered.txt'),'utf8'),'checked draft');
+});
+
+test('automatic host verification runs again after clarification resets the attempt count',async t=>{
+  const command='npm run test:http';
+  let repairs=0;
+  const f=await fixture(t,{hostPolicy:{automatic:true,checks:{
+    [command]:{argv:['--eval',"require('node:assert/strict').equal(require('node:fs').readFileSync('recovered.txt','utf8'),'fixed')"]}
+  }},worker:async(_agent,ctx,id)=>{
+    if(id!=='failed')return {text:'Passed'};
+    await writeFile(join(ctx.cwd,'recovered.txt'),repairs++?'fixed':'broken');
+    const report={status:'blocked',summary:'Candidate',files:['recovered.txt'],
+      checks:[{command,status:'failed',required:true,details:'connect EACCES 127.0.0.1:30123'}]};
+    throw Object.assign(Error('Test environment unavailable'),{code:'AGENT_BLOCKED',report});
+  }});
+  await until(()=>f.run.events.some(event=>event.type==='task.host_verification_finished'));
+  const resume=await f.call(`/api/execution/runs/${f.run.id}/clarify`,'POST',{taskId:'b',answer:'Fix the saved draft.',scope:'task'});
+  assert.equal(resume.status,202,JSON.stringify(resume.value));
+  await until(()=>f.run.status==='completed');
+  assert.equal(f.run.events.filter(event=>event.type==='task.host_verification_started'&&event.automatic).length,2);
+  assert.equal(await readFile(join(f.run.project.workspace,'recovered.txt'),'utf8'),'fixed');
 });
 
 test('automatic host verification continues to the next draft after a failed check',async t=>{

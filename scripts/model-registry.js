@@ -79,7 +79,7 @@ export async function inspectCodex(command,{rpcFactory=metadataRpc,autoReloadDis
 
 export function createModelRegistry({store,env=process.env,find=locateCli,inspect=inspectCodex,inspectOpen=inspectOpenCode,inspectAgy=inspectAntigravity,run=runProcess}={}) {
   let scanning,refreshingAntigravity,refreshingOpenCode,internalCommands=new Map();
-  const subscriptionGuard=new SubscriptionGuard();
+  const subscriptionGuard=new SubscriptionGuard({intervalMs:15000});
   const currentRoute=r=>r?.backend==='codex'&&r.subscriptionGuard?{...r,subscriptionGuard:{...r.subscriptionGuard,autoReloadDisabled:r.subscriptionGuard.autoReloadDisabled===true&&env.ORCHESTRATOR_CODEX_AUTO_RELOAD_DISABLED==='1'}}:r;
   const snapshot=()=>{
     const value=store.data.catalog??{version:1,checkedAt:null,connections:[],routes:[]};
@@ -188,7 +188,7 @@ export function createModelRegistry({store,env=process.env,find=locateCli,inspec
 
 export function withModelPolicy(registry,provider) {
   const checks=(cwd,testFiles,options)=>sandboxChecks(cwd,testFiles,{...options,command:options?.command??registry.commandFor?.('codex')??process.env.ORCHESTRATOR_SANDBOX_COMMAND??process.env.ORCHESTRATOR_EXECUTOR_COMMAND??process.env.ORCHESTRATOR_PLANNER_COMMAND??'codex'});
-  const invoke=provider??((agent,context)=>agent.provider==='antigravity'?(agent.fileWorker?executeFileWorker(agent,context,{model:(a,c)=>executeAntigravity(a,c),checks}):executeAntigravity(agent,context)):agent.provider==='opencode'?(agent.fileWorker?executeFileWorker(agent,context,{checks}):executeOpenCode(agent,context)):execute(agent,context));
+  const invoke=provider??((agent,context)=>agent.provider==='antigravity'?(agent.fileWorker?executeFileWorker(agent,context,{model:(a,c,o)=>executeAntigravity(a,c,o),checks}):executeAntigravity(agent,context)):agent.provider==='opencode'?(agent.fileWorker?executeFileWorker(agent,context,{checks}):executeOpenCode(agent,context)):execute(agent,context));
   const run=(agent,context)=>{
     context.signal?.throwIfAborted();
     context.onInvoke?.();
