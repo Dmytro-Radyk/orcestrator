@@ -133,6 +133,52 @@ test('reported files cannot be silently discarded by a generated gitignore',asyn
   const run=f.start([task('a')]);await settled(run);assert.equal(run.status,'completed');assert.equal(await readFile(join(f.workspace,'result.txt'),'utf8'),'required');
 });
 
+test('a reported folder summarizes normal changes without force-adding ignored files',async t=>{
+  const f=await setup(t,async(a,ctx)=>{
+    await mkdir(join(ctx.cwd,'covers'));
+    await writeFile(join(ctx.cwd,'.gitignore'),'covers/*.tmp\n');
+    await writeFile(join(ctx.cwd,'covers','cover.jpg'),'cover');
+    await writeFile(join(ctx.cwd,'covers','scratch.tmp'),'scratch');
+    return {text:'done',report:{files:['covers/']}};
+  });
+  const run=f.start([task('a')]);
+  await settled(run);
+  assert.equal(run.status,'completed');
+  assert.equal(await readFile(join(f.workspace,'covers','cover.jpg'),'utf8'),'cover');
+  await assert.rejects(access(join(f.workspace,'covers','scratch.tmp')),{code:'ENOENT'});
+});
+
+test('local verification resumes a shared pipeline at its next agent before integration',async t=>{
+  const invoked=[];
+  const command='node --test tests/http.test.mjs';
+  const f=await setup(t,async(agent,{cwd,prompt})=>{
+    invoked.push(agent.id);
+    if(agent.id==='worker'){
+      await writeFile(join(cwd,'draft.txt'),'prepared');
+      throw Object.assign(Error('Loopback unavailable'),{code:'AGENT_BLOCKED',report:{status:'blocked',
+        summary:'Prepared checkout',files:['draft.txt'],checks:[{command,status:'failed',required:true,details:'EACCES 127.0.0.1'}]}});
+    }
+    assert.equal(await readFile(join(cwd,'draft.txt'),'utf8'),'prepared');
+    assert.match(prompt,/Prepared checkout/);
+    await writeFile(join(cwd,'review.txt'),'verified');
+    return {text:'Reviewed in the same worktree'};
+  });
+  const run=f.start([task('a',{agentIds:['worker','review'],mode:'pipeline'})]);
+  await settled(run);
+  const entry=f.engine.hostVerificationTask(run,'a');
+  assert.ok(entry);
+  const lease=await f.manager.resume(run,entry.workspace);
+  lease.files=entry.blockedReport.files;
+  const signal=new AbortController().signal;
+  const tree=await f.manager.candidateTree(lease,signal);
+  await f.engine.acceptHostVerification(run,entry,lease,tree,[{command,status:'passed',required:true,source:'host'}],signal);
+  await settled(run);
+  assert.equal(run.status,'completed');
+  assert.deepEqual(invoked,['worker','review']);
+  assert.ok(run.events.some(event=>event.type==='task.pipeline_step_verified'));
+  assert.equal(await readFile(join(f.workspace,'review.txt'),'utf8'),'verified');
+});
+
 test('cancellation retains partial changes only in the isolated candidate workspace',async t=>{
   let started=false;const f=await setup(t,async(a,ctx)=>{await writeFile(join(ctx.cwd,'partial.txt'),'partial');started=true;
     await new Promise((resolve,reject)=>ctx.signal.addEventListener('abort',()=>reject(ctx.signal.reason),{once:true}));});

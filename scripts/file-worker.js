@@ -1,13 +1,20 @@
 import { readdir,lstat,readFile,mkdir,writeFile,unlink,realpath,rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve,relative,isAbsolute,join,dirname,sep } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash,randomUUID } from 'node:crypto';
 import { runProcess } from '../src/providers.js';
+import { skillGuidance } from '../src/execution-context.js';
+import { unsafePathSegment } from '../src/workspaces.js';
 import { executeOpenCode,OPENCODE_HOME } from './opencode-service.js';
+import { ANTIGRAVITY_HOME } from './antigravity-service.js';
 
 const hash=b=>createHash('sha256').update(b).digest('hex');
 const sourceRoots=['src','app','apps','lib','tests','test','config'];
 const workerPromptBytes=48*1024;
-const denied=n=>/^(?:\.git|\.env(?:\..*)?|\.aws|\.codex|\.gemini|\.agents|node_modules)$/i.test(n)||/\.(?:pem|key|p12|pfx|db|sqlite(?:3|-wal|-shm)?|exe|dll)$/i.test(n);
+const denied=part=>{
+  const n=part.replace(/[. ]+$/,'');
+  return unsafePathSegment(part)||/^(?:\.git|\.env(?:\..*)?|\.aws|\.codex|\.gemini|\.agents|node_modules)$/i.test(n)||/\.(?:pem|key|p12|pfx|db|sqlite(?:3|-wal|-shm)?|exe|dll)$/i.test(n);
+};
 export function workerPath(root,path) {
   if(typeof path!=='string'||!path||path.length>240||/[\\\x00-\x1f:]/.test(path)||isAbsolute(path)||path.split('/').some(n=>!n||n==='.'||n==='..'||n.startsWith('-')||denied(n)))throw Error('Недопустимий шлях зміни');
   const actual=resolve(root,path),rel=relative(root,actual);if(!rel||rel==='..'||rel.startsWith(`..${sep}`)||isAbsolute(rel))throw Error('Файл виходить за межі worktree');return actual;
@@ -60,15 +67,15 @@ export async function applyWorkerChanges(root,changes) {
   return changes.map(c=>c.path);
 }
 
-export async function sandboxChecks(cwd,testFiles,{signal,access='workspace-write',command=process.env.ORCHESTRATOR_SANDBOX_COMMAND??process.env.ORCHESTRATOR_EXECUTOR_COMMAND??process.env.ORCHESTRATOR_PLANNER_COMMAND??'codex',run=runProcess}={}) {
+export async function sandboxChecks(cwd,testFiles,{signal,command=process.env.ORCHESTRATOR_SANDBOX_COMMAND??process.env.ORCHESTRATOR_EXECUTOR_COMMAND??process.env.ORCHESTRATOR_PLANNER_COMMAND??'codex',run=runProcess}={}) {
   const root=await realpath(cwd);const tests=[];
+  const tempRoot=await realpath(tmpdir()).catch(()=>resolve(tmpdir()));
   for(const path of testFiles){const actual=workerPath(root,path);await safeParents(root,actual);if(!/\.(?:[cm]?js|ts)$/.test(path)||!(await lstat(actual)).isFile())throw Error('Недопустимий файл перевірки');tests.push(path);}
   const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>/^(?:path|pathext|systemroot|windir|comspec|temp|tmp|localappdata|appdata|programfiles|programfiles\(x86\)|programdata|userprofile|lang|lc_all)$/i.test(key)));
-  const writable=access==='workspace-write';
-  const profile=`permissions.orcestrator_check={extends=":${writable?'workspace':'read-only'}",filesystem={":root"="deny",":minimal"="read",":workspace_roots"={"."="${writable?'write':'read'}"}},network={enabled=false}}`;
+  const profile=`permissions.orcestrator_check={extends=":read-only",filesystem={":root"="deny",":minimal"="read",":workspace_roots"={"."="read"}},network={enabled=false}}`;
   const args=['sandbox','-P','orcestrator_check','-C',root,'--include-managed-config','-c',profile,
     ...(process.platform==='win32'?['--enable','prefer_mxc','-c','windows.sandbox="elevated"']:[]),'--',process.execPath,
-    '--permission',`--allow-fs-read=${root}`,...(writable?[`--allow-fs-write=${root}`]:[]),'--preserve-symlinks','--preserve-symlinks-main','--test-isolation=none','--test-reporter=tap','--test','--', ...tests];
+    '--permission',`--allow-fs-read=${root}`,`--allow-fs-read=${tempRoot}`,`--allow-fs-write=${tempRoot}`,'--preserve-symlinks','--preserve-symlinks-main','--test-reporter=tap','--test','--', ...tests];
   try{
     const result=await run(command,args,{cwd:root,env,prompt:'',signal});
     const testsMatch=/^# tests\s+(\d+)/m.exec(result??'');
@@ -92,14 +99,13 @@ export async function executeFileWorker(agent,context,{model=executeOpenCode,che
 Для JS/TS коду потрібні реальні тести. testFiles — шляхи до Node.js тестів, команди не приймаються. Результати тестів не вигадуй: сервер запустить їх.
 Не викликай інструментів. Нижче наведено вибрані файли. Відсутність вмісту файлу не означає, що файл можна створити заново. Якщо для задачі потрібен пропущений файл, назви його шлях у звіті. Поверни один завершений текстовий JSON.
 ${context.canDelegate?'Можна status=delegated і subtasks:[{title,prompt,skills,agentIds:[]}]; тоді changes і testFiles мають бути порожніми.':'Делегування заборонене: status=delegated не допускається.'}
-${context.prompt}
-
-Файли з вмістом: `;
-  const focus=context.prompt.split('\nDependency results:\n')[0].toLowerCase();
-  const words=new Set(focus.match(/[a-z0-9]{3,}/g)??[]);
+${context.prompt}`;
+  const taskInstruction=context.review?`${context.prompt}\nНижче надано доступний вміст файлів. Назви матеріали, яких бракує для висновку.`:instruction;
+  const focus=(context.review?context.prompt:context.prompt.split('\nDependency results:\n')[0]).normalize('NFKC').toLowerCase();
+  const words=new Set(focus.match(/[\p{L}\p{N}]{3,}/gu)??[]);
   const ranked=files.map(file=>{
-    const path=file.path.toLowerCase();
-    const terms=new Set(path.match(/[a-z0-9]{3,}/g)??[]);
+    const path=file.path.normalize('NFKC').toLowerCase();
+    const terms=new Set(path.match(/[\p{L}\p{N}]{3,}/gu)??[]);
     const score=(focus.includes(path)?100:0)+[...terms].filter(word=>words.has(word)).length+
       (path==='package.json'||path==='readme.md'?2:0);
     return {file,score};
@@ -108,8 +114,12 @@ ${context.prompt}
   const paths=ranked.map(({file})=>file.path);
   const suffix='\nВиявлені шляхи у робочій папці: '+JSON.stringify(paths);
   const bytes=value=>Buffer.byteLength(JSON.stringify(value),'utf8')-2;
-  const fixed=bytes(instruction)+2+64;
-  if(fixed>workerPromptBytes)throw Object.assign(Error('Текст задачі перевищує бюджет контексту файлового виконавця'),{code:'WORKER_CONTEXT_TOO_LARGE'});
+  const fileLabel='\n\nФайли з вмістом: ';
+  const guidance=skillGuidance(context.skills,context.hooks);
+  const baseSize=bytes(taskInstruction+fileLabel)+2+64;
+  if(baseSize>workerPromptBytes)throw Object.assign(Error('Текст задачі перевищує бюджет контексту файлового виконавця'),{code:'WORKER_CONTEXT_TOO_LARGE'});
+  const includedGuidance=baseSize+bytes(guidance)<=workerPromptBytes*0.8?guidance:'';
+  const fixed=baseSize+bytes(includedGuidance);
   const index=fixed+bytes(suffix)<=workerPromptBytes?suffix:'';
   let available=workerPromptBytes-fixed-bytes(index);
   const selected=[];
@@ -119,14 +129,16 @@ ${context.prompt}
     selected.push(file);
     available-=size;
   }
-  const prompt=instruction+JSON.stringify(selected)+index;
-  const jobHome=join(OPENCODE_HOME,'jobs',hash(root).slice(0,24));
+  const prompt=taskInstruction+includedGuidance+fileLabel+JSON.stringify(selected)+index;
+  const baseHome=agent.provider==='antigravity'?ANTIGRAVITY_HOME:OPENCODE_HOME;
+  const jobHome=join(baseHome,'jobs',randomUUID());
   let output;
   try {
     output=await model({...agent,access:'read-only'},{...context,prompt},{home:jobHome});
   } finally {
     await rm(jobHome,{recursive:true,force:true}).catch(()=>{});
   }
+  if(context.review)return output;
   try {
   const value=JSON.parse(output.text.trim().replace(/^```(?:json)?\s*|\s*```$/g,''));
   if(typeof value.summary!=='string'||!value.summary.trim()||!['completed','blocked','failed','delegated'].includes(value.status))throw Error('Некоректний звіт файлового виконавця');
@@ -141,7 +153,7 @@ ${context.prompt}
   if(agent.access!=='workspace-write'&&value.changes?.length)throw Error('Read-only виконавець не може змінювати файли');
   if(!Array.isArray(value.testFiles)||value.testFiles.length>30||value.testFiles.some(p=>typeof p!=='string'))throw Error('Некоректний список перевірок');
   const changed=await applyWorkerChanges(root,value.changes??[]);context.signal.throwIfAborted();
-  const current=await workerContext(root),discovered=current.filter(f=>/\.(?:test|spec)\.[cm]?js$/.test(f.path)).map(f=>f.path);
+  const current=await workerContext(root),discovered=current.filter(f=>/\.(?:test|spec)\.(?:[cm]?js|ts)$/.test(f.path)).map(f=>f.path);
   const needsTests=changed.some(p=>/\.(?:[cm]?js|ts)$/.test(p))||(agent.access==='read-only'&&discovered.length>0);
   const testFiles=value.testFiles.length?value.testFiles:needsTests?discovered:[];
   const results=testFiles.length?[await checks(root,testFiles,{signal:context.signal,access:agent.access})]:[];

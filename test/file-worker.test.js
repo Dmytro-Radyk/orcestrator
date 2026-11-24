@@ -32,6 +32,18 @@ test('delegation is bounded and read-only file workers cannot apply changes',asy
   const value={status:'completed',summary:'x',changes:[{path:'file.txt',baseHash:null,content:'x'}],testFiles:[]};
   await assert.rejects(executeFileWorker({access:'read-only'},context,{model:async()=>({text:JSON.stringify(value)})}),/Read-only/);
 });
+test('file-worker self-review receives the reviewed files and never applies proposed edits',async t=>{
+  const cwd=await folder(t);
+  await writeFile(join(cwd,'candidate.mjs'),'export const answer=1;');
+  const verdict={approved:false,feedback:'Check the value.',changes:[{path:'candidate.mjs',baseHash:null,content:'edited'}]};
+  const result=await executeFileWorker({access:'read-only'},{cwd,review:'self',prompt:'Review candidate.mjs',signal:AbortSignal.timeout(10000)},
+    {model:async(agent,{prompt})=>{
+      assert.equal(agent.access,'read-only');assert.match(prompt,/export const answer=1;/);
+      return {text:JSON.stringify(verdict)};
+    },checks:()=>assert.fail('Review must not apply or test model-proposed edits')});
+  assert.equal(JSON.parse(result.text).approved,false);
+  assert.equal(await readFile(join(cwd,'candidate.mjs'),'utf8'),'export const answer=1;');
+});
 test('check runner requires a network-disabled OS sandbox, scoped Node permissions and no shell or credentials',async t=>{
   const cwd=await folder(t);await writeFile(join(cwd,'test.mjs'),'');let captured;
   const result=await sandboxChecks(cwd,['test.mjs'],{signal:AbortSignal.timeout(1000),command:'trusted-sandbox',run:async(command,args,options)=>{captured={command,args,options};return 'passed';}});
@@ -63,12 +75,14 @@ test('file worker keeps the full task before the most relevant files within the 
   await writeFile(join(cwd,'src','seo.mjs'),'export const sitemap = [];');
   const task='Додати SEO в src/seo.mjs.\nAcceptance criteria: sitemap, policies and funnel analytics.';
   let sent;
-  await executeFileWorker({access:'workspace-write'},{cwd,prompt:task,signal:AbortSignal.timeout(10000)},{model:async(_agent,{prompt})=>{
+  await executeFileWorker({access:'workspace-write'},{cwd,prompt:task,signal:AbortSignal.timeout(10000),
+    skills:[{id:'ux',text:'Keep the keyboard focus visible.'}]},{model:async(_agent,{prompt})=>{
     sent=prompt;
     return {text:JSON.stringify({status:'completed',summary:'Checked context',changes:[],testFiles:[]})};
   }});
   assert.ok(Buffer.byteLength(JSON.stringify({event:'user',message:{content:sent}})+'\n')<=48*1024);
   assert.ok(sent.indexOf(task)<sent.indexOf('Файли з вмістом:'));
+  assert.match(sent,/Keep the keyboard focus visible/);
   assert.match(sent,/export const sitemap = \[\];/);
   assert.match(sent,/Виявлені шляхи.*src\/fixture-0\.mjs/);
 });

@@ -15,6 +15,7 @@ export function validateProject(project) {
   assert(Array.isArray(project.agents) && project.agents.length, 'At least one agent is required');
   assert(Array.isArray(project.tasks) && project.tasks.length, 'At least one task is required');
   if(project.workspaceMode!==undefined)assert(['shared','isolated'].includes(project.workspaceMode),'Invalid workspace mode');
+  if(project.workspace!==undefined)assert(typeof project.workspace==='string'&&project.workspace.trim()&&project.workspace.length<=1024&&!/[\x00-\x1f]/.test(project.workspace),'Invalid project workspace');
   if(project.workspaceMode==='isolated')assert(typeof project.workspace==='string'&&project.workspace,'Isolated execution requires a workspace');
   if(project.recovery!==undefined){
     assert(project.recovery&&typeof project.recovery==='object'&&!Array.isArray(project.recovery)&&typeof project.recovery.enabled==='boolean','Invalid recovery policy');
@@ -47,6 +48,7 @@ export function validateProject(project) {
     if (a.access) assert(['read-only', 'workspace-write'].includes(a.access), 'Invalid agent access');
     if (a.reasoningEffort !== undefined) assert(typeof a.reasoningEffort === 'string' && a.reasoningEffort.length <= 40, 'Invalid reasoning effort');
     if (a.windowsSandbox !== undefined) assert(['elevated', 'unelevated'].includes(a.windowsSandbox), 'Invalid Windows sandbox mode');
+    if (a.outputSchema !== undefined) assert(typeof a.outputSchema === 'string' && a.outputSchema.length <= 1024 && !/^(?:\\\\|\/\/)|[\x00-\x1f]/.test(a.outputSchema), 'Invalid output schema path');
   }
   const tasks = new Map();
   for (const t of project.tasks) {
@@ -82,7 +84,7 @@ export function makeProject(input, previous) {
   const project = {
     ...input,
     id: previous?.id ?? id(), revision: (previous?.revision ?? 0) + 1,
-    limits: { concurrency: 4, maxCalls: 50, maxDepth: 2, maxTasks: 100, timeoutMs: null, maxOutputTokens: 4096, ...input.limits },
+    limits: { concurrency: 4, maxCalls: 50, maxDepth: 2, maxTasks: 100, timeoutMs: null, maxOutputTokens: 4096, ...previous?.limits, ...input.limits },
     tasks: (input.tasks ?? []).map(taskDefaults),
     updatedAt: new Date().toISOString()
   };

@@ -2,19 +2,34 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir,lstat,realpath,writeFile,readdir,mkdtemp,rm } from 'node:fs/promises';
 import { resolve,relative,isAbsolute,join,sep } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash,randomUUID } from 'node:crypto';
 
 const exec=promisify(execFile);
-const inside=(root,path)=>{const rel=relative(root,path);return Boolean(rel)&&rel!=='..'&&!rel.startsWith(`..${sep}`)&&!isAbsolute(rel);};
-const forbidden=p=>p.split(/[\\/]/).some(n=>/^(?:\.env(?:\..*)?|\.aws|\.codex|\.gemini|\.agents|node_modules)$/i.test(n))||/\.(?:pem|key|p12|pfx|sqlite(?:3|-wal|-shm)?|db)$/i.test(p);
+const samePath=(a,b)=>process.platform==='win32'?String(a).toLowerCase()===String(b).toLowerCase():a===b;
+const lockKey=value=>process.platform==='win32'?resolve(value).toLowerCase():resolve(value);
+const inside=(root,path)=>{
+  const a=process.platform==='win32'?resolve(root).toLowerCase():resolve(root);
+  const b=process.platform==='win32'?resolve(path).toLowerCase():resolve(path);
+  const rel=relative(a,b);
+  return Boolean(rel)&&rel!=='..'&&!rel.startsWith(`..${sep}`)&&!isAbsolute(rel);
+};
+export const unsafePathSegment=n=>/[. ]$/.test(n)||n.includes('~')||/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(n);
+const forbidden=p=>p.split(/[\\/]/).some(part=>{
+  const n=part.replace(/[. ]+$/,'');
+  return unsafePathSegment(part)||/^(?:\.env(?:\..*)?|\.aws|\.codex|\.gemini|\.agents|node_modules)$/i.test(n);
+})||/\.(?:pem|key|p12|pfx|sqlite(?:3|-wal|-shm)?|db)[. ]*$/i.test(p);
 export class WorkspaceConflict extends Error { constructor(message,candidateCommit){super(message);this.code='WORKSPACE_CONFLICT';if(candidateCommit)this.candidateCommit=candidateCommit;} }
 
 export class WorkspaceManager {
-  constructor(root,{allowedRoot,projectLocation}={}) {this.root=resolve(root);this.allowedRoot=allowedRoot&&resolve(allowedRoot);this.projectLocation=projectLocation;this.locks=new Map();}
+  constructor(root,{allowedRoot,projectLocation,forbiddenRoots=[]}={}) {
+    this.root=resolve(root);this.allowedRoot=allowedRoot&&resolve(allowedRoot);this.projectLocation=projectLocation;
+    this.forbiddenRoots=forbiddenRoots.map(p=>resolve(p));this.locks=new Map();
+  }
   async locked(key,fn) {
-    const previous=this.locks.get(key)??Promise.resolve();let release;const next=new Promise(r=>{release=r;});
-    this.locks.set(key,next);await previous.catch(()=>{});
-    try{return await fn();}finally{release();if(this.locks.get(key)===next)this.locks.delete(key);}
+    const normalized=lockKey(key);
+    const previous=this.locks.get(normalized)??Promise.resolve();let release;const next=new Promise(r=>{release=r;});
+    this.locks.set(normalized,next);await previous.catch(()=>{});
+    try{return await fn();}finally{release();if(this.locks.get(normalized)===next)this.locks.delete(normalized);}
   }
   async git(cwd,args,{signal,input,index,literalPathspecs=false}={}) {
     const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!/^GIT_/i.test(key)));
@@ -28,15 +43,42 @@ export class WorkspaceManager {
   }
   async assertBase(path, projectId) {
     const base=await realpath(path);
+    for(const blocked of this.forbiddenRoots){
+      const resolvedBlocked=await realpath(blocked).catch(()=>blocked);
+      if(samePath(base,resolvedBlocked)||inside(resolvedBlocked,base))throw Error('Workspace не може вказувати на службовий каталог оркестратора');
+    }
     const chosen=this.projectLocation?.(projectId);
-    if(chosen){if(base!==chosen)throw Error('Робочу папку проєкту переміщено або замінено');return base;}
+    if(chosen){
+      const resolvedChosen=await realpath(chosen);
+      if(!samePath(resolvedChosen,chosen)||!samePath(base,resolvedChosen))throw Error('Робочу папку проєкту переміщено або замінено');
+      return base;
+    }
     if(this.allowedRoot){await mkdir(this.allowedRoot,{recursive:true});const root=await realpath(this.allowedRoot);if(!inside(root,base))throw Error('Workspace виходить за межі керованих проєктів');}
     return base;
+  }
+  async resolveProjectWorkspace(project) {
+    const chosen=this.projectLocation?.(project.uiProjectId);
+    if(project.workspace)return this.assertBase(project.workspace,project.uiProjectId);
+    if(chosen)return this.assertBase(chosen,project.uiProjectId);
+    if(this.allowedRoot){
+      await mkdir(this.allowedRoot,{recursive:true});
+      const root=await realpath(this.allowedRoot);
+      const target=join(root,createHash('sha256').update(String(project.uiProjectId??project.id)).digest('hex').slice(0,24));
+      await mkdir(target,{recursive:true});
+      return this.assertBase(target,project.uiProjectId);
+    }
+    return resolve(process.cwd());
   }
   async safeTree(cwd) {
     const walk=async dir=>{for(const entry of await readdir(dir,{withFileTypes:true})) {
       if(entry.isSymbolicLink())throw Error('Symlink не допускається в результаті ізольованого виконавця');
-      if(entry.name==='.git'||entry.name==='node_modules'||/^\.env(?:\..*)?$/i.test(entry.name))continue;
+      const trimmed=entry.name.replace(/[. ]+$/,'');
+      if(trimmed.toLowerCase()==='.git'){
+        if(dir===cwd&&entry.name==='.git')continue;
+        throw Error('Вкладений або нестандартний каталог .git не допускається в результаті виконавця');
+      }
+      if(entry.name==='node_modules'||/^\.env(?:\..*)?$/i.test(trimmed))continue;
+      if(unsafePathSegment(entry.name))throw Error('Недопустиме ім’я файла або каталогу в робочій папці');
       const path=join(dir,entry.name);
       if(entry.isDirectory())await walk(path);
     }};await walk(cwd);
@@ -62,7 +104,7 @@ export class WorkspaceManager {
         await writeFile(join(base,'.git','info','exclude'),'\n.env*\nnode_modules/\n.codex/\n.aws/\n.agents/\n*.key\n*.pem\n*.p12\n*.pfx\n*.db\n*.sqlite*\n');
         await this.safeTree(base);await this.git(base,['add','--all']);await this.git(base,['commit','--allow-empty','-m','Initialize managed project']);
       }
-      if(await this.git(base,['rev-parse','--show-toplevel']).then(p=>resolve(p))!==resolve(base))throw Error('Некоректний корінь Git workspace');
+      if(!samePath(await this.git(base,['rev-parse','--show-toplevel']).then(p=>resolve(p)),resolve(base)))throw Error('Некоректний корінь Git workspace');
       if(await this.git(base,['status','--porcelain']))throw new WorkspaceConflict('Керована папка містить зміни поза запуском; збережіть їх перед виконанням');
       return this.create(base,base,run.id,task.id);
     });
@@ -78,10 +120,10 @@ export class WorkspaceManager {
     const base=await this.assertBase(run.project.workspace,run.project.uiProjectId),root=await realpath(this.root),cwd=await realpath(candidate.path);
     if(!inside(root,cwd))throw new WorkspaceConflict('Папка чернетки виходить за межі керованих worktree');
     return this.locked(base,async()=>{
-      if(resolve(await this.git(base,['rev-parse','--show-toplevel']))!==base||await this.git(base,['status','--porcelain']))throw new WorkspaceConflict('Прийнята папка змінилася перед уточненням');
+      if(!samePath(resolve(await this.git(base,['rev-parse','--show-toplevel'])),base)||await this.git(base,['status','--porcelain']))throw new WorkspaceConflict('Прийнята папка змінилася перед уточненням');
       const common=resolve(cwd,await this.git(cwd,['rev-parse','--git-common-dir']));
       const head=await this.git(cwd,['rev-parse','HEAD']);
-      if(common!==await realpath(join(base,'.git'))||resolve(await this.git(cwd,['rev-parse','--show-toplevel']))!==cwd||
+      if(!samePath(common,await realpath(join(base,'.git')))||!samePath(resolve(await this.git(cwd,['rev-parse','--show-toplevel'])),cwd)||
         await this.git(cwd,['branch','--show-current'])!==candidate.branch)throw new WorkspaceConflict('Чернетка не відповідає збереженій worktree');
       if(committed){
         if(await this.git(cwd,['status','--porcelain']))throw new WorkspaceConflict('Збережений результат змінено після конфлікту');
@@ -114,6 +156,7 @@ export class WorkspaceManager {
       if(tab<0)continue;
       const mode=entry.slice(0,entry.indexOf(' ')),path=entry.slice(tab+1);
       if(mode==='120000')throw Error('Symlink не допускається в результаті ізольованого виконавця');
+      if(!['100644','100755'].includes(mode))throw Error('Недопустимий режим Git-об’єкта в результаті ізольованого виконавця');
       if(forbidden(path))throw Error('Результат містить заборонений файл');
     }
   }
@@ -129,13 +172,21 @@ export class WorkspaceManager {
     await this.git(lease.cwd,['add','--all'],{signal,index});
     if(lease.files?.length){
       const safeFiles=[];
-      for(const path of lease.files) {
-        if(typeof path!=='string'||!path||forbidden(path)||path.split(/[\\/]/).some(n=>!n||n==='.'||n==='..'||n==='.git')||isAbsolute(path))throw Error('Недопустимий файл у звіті виконавця');
+      for(const reportedPath of lease.files) {
+        if(typeof reportedPath!=='string')throw Error('Недопустимий файл у звіті виконавця');
+        const directorySummary=/[\\/]$/.test(reportedPath);
+        const path=directorySummary?reportedPath.slice(0,-1):reportedPath;
+        if(!path||forbidden(path)||path.split(/[\\/]/).some(n=>!n||n==='.'||n==='..'||n.toLowerCase()==='.git')||isAbsolute(path))throw Error('Недопустимий файл у звіті виконавця');
         const target=resolve(lease.cwd,path);
         if(!inside(lease.cwd,target))throw Error('Недопустимий файл у звіті виконавця');
         const info=await lstat(target).catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+        if(info?.isSymbolicLink())throw Error('Symlink не допускається в результаті ізольованого виконавця');
+        // A directory summary only describes files already staged by normal Git rules.
+        if(directorySummary){
+          if(!info?.isDirectory())throw Error('Папка, вказана у звіті виконавця, відсутня');
+          continue;
+        }
         if(info){
-          if(info.isSymbolicLink())throw Error('Symlink не допускається в результаті ізольованого виконавця');
           if(!info.isFile())throw Error('Звіт виконавця може вказувати лише звичайні файли');
         }
         safeFiles.push(path);
@@ -179,7 +230,7 @@ export class WorkspaceManager {
     } finally {
       try {
         const actual=await realpath(path);
-        if(actual!==path||!inside(root,actual))throw new WorkspaceConflict('Робоча папка перевірки змінила шлях');
+        if(!samePath(actual,path)||!inside(root,actual))throw new WorkspaceConflict('Робоча папка перевірки змінила шлях');
         await this.locked(lease.repo,()=>this.git(lease.repo,['worktree','remove','--force',actual]));
       } catch(cleanupError) {
         if(!primaryError&&cleanupError.code==='WORKSPACE_CONFLICT')throw cleanupError;
