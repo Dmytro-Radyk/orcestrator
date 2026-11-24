@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { readJsonBody } from '../src/http-body.js';
 import { redactSecrets } from '../src/providers.js';
-import { inspectLocalPreview } from './storefront-browser.js';
+import { inspectLocalPreview } from './browser-cdp.js';
 import { managedCheckKind,validNodeTests } from './project-test-runtime.js';
 
 const inspectTool={

@@ -18,10 +18,10 @@ import { readJsonBody } from '../src/http-body.js';
 import { missingWorkerFileContext,reportNeedsCorrection,workspaceNeedsResolution,verificationBlockers,waitsForVerification } from '../src/execution-report.js';
 import { plannedCalls } from '../apps/web/src/call-budget.js';
 import { createHostVerifier } from './host-verifier.js';
-import { storefrontAcceptanceId } from '../src/storefront-quality.js';
+import { applyAcceptanceRoutingNeed, defaultDomainProfiles, findAcceptanceProfile } from '../src/domain-profiles.js';
 import { createProjectPreview, localPreviewUrl } from './project-preview.js';
 import { createTaskExtensions } from './task-extensions.js';
-import { auditStorefront } from './storefront-browser.js';
+import { createStorefrontVerifier } from './profiles/storefront/browser-audit.js';
 import { createProjectComputer } from './project-computer.js';
 import { localTestRuntime } from './project-test-runtime.js';
 import { createConnectionRecovery } from './connection-recovery.js';
@@ -74,13 +74,13 @@ export async function workspaceFiles(directory) {
   if(truncated)Object.defineProperty(result,'truncated',{value:true,enumerable:false});
   return result;
 }
-export function createExecutionService({directory=join(root,'ui'),workspaces=join(root,'workspaces'),config=executorConfig(),provider,registry:injectedRegistry,origin,reviewRuns=true,
+export function createExecutionService({directory=join(root,'ui'),workspaces=join(root,'workspaces'),config=executorConfig(),provider,registry:injectedRegistry,origin,reviewRuns=true,domainProfiles=defaultDomainProfiles,
   testNode=origin?localTestRuntime():null,hostVerifier=createHostVerifier(join(directory,'host-verification.json'),{testNode})}={}) {
   const store=new Store(directory);
   const projectPreview=createProjectPreview(directory,{previewRuntime:testNode?.preview});
   const projectComputer=createProjectComputer({origin,preview:projectPreview,testNode});
   const registry=injectedRegistry??createModelRegistry({store,env:{...process.env,ORCHESTRATOR_EXECUTOR_COMMAND:config.command}});
-  const director=createDirector({registry,provider});
+  const director=createDirector({registry,provider,domainProfiles});
   const connectionRecovery=origin?createConnectionRecovery():undefined;
   function reviewAuthors(run){
     const authorIds=new Set(run.tasks.filter(item=>!item.projectReview).flatMap(item=>item.assignedAgentIds??item.agentIds));
@@ -117,8 +117,11 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     const roots=run.tasks.filter(t=>!t.projectReview&&!t.parentId);
     return roots.length>0&&roots.every(t=>taskRequiresFree(run,t));
   }
+  const acceptanceVerifiers=Object.fromEntries(domainProfiles
+    .filter(profile=>profile.id==='storefront')
+    .map(profile=>[profile.id,createStorefrontVerifier({projectPreview,outputRoot:join(directory,'storefront-audits')})]));
   const engine=new Engine(store,withModelPolicy(registry,provider),{workspaces:new WorkspaceManager(join(workspaces,'.runs'),
-    {allowedRoot:workspaces,projectLocation,forbiddenRoots:[directory]}),maxIntegrationRetries:1,
+    {allowedRoot:workspaces,projectLocation,forbiddenRoots:[directory]}),maxIntegrationRetries:1,domainProfiles,acceptanceVerifiers,
     taskExtensions:createTaskExtensions(join(directory,'task-extensions.json'),{ensureConnection:connectionRecovery}),projectComputer,
     async selectProjectReviewer(run,task){
       const authors=reviewAuthors(run);
@@ -146,13 +149,6 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       const reviewer=projectReviewer(route);
       if(!run.project.agents.some(agent=>agent.id===reviewer.id))run.project.agents.push(reviewer);
       return reviewer;
-    },
-    async storefrontVerifier(run,cwd,signal){
-      const session=await projectPreview.open(run.project.uiProjectId,cwd,'http://127.0.0.1',{candidate:true});
-      if(!session.url)return {status:session.reason?'unavailable':'failed',
-        issues:[session.reason??'Копія не містить зібраної вітрини з index.html, яку можна відкрити в оркестраторі.']};
-      try{return await auditStorefront(session.url,{signal,output:join(directory,'storefront-audits',run.id)});}
-      finally{session.close();}
     }});
   const token=randomBytes(32).toString('hex');
   const launching=new Set();
@@ -558,7 +554,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
       if(!draft||draft.expiresAt<=Date.now())throw Error('Підбір команди застарів: повторіть його в майстрі');
       if(!p||store.data.ui?.workspace.projects.some(old=>old.id===p.id)||p.revision!==1||draft.proposal.planFingerprint!==planFingerprint(routingPlan(p)))throw Error('План змінився після підбору команди');
       await registry.scan();
-      validateRouteAssignments(draft.proposal,routingPlan(p),routingCandidates(routingPlan(p),registry.snapshot().routes,draft.proposal.requirements),{maxAgentsPerTask:draft.proposal.maxAgentsPerTask});
+      validateRouteAssignments(draft.proposal,routingPlan(p),routingCandidates(routingPlan(p),registry.snapshot().routes,draft.proposal.requirements,{domainProfiles}),{maxAgentsPerTask:draft.proposal.maxAgentsPerTask,domainProfiles});
       if(input.revision!==(store.data.ui?.revision??0))throw Error('Конфлікт збереження: оновіть сторінку, щоб отримати актуальні дані');
       if(draftProposals.get(input.routingDraftId)!==draft||draft.expiresAt<=Date.now())throw Error('Підбір команди застарів: повторіть його в майстрі');
       adopted={...draft.proposal,projectId:p.id,revision:p.revision};
@@ -617,7 +613,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
     if(hasActiveRun(p.id))throw new Error('Цей проєкт уже виконується або завершує скасування');
     const proposal=input.proposalId?storedRouting(p.id):null;
     if(input.proposalId&&(!proposal||proposal.id!==input.proposalId||proposal.revision!==p.revision||proposal.planFingerprint!==planFingerprint(routingPlan(p))))throw new Error('Пропозиція AI застаріла або не знайдена');
-    if(proposal)validateRouteAssignments(proposal,routingPlan(p),routingCandidates(routingPlan(p),registry.snapshot().routes,proposal.requirements),{maxAgentsPerTask:proposal.maxAgentsPerTask});
+    if(proposal)validateRouteAssignments(proposal,routingPlan(p),routingCandidates(routingPlan(p),registry.snapshot().routes,proposal.requirements,{domainProfiles}),{maxAgentsPerTask:proposal.maxAgentsPerTask,domainProfiles});
     const agents=[],tasks=[],seen=new Map();
     function bind(a,runtime) {
       if(!runtime)throw new Error(`Оберіть реального виконавця для ${a.name}`);
@@ -639,11 +635,12 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         });
       }
       if(!ids.length)throw Error('Призначте виконавців задач');
-      if(t.id===storefrontAcceptanceId&&(ids.length!==1||!agents.some(agent=>agent.id===ids[0]&&agent.access==='workspace-write'&&!agent.fileWorker)))
-        throw Error('Для браузерного приймання потрібен один виконавець із браузерними інструментами й доступом до запису');
+      const acceptanceProfile=findAcceptanceProfile(t.id,domainProfiles);
+      if(acceptanceProfile&&(ids.length!==1||!agents.some(agent=>agent.id===ids[0]&&agent.access==='workspace-write'&&!agent.fileWorker)))
+        throw Error(acceptanceProfile.launchRuntimeError??'Для браузерного приймання потрібен один виконавець із інструментами й доступом до запису');
       tasks.push({id:t.id,title:t.title,prompt:t.prompt,skills:t.skills??[],agentIds:ids,dependsOn:t.dependsOn,...(reviewRuns?{selfReview:true}:{}),
         acceptanceCriteria:t.acceptanceCriteria??[],mode:t.mode??'pipeline',
-        allowDelegation:t.id!==storefrontAcceptanceId&&p.allowDelegation!==false&&t.allowDelegation!==false});
+        allowDelegation:!acceptanceProfile&&p.allowDelegation!==false&&t.allowDelegation!==false});
     }
     const requirements=structuredClone(proposal?.requirements??{});
     const allFree=Boolean(p.planning?.freeWorkers)||(tasks.length>0&&tasks.every(task=>
@@ -767,8 +764,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
         if(input.requirements!==undefined&&(!input.requirements||typeof input.requirements!=='object'||Array.isArray(input.requirements)||Object.keys(input.requirements).some(id=>!input.plan.tasks.some(t=>t.id===id))))throw Error('Некоректні вимоги задач');
         if(routingControls.has(draftRoutingKey))throw Error('Підбір команди в майстрі вже триває');
         const plan=routingPlan({name:input.name,description:input.description,tasks:input.plan.tasks});
-        const requirements=Object.fromEntries(plan.tasks.map(t=>[t.id,{workspaceWrite:true,...input.requirements?.[t.id],
-          ...(t.id===storefrontAcceptanceId?{workspaceWrite:true,tools:true}:{})}]));
+        const requirements=Object.fromEntries(plan.tasks.map(t=>[t.id,applyAcceptanceRoutingNeed(t.id,{workspaceWrite:true,...input.requirements?.[t.id]},domainProfiles)]));
         const controller=new AbortController();routingControls.set(draftRoutingKey,controller);
         res.on('close',()=>{if(!res.writableEnded)controller.abort();});
         try{
@@ -792,8 +788,7 @@ export function createExecutionService({directory=join(root,'ui'),workspaces=joi
           if(input.requirements!==undefined&&(!input.requirements||typeof input.requirements!=='object'||Array.isArray(input.requirements)||
             Object.keys(input.requirements).some(id=>!plan.tasks.some(t=>t.id===id))))throw new Error('Некоректні вимоги задач');
           // Project execution writes files by default; text-only routes require explicit task requirements.
-          const requirements=Object.fromEntries(plan.tasks.map(t=>[t.id,{workspaceWrite:true,...input.requirements?.[t.id],
-            ...(t.id===storefrontAcceptanceId?{workspaceWrite:true,tools:true}:{})}]));
+          const requirements=Object.fromEntries(plan.tasks.map(t=>[t.id,applyAcceptanceRoutingNeed(t.id,{workspaceWrite:true,...input.requirements?.[t.id]},domainProfiles)]));
           const controller=new AbortController();routingControls.set(p.id,controller);
           res.on('close',()=>{if(!res.writableEnded)controller.abort();});
           try {

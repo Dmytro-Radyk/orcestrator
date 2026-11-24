@@ -4,7 +4,7 @@ import { id, assert, makeProject, selectAgents, taskDefaults, validateProject } 
 import { dependencyHandoff,workerHandoff } from './execution-context.js';
 import { execute,codexUsageLimitMessage } from './providers.js';
 import { executionReportInstructions,reportNeedsCorrection,workspaceNeedsResolution,verificationBlockers,waitsForVerification } from './execution-report.js';
-import { storefrontAcceptanceId } from './storefront-quality.js';
+import { defaultDomainProfiles, findAcceptanceProfile } from './domain-profiles.js';
 import { fileURLToPath } from 'node:url';
 const reviewSchema=fileURLToPath(new URL('../scripts/schemas/review.json',import.meta.url));
 
@@ -28,7 +28,7 @@ function unblockTasks(tasks,reset) {
   }}while(changed);
 }
 export class Engine {
-  constructor(store, provider = execute, {workspaces,recover,maxIntegrationRetries=0,taskExtensions,storefrontVerifier,projectComputer,selectProjectReviewer}={}) {
+  constructor(store, provider = execute, {workspaces,recover,maxIntegrationRetries=0,taskExtensions,domainProfiles=defaultDomainProfiles,acceptanceVerifiers,storefrontVerifier,projectComputer,selectProjectReviewer}={}) {
     this.store = store;
     this.provider = provider;
     this.controls = new Map();
@@ -37,7 +37,8 @@ export class Engine {
     this.workspaces=workspaces;this.recover=recover;this.maxIntegrationRetries=maxIntegrationRetries===1?1:0;this.listeners=new Set();
     this.taskExtensions=taskExtensions;
     this.projectComputer=projectComputer;
-    this.storefrontVerifier=storefrontVerifier;
+    this.domainProfiles=domainProfiles;
+    this.acceptanceVerifiers={...(storefrontVerifier?{storefront:storefrontVerifier}:{}),...(acceptanceVerifiers??{})};
     this.selectProjectReviewer=selectProjectReviewer;
   }
   createProject(input) {
@@ -303,8 +304,9 @@ export class Engine {
     }
     const summary=testCompletion?'Чернетку прийнято для тестового запуску. Перевірки реального запуску відкладено.':task.blockedReport.summary;
     const report={...task.blockedReport,status:'completed',summary,checks};
-    if(task.id===storefrontAcceptanceId){
-      const audit=await this.verifyStorefront(run,task,lease,verifiedTree,signal);
+    const acceptanceProfile=findAcceptanceProfile(task.id,this.domainProfiles);
+    if(acceptanceProfile){
+      const audit=await this.verifyDomainAcceptance(run,task,acceptanceProfile,lease,verifiedTree,signal);
       if(audit.status!=='passed')throw Error(audit.issues.join(' '));
       assert(this.hostVerificationTask(run,task.id)===task,'Чернетка більше не очікує перевірки');
     }
@@ -629,12 +631,13 @@ export class Engine {
     parent.status = 'waiting_children';
     this.event(run, 'task.delegated', { taskId: parent.id, childIds: children.map(t => t.id) });
   }
-  async verifyStorefront(run,task,lease,tree,signal) {
-    const audit=this.storefrontVerifier
-      ? await this.workspaces.verifyTree(lease,tree,cwd=>this.storefrontVerifier(run,cwd,signal),signal)
+  async verifyDomainAcceptance(run,task,profile,lease,tree,signal) {
+    const verifier=Object.hasOwn(this.acceptanceVerifiers,profile.id)?this.acceptanceVerifiers[profile.id]:undefined;
+    const audit=verifier
+      ? await this.workspaces.verifyTree(lease,tree,cwd=>verifier(run,cwd,signal),signal)
       : {status:'unavailable',issues:['Незалежний браузерний верифікатор не налаштовано.']};
-    const summary=audit.surfaces?.map(({width,models,uniqueImages})=>`${width} px · Моделі: ${models} · Унікальні фото: ${uniqueImages}`).join('\n');
-    this.event(run,'task.storefront_audit',{taskId:task.id,status:audit.status,surfaces:audit.surfaces,
+    const summary=profile.formatAuditSummary?.(audit);
+    this.event(run,profile.auditEventType??'task.domain_audit',{taskId:task.id,status:audit.status,surfaces:audit.surfaces,
       message:[...audit.issues,summary].filter(Boolean).join('\n')||'Незалежна браузерна перевірка пройшла.'});
     return audit;
   }
@@ -648,25 +651,26 @@ export class Engine {
       delete task.resumeWorkspace;delete task.resumeFiles;control.taskWorkspaces.set(task.id,lease);
       task.workspace={path:lease.cwd,branch:lease.branch,baseCommit:lease.baseCommit,...(lease.conflicts?.length?{conflicts:lease.conflicts}:{})};this.event(run,'workspace.ready',{taskId:task.id,...task.workspace});
     }
-    let retriedStorefront=false;
+    let retriedAcceptance=false;
     try {for(let integrationAttempt=0;;integrationAttempt++){
       await this.workInWorkspace(run,task,{continuedDraft});
       if(task.status!=='running'||run.status==='cancelled')return;
       const lease=control.taskWorkspaces.get(task.id);
       const signal=AbortSignal.any([control.controller.signal,control.taskControllers.get(task.id).signal]);signal.throwIfAborted();
       let verifiedTree;
-      if(task.id===storefrontAcceptanceId){
-        if(!lease)throw Object.assign(Error('Приймання вітрини потребує ізольованої робочої копії.'),{code:'AGENT_BLOCKED'});
+      const acceptanceProfile=findAcceptanceProfile(task.id,this.domainProfiles);
+      if(acceptanceProfile){
+        if(!lease)throw Object.assign(Error(acceptanceProfile.isolatedLeaseError??'Приймання потребує ізольованої робочої копії.'),{code:'AGENT_BLOCKED'});
         verifiedTree=await this.workspaces.candidateTree(lease,signal);
-        let audit=await this.verifyStorefront(run,task,lease,verifiedTree,signal);
-        if(audit.status==='failed'&&!retriedStorefront&&run.calls<run.project.limits.maxCalls){
-          retriedStorefront=true;
-          this.event(run,'task.storefront_evidence_retry',{taskId:task.id,message:'Виконавцю передано дефекти незалежної браузерної перевірки.'});
-          await this.workInWorkspace(run,task,{continuedDraft:true,storefrontIssues:audit.issues});
+        let audit=await this.verifyDomainAcceptance(run,task,acceptanceProfile,lease,verifiedTree,signal);
+        if(audit.status==='failed'&&!retriedAcceptance&&run.calls<run.project.limits.maxCalls){
+          retriedAcceptance=true;
+          this.event(run,acceptanceProfile.retryEventType??'task.domain_evidence_retry',{taskId:task.id,message:acceptanceProfile.retryMessage??'Виконавцю передано дефекти незалежної перевірки.'});
+          await this.workInWorkspace(run,task,{continuedDraft:true,acceptanceIssues:audit.issues});
           signal.throwIfAborted();
           if(task.status!=='running'||run.status==='cancelled')return;
           verifiedTree=await this.workspaces.candidateTree(lease,signal);
-          audit=await this.verifyStorefront(run,task,lease,verifiedTree,signal);
+          audit=await this.verifyDomainAcceptance(run,task,acceptanceProfile,lease,verifiedTree,signal);
         }
         if(audit.status!=='passed')throw Object.assign(
           Error(audit.issues.join(' ')+' Чернетку збережено.'),
@@ -701,7 +705,7 @@ export class Engine {
       return;
     }}finally{control.taskWorkspaces.delete(task.id);}
   }
-  async workInWorkspace(run, task, {continuedDraft=false,storefrontIssues=[]}={}) {
+  async workInWorkspace(run, task, {continuedDraft=false,acceptanceIssues=[]}={}) {
     if(task.projectReview){
       const agent=await this.selectProjectReviewer?.(run,task);
       assert(agent,'Немає доступної окремої моделі для фінального рев’ю');
@@ -721,7 +725,7 @@ export class Engine {
     const isolated=run.project.workspaceMode==='isolated';
     const dependencies = run.tasks.filter(t => task.dependsOn.includes(t.id)).map(t=>dependencyHandoff(t,isolated));
     const children = run.tasks.filter(t => t.parentId === task.id);
-    const prompt = `Project: ${run.project.name}\nGoal: ${run.project.goal ?? ''}\nTask: ${task.title}\n${task.prompt}\nAcceptance criteria:\n${JSON.stringify(task.acceptanceCriteria ?? [])}\nDependency results:\n${JSON.stringify(dependencies)}\n${continuedDraft?'This worktree contains a saved draft from an earlier attempt. Inspect the existing changes, build on them, and rerun the required checks.\n':''}${storefrontIssues.length?'Виправ дефекти незалежної браузерної перевірки в поточній робочій папці:\n'+storefrontIssues.join('\n')+'\n':''}${task.review ? `Previous review feedback: ${JSON.stringify(task.review)}\n` : ''}${task.integrationContext?'Integration reconciliation:\n'+JSON.stringify(task.integrationContext)+'\n':''}`;
+    const prompt = `Project: ${run.project.name}\nGoal: ${run.project.goal ?? ''}\nTask: ${task.title}\n${task.prompt}\nAcceptance criteria:\n${JSON.stringify(task.acceptanceCriteria ?? [])}\nDependency results:\n${JSON.stringify(dependencies)}\n${continuedDraft?'This worktree contains a saved draft from an earlier attempt. Inspect the existing changes, build on them, and rerun the required checks.\n':''}${acceptanceIssues.length?'Виправ дефекти незалежної браузерної перевірки в поточній робочій папці:\n'+acceptanceIssues.join('\n')+'\n':''}${task.review ? `Previous review feedback: ${JSON.stringify(task.review)}\n` : ''}${task.integrationContext?'Integration reconciliation:\n'+JSON.stringify(task.integrationContext)+'\n':''}`;
     if (children.length) {
       const output = await this.invokeWorker(run, task, team[0], `${prompt}\nCombine child results into a final answer:\n${JSON.stringify(children.map(t=>dependencyHandoff(t,isolated)))}`,{canDelegate:false});
       task.result = output.text;

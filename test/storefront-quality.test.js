@@ -5,6 +5,38 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProjectPreview } from '../scripts/project-preview.js';
 import { auditStorefront, storefrontBrowser } from '../scripts/storefront-browser.js';
+import { generatePlanning } from '../scripts/planning-service.js';
+import { storefrontAcceptanceId } from '../src/profiles/storefront/quality.js';
+
+test('storefront domain profile is optional and can be omitted cleanly in planning', async () => {
+  const rawPlan = {
+    summary: 'Компактний каталог товарів',
+    assumptions: ['Локальні дані'],
+    risks: ['Немає бекенду'],
+    tasks: [{
+      id: 'catalog-ui',
+      title: 'Каталог товарів',
+      prompt: 'Створи інтерфейс каталогу',
+      skills: ['frontend'],
+      dependsOn: [],
+      acceptanceCriteria: ['Картки відображаються']
+    }]
+  };
+  const cfg = { configured: true, label: 'mock', provider: 'responses', agent: { provider: 'responses', model: 'mock' } };
+  const brief = { name: 'Онлайн магазин смартфонів', description: 'Інтернет-магазин телефонів' };
+
+  const withoutProfiles = await generatePlanning('plan', brief, cfg, async (_agent, { prompt }) => {
+    assert.doesNotMatch(prompt, /СТАНДАРТ ВІТРИНИ/);
+    return { text: JSON.stringify(rawPlan) };
+  }, undefined, { domainProfiles: [] });
+  assert.deepEqual(withoutProfiles.value.tasks.map(t => t.id), ['catalog-ui']);
+
+  const withDefaultProfile = await generatePlanning('plan', brief, cfg, async (_agent, { prompt }) => {
+    assert.match(prompt, /СТАНДАРТ ВІТРИНИ/);
+    return { text: JSON.stringify(rawPlan) };
+  });
+  assert.deepEqual(withDefaultProfile.value.tasks.map(t => t.id), ['catalog-ui', storefrontAcceptanceId]);
+});
 
 test('a configured server preview is never launched from a candidate worktree', async t=>{
   const directory=await mkdtemp(join(tmpdir(),'storefront-preview-'));

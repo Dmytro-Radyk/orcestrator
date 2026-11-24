@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { redactSecrets, runProcess, terminate } from '../src/providers.js';
 import { resolveProjectRuntime } from './project-runtime-profile.js';
+import { resolveIsolatedCompanionFile } from '../src/domain-profiles.js';
 
 export const nodeTestPath=/^(?:tests?|src)\/(?:[\w-]+\/)*[\w.-]+\.(?:test|spec)\.(?:[cm]?js|ts)$/;
 export const managedCheckKind=file=>/^scripts\/check-[a-z0-9-]+-browser\.mjs$/.test(file)?'browser':
@@ -208,7 +209,8 @@ export function localTestRuntime(env=process.env,{run=runProcess}={}) {
   testNode.script=async(cwd,file,signal)=>{
     const mode=managedCheckKind(file);
     if(!mode)throw Error('Вкажіть підтримуваний сценарій Chromium або PostgreSQL.');
-    const app=file==='scripts/test-storefront-postgres.mjs'&&existsSync(join(cwd,'src/server.mjs'))?'src/server.mjs':null;
+    const companion=resolveIsolatedCompanionFile(file);
+    const app=companion&&existsSync(join(cwd,companion))?companion:null;
     const files=app?[file,app]:[file];
     const runtime=await resolveProjectRuntime(cwd,{includePostgres:true});
     const image=await prepare(signal,runtime);
