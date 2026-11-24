@@ -30,21 +30,44 @@ async function until(predicate) {
 }
 const finished = run => !['running', 'paused'].includes(run.status);
 
-test('storefront evidence gets one automatic repair before blocking publication', async t => {
+test('storefront browser failure sends the defects for one automatic repair before blocking publication', async t => {
   const prompts=[];
   const engine=fixture(t,async(_agent,{prompt})=>{
     prompts.push(prompt);
     return {text:'Draft only',report:{status:'completed',summary:'Draft only',files:[],checks:[]}};
   });
-  engine.workspaces={prepare:async()=>({cwd:process.cwd()}),publish:async()=>assert.fail('Evidence must be checked before publishing')};
+  engine.storefrontVerifier=async()=>({status:'failed',issues:['Потрібні різні фото']});
+  engine.workspaces={prepare:async()=>({cwd:process.cwd()}),candidateTree:async()=>'tree',
+    verifyTree:async(lease,tree,verify)=>verify(lease.cwd),publish:async()=>assert.fail('Evidence must be checked before publishing')};
   const project=engine.createProject({name:'Storefront',workspace:process.cwd(),workspaceMode:'isolated',
     agents,tasks:[task('storefront-acceptance',{agentIds:['dev']})]});
   const run=engine.start(project.id);
   await until(()=>finished(run));
   assert.equal(run.status,'blocked');
   assert.equal(run.calls,2);
-  assert.match(prompts[1],/Виправ тільки відсутні докази/);
+  assert.match(prompts[1],/Потрібні різні фото/);
   assert.equal(run.events.filter(event=>event.type==='task.storefront_evidence_retry').length,1);
+});
+
+test('storefront publishes only the Git tree that passed the independent check', async t=>{
+  let calls=0,published;
+  const engine=fixture(t,async()=>{calls++;return {text:'Draft ready'};});
+  const lease={cwd:process.cwd()};
+  engine.workspaces={prepare:async()=>lease,candidateTree:async()=>`tree-${calls}`,
+    verifyTree:async(_lease,tree,verify)=>verify(tree),publish:async(_lease,_signal,{verifiedTree})=>{
+      published=verifiedTree;
+      return {commit:'accepted'};
+    }};
+  engine.storefrontVerifier=async(_run,tree)=>tree==='tree-1'
+    ?{status:'failed',issues:['Зламане фото']}
+    :{status:'passed',issues:[]};
+  const project=engine.createProject({name:'Storefront',workspace:process.cwd(),workspaceMode:'isolated',
+    agents,tasks:[task('storefront-acceptance',{agentIds:['dev']})]});
+  const run=engine.start(project.id);
+  await until(()=>finished(run));
+  assert.equal(run.status,'completed');
+  assert.equal(published,'tree-2');
+  assert.deepEqual(run.events.filter(event=>event.type==='task.storefront_audit').map(event=>event.status),['failed','passed']);
 });
 
 test('completed worktree context keeps summaries, file references and checks without command logs',()=>{
@@ -218,6 +241,34 @@ test('restart marks unfinished work interrupted instead of replaying edits', t =
   const run = engine.start(project.id);
   const recovered = new Store(engine.store.directory).data.runs[run.id];
   assert.equal(recovered.status, 'interrupted');
+});
+
+test('restart resumes from a clean checkpoint and leaves an interrupted writer untouched', async t => {
+  const engine=fixture(t);
+  const project=engine.createProject({name:'Checkpoint',workspaceMode:'isolated',workspace:engine.store.directory,
+    agents:[agents[0]],tasks:[task('done'),task('remaining',{dependsOn:['done']})]});
+  const snapshot={id:'checkpoint',projectId:project.id,project,status:'running',calls:1,
+    events:[{id:1,type:'task.completed',taskId:'done'}],tasks:[
+      {...project.tasks[0],status:'completed',depth:0,outputs:[],attempts:1,result:'Integrated'},
+      {...project.tasks[1],status:'pending',depth:0,outputs:[],attempts:0}
+    ]};
+  engine.store.data.runs.checkpoint=snapshot;
+  engine.store.data.runs.unfinished={...structuredClone(snapshot),id:'unfinished'};
+  engine.store.data.runs.unfinished.tasks[1].status='running';
+  engine.store.save();
+  const calls=[];
+  const restarted=new Engine(new Store(engine.store.directory),async(_agent,{prompt})=>{
+    calls.push(prompt);return {text:'Resumed'};
+  },{workspaces:{prepare:async()=>({cwd:engine.store.directory}),publish:async()=>({commit:'fixture',changed:true})}});
+  const recovered=restarted.run('checkpoint');
+  assert.equal(restarted.resumeCheckpoint(restarted.run('unfinished')),false);
+  assert.equal(restarted.resumeCheckpoint(recovered),true);
+  await until(()=>finished(recovered));
+  assert.equal(recovered.status,'completed');
+  assert.equal(recovered.tasks[0].result,'Integrated');
+  assert.equal(recovered.calls,2);
+  assert.equal(calls.length,1);
+  assert.match(calls[0],/Task: remaining/);
 });
 
 test('execution has no default deadline, accepts an explicit timeout and rejects invalid values',async t=>{

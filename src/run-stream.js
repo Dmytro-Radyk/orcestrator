@@ -28,7 +28,7 @@ export function streamRun(engine,run,req,res,{present=async r=>r,onClose=()=>{},
       ...(['task.delegated','recovery.applied','task.host_verified'].includes(event.type)?{tasks:run.tasks}:{}),cursor:event.id},event.id);
     void finish();
   });
-  send('snapshot',{run:{...run,...meta()},cursor:run.events.length},run.events.length);
+  send('snapshot',{run:{...run,...meta(),...(after>0?{events:run.events.slice(0,after)}:{})},cursor:after>0?after:run.events.length},after>0?after:run.events.length);
   if(after>0)for(let i=after;i<run.events.length&&!closed;i++)send('replay',{event:run.events[i],cursor:i+1},i+1);
   void finish();return close;
 }

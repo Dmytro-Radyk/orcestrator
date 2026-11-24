@@ -1,15 +1,17 @@
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { normalizeReportChecks } from './execution-report.js';
+import { skillGuidance } from './execution-context.js';
 
 const OUTPUT_LIMIT = 4 * 1024 * 1024;
 export const codexUsageLimitMessage=message=>/^(?:Codex:\s*)?You[’']ve hit your usage limit\b/i.test(message??'');
 
 export function redactSecrets(text, limit = 2000) {
   return String(text ?? '')
-    .replace(/\b(?:sk-(?:proj-|ant-)?[\w-]{8,}|gh[pousr]_[\w]+|github_pat_[\w]+|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b/g, '[redacted]')
+    .replace(/\b(?:sk-(?:proj-|ant-)?[\w-]{8,}|gh[pousr]_[\w]+|github_pat_[\w]+|glpat-[\w-]{12,}|npm_[\w]{16,}|AIza[\w-]{20,}|AKIA[0-9A-Z]{16}|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b/g, '[redacted]')
     .replace(/\b(Bearer\s+)\S+/gi, '$1[redacted]')
-    .replace(/\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|secret)\s*[=:]\s*)\S+/gi, '$1[redacted]')
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:)[^@\s/]+@/gi, '$1[redacted]@')
+    .replace(/(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|secret)["']?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[redacted]')
     .slice(0, limit);
 }
 
@@ -59,7 +61,7 @@ export function runProcess(command, args, { prompt, cwd, signal, onLine, env }) 
       if (onLine && pending && !failure) { try { onLine(pending); } catch(error) { failure ??= error; } }
       if (failure) reject(failure);
       else if (code !== 0) {
-        const error = new Error(`CLI exited with code ${code}: ${redactSecrets(stderr.slice(-2000), 2000)}`);
+        const error = new Error(`CLI exited with code ${code}: ${redactSecrets(stderr.slice(-8192), 2000)}`);
         error.stdout = stdout; error.exitCode = code; reject(error);
       } else resolve(stdout.trim());
     };
@@ -118,7 +120,7 @@ async function api(agent, prompt, signal, maxOutputTokens) {
   return { text, usage: data.usage ?? null };
 }
 
-export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onEvent,canDelegate }) {
+export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onEvent,canDelegate,skills,hooks,mcpServers=[] }) {
   if (agent.provider === 'demo') {
     await delay(30, undefined, { signal });
     return { text: `[DEMO — no model called] ${agent.name ?? agent.id}: ${prompt.slice(0, 180)}`, usage: null };
@@ -127,6 +129,14 @@ export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onE
   let command, args;
   if (agent.provider === 'codex') {
     command = agent.command ?? 'codex';
+    const extensions=mcpServers.flatMap(({id,url,tools,timeoutSeconds})=>{
+      if(!/^[a-zA-Z0-9_-]{1,64}$/.test(id))throw new Error('Invalid MCP server identifier');
+      return [
+        '-c',`mcp_servers.${id}.url=${JSON.stringify(url)}`,
+        '-c',`mcp_servers.${id}.enabled_tools=${JSON.stringify(tools)}`,
+        ...(Number.isSafeInteger(timeoutSeconds)&&timeoutSeconds>0?['-c',`mcp_servers.${id}.tool_timeout_sec=${timeoutSeconds}`]:[])
+      ];
+    });
     args = ['exec', '--json', '--sandbox', agent.access ?? 'read-only', '--skip-git-repo-check', '--color', 'never',
       ...(agent.subscriptionOnly?['-c','forced_login_method="chatgpt"','-c','model_provider="openai"']:[]),
       ...(agent.model ? ['--model', agent.model] : []),
@@ -134,7 +144,8 @@ export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onE
       ...(agent.outputSchema ? ['--output-schema', agent.outputSchema] : []),
       ...(agent.ephemeral ? ['--ephemeral'] : []),
       ...(agent.ignoreUserConfig||agent.subscriptionOnly ? ['--ignore-user-config'] : []),
-      ...(agent.windowsSandbox ? ['-c', `windows.sandbox=${JSON.stringify(agent.windowsSandbox)}`, '--enable', 'prefer_mxc'] : []), '-'];
+      ...(agent.windowsSandbox ? ['-c', `windows.sandbox=${JSON.stringify(agent.windowsSandbox)}`, '--enable', 'prefer_mxc'] : []), ...extensions, '-'];
+    prompt+=skillGuidance(skills,hooks);
   } else if (agent.provider === 'claude') {
     command = agent.command ?? 'claude';
     args = ['-p', '--output-format', 'json', '--tools', agent.access === 'workspace-write' ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep',
@@ -148,6 +159,7 @@ export async function execute(agent, { prompt, cwd, signal, maxOutputTokens, onE
     let message;
     if(item.type==='command_execution') message=`${event.type==='item.started'?'Команда':'Результат команди'}: ${item.command}\n${item.aggregated_output??''}${item.exit_code!=null?`\nExit: ${item.exit_code}`:''}`;
     else if(item.type==='file_change') message=`Файли: ${JSON.stringify(item.changes??[])}`;
+    else if(item.type==='mcp_tool_call'&&event.type==='item.completed') message=`MCP: ${item.server} / ${item.tool} · ${item.status==='completed'?'виконано':'помилка'}`;
     else if(item.type==='agent_message') message=item.text;
     if(message) onEvent({kind:item.type,message:redactSecrets(message, 8000)});
   } : undefined;

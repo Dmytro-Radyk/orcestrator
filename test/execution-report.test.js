@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import {normalizeReportChecks,reportNeedsCorrection,waitsForVerification} from '../src/execution-report.js';
+import {normalizeReportChecks,reportNeedsCorrection,verificationBlockers,waitsForVerification} from '../src/execution-report.js';
 import {createHostVerifier} from '../scripts/host-verifier.js';
 
 test('Windows browser startup failure can use the local verifier, but an application assertion cannot',()=>{
@@ -17,11 +17,25 @@ test('Windows browser startup failure can use the local verifier, but an applica
   assert.equal(waitsForVerification(task),true);
   task.blockedReport.checks[2].details='BROWSER_REPORT_MISSING; Page load failed: net::ERR_NETWORK_ACCESS_DENIED. No browser loopback HTTP.';
   assert.equal(waitsForVerification(task),true);
+  task.blockedReport.checks[2].details='Chrome crashed: crash server failed to launch, self-terminating';
+  assert.equal(waitsForVerification(task),true);
+  task.blockedReport.checks[2].details='Timed out waiting for the Chromium debugging endpoint';
+  assert.equal(waitsForVerification(task),true);
   task.blockedReport.checks[2].details='Chrome started; assertion: reserve button is missing';
   assert.equal(waitsForVerification(task),false);
 });
 
 const check=(more={})=>({command:'node check-ready.mjs --require-ready',status:'failed',required:true,details:'Expected activation refusal',kind:'exit_code',expectedExitCode:1,actualExitCode:1,...more});
+
+test('Windows PostgreSQL loopback permissions are classified as an environment blocker',()=>{
+  const command='node scripts/test-catalog-postgres.mjs';
+  const details='connection to server at "127.0.0.1", port 5432 failed: Permission denied (0x0000271D/10013)';
+  const result=check({command,details});
+  const task={status:'blocked',workspace:{path:'draft'},failure:{code:'AGENT_BLOCKED'},blockedReport:{checks:[result]}};
+  assert.deepEqual(verificationBlockers(task).map(blocker=>blocker.command),[command]);
+  result.details='permission denied for schema catalog_test';
+  assert.deepEqual(verificationBlockers(task),[]);
+});
 
 test('the local verifier retries transient browser reports once and preserves genuine assertions',async()=>{
   const report={checks:[check({command:'browser',expectedExitCode:0})]};

@@ -52,6 +52,7 @@ test('Codex subprocess gets planning controls and returns final JSON without com
     process.stdin.on('data', chunk => prompt+=chunk);
     process.stdin.on('end', () => {
       const events = [
+        {type:'item.completed',item:{type:'mcp_tool_call',server:'project_docs',tool:'search',status:'completed',arguments:{private:'not in logs'}}},
         {type:'item.completed',item:{type:'agent_message',text:'Working on the plan…'}},
         {type:'item.completed',item:{type:'agent_message',text:JSON.stringify({args:process.argv.slice(2),prompt})}},
         {type:'turn.completed',usage:{input_tokens:3,output_tokens:5}}
@@ -72,6 +73,16 @@ test('Codex subprocess gets planning controls and returns final JSON without com
   assert.equal(answer.args.filter(a=>a==='--ignore-user-config').length,1);
   assert.equal(answer.args.at(-1), '-');
   assert.equal(result.usage.output_tokens,5);
+  const progress=[];
+  const extended=JSON.parse((await execute({provider:'codex',command:process.execPath,ignoreUserConfig:true},
+    {...context(),cwd,onEvent:event=>progress.push(event),skills:[{id:'ux',text:'Keep focus visible'}],
+      mcpServers:[{id:'project_docs',url:'http://127.0.0.1:3000/mcp',tools:['search']}]})).text);
+  assert.ok(extended.args.includes('--ignore-user-config'));
+  assert.ok(extended.args.includes('mcp_servers.project_docs.url="http://127.0.0.1:3000/mcp"'));
+  assert.ok(extended.args.includes('mcp_servers.project_docs.enabled_tools=["search"]'));
+  assert.match(extended.prompt,/Keep focus visible/);
+  assert.deepEqual(progress.find(event=>event.kind==='mcp_tool_call'),
+    {kind:'mcp_tool_call',message:'MCP: project_docs / search · виконано'});
 });
 
 test('Codex execution reports reject blocked work and checks that did not pass',async t=>{

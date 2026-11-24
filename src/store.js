@@ -22,9 +22,11 @@ export class Store {
     this.data = existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) : { projects: {}, runs: {} };
     for (const run of Object.values(this.data.runs)) {
       if (['running', 'paused'].includes(run.status)) {
+        const previousStatus=run.status;
         run.status = 'interrupted';
         for (const task of run.tasks) if (task.status === 'running') task.status = 'interrupted';
-        run.events.push({ at: new Date().toISOString(), type: 'run.interrupted', message: 'Server restarted; create a new run to retry safely.' });
+        run.events.push({ id:run.events.length+1, at:new Date().toISOString(), type:'run.interrupted', previousStatus,
+          message:'Сервер перезапущено. Збережені результати доступні.' });
       }
     }
     this.save();
@@ -34,7 +36,7 @@ export class Store {
     this.pendingSave=undefined;
     const temp=`${this.path}.${process.pid}.${randomUUID().slice(0,8)}.tmp`;
     try {
-      writeFileSync(temp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
+      writeFileSync(temp, JSON.stringify(this.data), { mode: 0o600 });
       replaceWithRetry(temp, this.path);
     } catch (error) {
       try { unlinkSync(temp); } catch {}
@@ -46,7 +48,7 @@ export class Store {
     this.pendingSave=setTimeout(()=>{
       this.pendingSave=undefined;
       try { this.save(); } catch (error) { console.error('Store progress save failed:', error.message); }
-    },250);
+    },1000);
     this.pendingSave.unref?.();
   }
   flush() {

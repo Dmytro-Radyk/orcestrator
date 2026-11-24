@@ -12,13 +12,17 @@ export function verificationBlockers(task) {
   const pending=(task.blockedReport?.checks??[]).filter(check=>check.required!==false&&check.status!=='passed');
   return pending.flatMap(check=>{
     const detail=check.details??'';
+    const localPostgres=/\bpsql\b|\bPostgreSQL\b|connection to server at/i.test(detail)&&
+      /127\.0\.0\.1|::1|\blocalhost\b/i.test(detail);
+    if(localPostgres&&/Permission denied\s*\(0x0000271D\/10013\)|WSAEACCES/i.test(detail))
+      return [{command:check.command,reason:'Середовище виконавця заблокувало локальне TCP-з’єднання PostgreSQL'}];
     if(/(?:EACCES|EPERM|WSAEACCES).{0,120}(?:127\.0\.0\.1|::1|localhost)|(?:loopback|127\.0\.0\.1|::1|localhost).{0,120}(?:EACCES|EPERM|WSAEACCES)/i.test(detail))
       return [{command:check.command,reason:'Середовище виконавця заблокувало локальний HTTP-сокет'}];
     const missing=detail.match(/\bPOSTGRES_TOOL_REQUIRED:([\w-]+)\b|\bspawn(?:Sync)?\s+([\w.-]+)\s+ENOENT\b/i);
     if(missing)return [{command:check.command,reason:`У середовищі виконавця немає ${missing[1]??missing[2]}`}];
     if(/\bBROWSER_REPORT_MISSING\b/.test(detail)&&/\bnet::ERR_NETWORK_ACCESS_DENIED\b/.test(detail)&&/loopback|127\.0\.0\.1|localhost/i.test(detail))
       return [{command:check.command,reason:'Середовище виконавця заблокувало локальне HTTP-з’єднання браузера'}];
-    if(/\bBROWSER_REQUIRED\b|\bBROWSER_START_FAILED:exit=(?:2147483651|0x80000003)\b/i.test(detail)||
+    if(/\bBROWSER_REQUIRED\b|\bBROWSER_START_FAILED:exit=(?:2147483651|0x80000003)\b|crash server failed to launch|Timed out waiting for the Chromium debugging endpoint/i.test(detail)||
       /\b(?:chrome|chromium|msedge)(?:\.exe)?\b.{0,80}\b(?:2147483651|0x80000003)\b/i.test(detail))
       return [{command:check.command,reason:'Середовище виконавця не запустило браузер для перевірки'}];
     return [];
@@ -28,6 +32,14 @@ export function verificationBlockers(task) {
 export function waitsForVerification(task) {
   const pending=(task.blockedReport?.checks??[]).filter(check=>check.required!==false&&check.status!=='passed');
   return pending.length>0&&verificationBlockers(task).length===pending.length;
+}
+
+export function missingWorkerFileContext(task) {
+  const report=task.blockedReport;
+  return task.status==='blocked'&&task.failure?.code==='AGENT_BLOCKED'&&Boolean(task.workspace)&&
+    report?.files?.length===0&&report.checks?.length===0&&
+    /\bbaseHash\b/i.test(report.summary)&&
+    /(?:missing|omitted|not (?:provided|included)|бракує|відсутн|пропущен|не (?:надан|передан))/iu.test(report.summary);
 }
 
 export function normalizeReportChecks(checks) {

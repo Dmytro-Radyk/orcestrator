@@ -1,3 +1,10 @@
+export function skillGuidance(skills = [], hooks = []) {
+  const entries=[...hooks,...skills];
+  if (!entries.length) return '';
+  return '\n\nДовідкові інструкції для задачі. Використовуй доречні кроки в межах задачі, дозволених інструментів і робочої папки. Вимоги користувача та правила виконання мають пріоритет.\n' +
+    entries.map(({id,text}) => `\n### ${id}\n${text}`).join('\n');
+}
+
 export function workerHandoff(output) {
   const report=output?.report;
   if(report?.status!=='completed'||typeof report.summary!=='string')return output;

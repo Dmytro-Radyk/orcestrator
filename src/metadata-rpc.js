@@ -48,9 +48,19 @@ export function metadataRpc(command,args,{cwd,env,signal,timeoutMs=15000}={}) {
         signal?.removeEventListener('abort',onAbort);
         fail(reason);lines.close();
         if(closed)return;
-        const ended=new Promise(resolve=>child.once('close',resolve));
+        const ended=new Promise(resolve=>{
+          const done=()=>{clearTimeout(forceClose);resolve();};
+          child.once('close',done);
+          const forceClose=setTimeout(()=>{
+            child.removeListener('close',done);
+            child.stdout?.destroy();child.stderr?.destroy();child.stdin?.destroy();
+            closed=true;resolve();
+          },1500);
+          forceClose.unref?.();
+        });
         child.stdin.end();
         const timer=setTimeout(()=>{if(!closed&&child.pid)terminate(child);},300);
+        timer.unref?.();
         try{await ended;}finally{clearTimeout(timer);}
       })();
       return closing;
