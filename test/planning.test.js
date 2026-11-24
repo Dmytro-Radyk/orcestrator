@@ -40,11 +40,22 @@ test('storefront planning adds browser acceptance and working product media from
   const gate=value.tasks.at(-1);
   assert.equal(gate.id,'storefront-acceptance');
   assert.deepEqual(gate.dependsOn,['integrate']);
-  assert.match(gate.prompt,/desktop\.png/);
-  assert.match(gate.prompt,/mobile\.png/);
+  assert.match(gate.prompt,/Оркестратор сам відкриє локальну збірку у Chromium на 1280 і 390 px/);
+  assert.match(gate.prompt,/data-product-model/);
   assert.equal(value.tasks.length,plan.tasks.length);
   assert.match(gate.prompt,/Перевірити результати за критеріями/);
   assert.match(value.tasks.find(task=>task.id==='frontend').acceptanceCriteria.join(' '),/зображення товарів, які завантажуються/);
+});
+test('a brief bookstore request includes browser acceptance and does not imply a server stack',async()=>{
+  const config={configured:true,label:'fixture',provider:'opencode',agent:{}};
+  const plan=demoPlan({name:'Книгарня',description:'Книгарня'});
+  for(const description of ['Книгарня','Книгарня PostgreSQL']){
+    const {value}=await generatePlanning('plan',{name:'Книгарня',description},config,async(_agent,{prompt})=>{
+      assert.equal(prompt.includes('пріоритет має компактний статичний прототип'),description==='Книгарня');
+      return {text:JSON.stringify(plan)};
+    });
+    assert.equal(value.tasks.at(-1).id,'storefront-acceptance');
+  }
 });
 test('AI plan and routing use the configured model and preserve provenance',async()=>{
   let captured;

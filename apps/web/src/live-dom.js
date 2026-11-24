@@ -4,7 +4,7 @@ const key = node => {
   if (liveKey) return `k:${liveKey}`;
   if (node.id) return `id:${node.id}`;
   const dataId = node.getAttribute('data-id');
-  if (dataId) return `${node.tagName}:${dataId}`;
+  if (dataId) return `${node.tagName}:${node.getAttribute('data-action') ?? ''}:${dataId}`;
   return null;
 };
 

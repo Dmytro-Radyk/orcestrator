@@ -1,4 +1,12 @@
 .creation-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.worker-model-picker{margin:0 0 16px}
+.worker-model-picker>summary{cursor:pointer}
+.worker-model-picker p{margin:8px 0}
+.worker-model-picker>.btn{margin-top:8px}
+.worker-model-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(210px,100%),1fr));gap:6px;max-height:210px;overflow:auto}
+.worker-model-option{display:flex;align-items:center;gap:9px;margin:0;padding:8px 10px;border:1px solid var(--line);border-radius:6px}
+.worker-model-option input{flex:none;margin:0}
+.worker-model-option small{display:block;overflow-wrap:anywhere}
 .project-folder-field{display:flex;align-items:flex-end;gap:10px;margin-bottom:16px}
 .project-folder-field label{flex:1;min-width:0;margin:0}
 .project-folder-field button{flex-shrink:0}
@@ -22,6 +30,10 @@
 .creation-fields .routing-cards article { overflow-wrap: anywhere; }
 .creation-fields > details { margin-block: 16px; }
 .creation-fields > details > summary { cursor: pointer; padding-block: 10px; }
+.interview-questions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
+.interview-questions > label { display: grid; grid-template-rows: auto 1fr auto; gap: 7px; min-width: 0; margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; }
+.interview-topic { color: var(--accent); font-weight: 600; }
+.interview-questions textarea { width: 100%; min-height: 64px; margin: 0; font-size: 14px; resize: vertical; }
 .creation-modes > label:first-child { grid-column: 1 / -1; }
 .planner-selection-reason { padding: 12px 14px; border-left: 2px solid #b8a7ff; background: #1b2340; color: #cbd5ed; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 dialog:has(.creation-flow) { width: min(1040px, calc(100vw - 48px)); max-width: calc(100vw - 24px); }

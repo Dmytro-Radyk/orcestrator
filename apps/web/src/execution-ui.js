@@ -17,6 +17,8 @@ export const hasVerificationChecks=task=>Boolean(task.verificationBlockers?.leng
 
 function runStateNote(runStatus, run, h) {
   if (runStatus==='completed'&&run.testCompletion) return '<div class="execution-state-note" role="status">Тестовий запуск завершено. Реальний пілот, продажі й приймальні перевірки перед запуском відкладено.</div>';
+  if(runStatus==='blocked'&&run.projectReviewAwaitingFreeModel)return '<div class="execution-state-note paused" role="status">Усі задачі виконано та збережено. Фінальне рев’ю очікує другу сумісну безкоштовну модель; перехід на підписку потребує явного вибору користувача.</div>';
+  if(runStatus==='blocked'&&run.tasks?.some(task=>task.projectReview&&task.error))return '<div class="execution-state-note paused" role="status">Зміни збережено. Запуск очікує на схвалення незалежного фінального рев’ю.</div>';
   if (run.hostChecking) return '<div class="execution-state-note paused" role="status">Локальний верифікатор виконує доступні тести. Результати збережуться автоматично.</div>';
   if (run.draining) {
     return '<div class="execution-state-note paused">Зупиняється… Очікуємо завершення активних викликів без нових запусків.</div>';
@@ -77,10 +79,17 @@ function verificationCard(task,run,h,button) {
   </div></div>`;
 }
 
+export function awaitingExecutionDetails(project) {
+  return project.execution?.mode === 'real' && !Array.isArray(project.execution.agents);
+}
+
 export function executionPanel(p, h, button, streamState = null) {
   if (p.execution?.mode !== 'real') return '';
+  if (awaitingExecutionDetails(p)) return '<section class="panel execution-panel" data-live-key="execution-panel"><p class="workspace-path" role="status">Завантажуємо дані запуску…</p></section>';
   const run = p.execution;
   const runStatus = run.status ?? p.status;
+  const finalReview=run.tasks?.find(task=>task.projectReview);
+  const reviewer=run.agents.find(agent=>agent.id===finalReview?.assignedAgentIds?.[0]);
   return `<section class="panel execution-panel" data-live-key="execution-panel">
     <div class="panel-heading">
       <div>
@@ -94,9 +103,15 @@ export function executionPanel(p, h, button, streamState = null) {
       </div>
     </div>
     ${runStateNote(runStatus, run, h)}
+    ${finalReview?`<div class="info-note"><div><strong>${h(finalReview.title)}</strong>
+      <p>${finalReview.review?(finalReview.review.approved?'Схвалено':'Виявлено блокери'):finalReview.error?h(finalReview.error):finalReview.status==='running'?'Виконується':'Очікує завершення задач'}${reviewer?' · '+h(reviewer.model):''}</p>
+      ${finalReview.review?`<details><summary>Висновок рецензента</summary><p>${h(finalReview.review.feedback)}</p></details>`:''}
+      ${run.canRetryProjectReview?button('retry-project-review',run.projectReviewAwaitingFreeModel?'Повторити безкоштовне рев’ю':'Повторити фінальне рев’ю','play','btn'):''}
+      ${run.canRetryProjectReview&&run.projectReviewAwaitingFreeModel&&run.subscriptionReviewRoutes?.length?button('choose-subscription-review','Обрати модель підписки для рев’ю…','shield','btn'):''}
+    </div></div>`:''}
     ${(run.tasks??[]).filter(hasVerificationChecks).map(t=>verificationCard(t,run,h,button)).join('')}
     ${run.brief?`<details><summary>Уточнені вимоги проєкту</summary><p class="text-small">${h(run.brief)}</p></details>`:''}
-    ${(run.tasks??[]).filter(t=>t.status==='blocked'&&t.failure?.code==='AGENT_BLOCKED'&&!hasVerificationChecks(t)).map(t=>`<div class="info-note"><div><strong>${h(t.title)}</strong><p>${h(t.blockedReport?.summary??t.error)}</p>${draftDetails(t,h)}</div></div>`).join('')}
+    ${(run.tasks??[]).filter(t=>!t.projectReview&&t.status==='blocked'&&t.failure?.code==='AGENT_BLOCKED'&&!hasVerificationChecks(t)).map(t=>`<div class="info-note"><div><strong>${h(t.title)}</strong><p>${h(t.blockedReport?.summary??t.error)}</p>${draftDetails(t,h)}</div></div>`).join('')}
     <p class="workspace-path">${h(run.workspace)}</p>
     <div class="execution-bindings">${run.agents.map(a => {
       const b = formatBillingBadge(a.billing, a.billingBoundary);
@@ -123,10 +138,10 @@ export function executionPanel(p, h, button, streamState = null) {
 }
 
 export function fileArtifacts(p, h, button) {
-  if (p.execution?.mode !== 'real') return '';
+  if (p.execution?.mode !== 'real' || !Array.isArray(p.execution.files)) return '';
   return `<section class="panel execution-files" data-live-key="execution-files"><h2>Файли робочої папки</h2><p class="muted text-small">Маніфест фіксується після завершення запуску. Завантаження читає поточний файл у папці проєкту.</p>${p.execution.files.length ? p.execution.files.map(f => `<div class="execution-file"><span><strong>${h(f.path)}</strong><small>${h({ created: 'Створено', modified: 'Змінено', unchanged: 'Без змін', deleted: 'Видалено' }[f.change] ?? f.change)} · ${Number(f.size) || 0} байтів</small></span>${f.change !== 'deleted' ? button('execution-file', 'Завантажити', 'download', 'btn small-btn', `data-path="${h(f.path)}"`) : ''}</div>`).join('') : '<p>Список з’явиться після завершення або зупинки запуску.</p>'}</section>`;
 }
 
 export function runHistory(runs, h, button, labels) {
-  return `<section class="panel run-list"><div class="panel-heading"><h2>Реальні запуски <span>${runs.length}</span></h2></div>${runs.length ? runs.map(r => `<button type="button" data-action="view-run" data-id="${h(r.id)}"><span class="project-glyph purple">↗</span><span><strong>${h(r.name)}</strong><small>${h(new Date(r.createdAt).toLocaleString('uk-UA'))} · план v${Number(r.uiRevision) || 1} · ${Number(r.calls) || 0} викликів</small></span><span class="badge ${h(r.status)}">${h(labels[r.status] ?? r.status)}</span></button>`).join('') : '<p class="empty compact">Після першого запуску тут буде його історія.</p>'}</section>`;
+  return `<section class="panel run-list"><div class="panel-heading"><h2>Реальні запуски <span>${runs.length}</span></h2></div>${runs.length ? runs.map(r => `<button type="button" data-action="view-run" data-id="${h(r.id)}"><span class="project-glyph purple">↗</span><span><strong>${h(r.name)}</strong><small>${h(new Date(r.createdAt).toLocaleString('uk-UA'))} · ${r.kind==='project-chat'?'правки з чату':`план v${Number(r.uiRevision) || 1}`} · ${Number(r.calls) || 0} викликів</small></span><span class="badge ${h(r.status)}">${h(labels[r.status] ?? r.status)}</span></button>`).join('') : '<p class="empty compact">Після першого запуску тут буде його історія.</p>'}</section>`;
 }

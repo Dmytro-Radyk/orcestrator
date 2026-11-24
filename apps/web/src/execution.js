@@ -1,12 +1,21 @@
 import { preferredAgentRuntime } from './agent-library.js';
 import { buildRoutingPayload, formatBillingBadge } from './routing-ui.js';
 import { readEventStream,applyRunFrame } from './event-stream.js';
-import { MAX_RUN_CALLS,plannedCalls,recommendedCalls } from './call-budget.js';
+import { MAX_RUN_CALLS,plannedCalls,recommendedCalls,withReviewBudget } from './call-budget.js';
 import { hasVerificationChecks } from './execution-ui.js';
 
 const terminal = status => !['running','paused'].includes(status);
 const statusLabels={ 'run.started':'Запуск розпочато','run.paused':'Чергу поставлено на паузу','run.resumed':'Чергу продовжено',
-  'run.blocked':'Очікуємо уточнення вимог','run.clarified':'Уточнення збережено — роботу продовжено','task.blocked':'Задача очікує уточнення','agent.blocked':'Агент підготував матеріали й очікує уточнення',
+  'agent.extensions':'Розширення виконавця',
+  'task.self_reviewed':'Самоперевірка задачі','task.project_reviewed':'Висновок незалежного рев’ю','task.project_review_retried':'Фінальне рев’ю запущено повторно',
+  'agent.project_tool':'Локальний інструмент проєкту',
+  'run.draft_recovery_started':'Почалося автоматичне відновлення чернетки',
+  'task.verified_draft_recovery_failed':'Автоматичне відновлення чернетки не вдалося',
+  'task.access_recheck_started':'Перевіряємо доступ після збою',
+  'task.access_recheck_failed':'Доступ досі не підтверджено',
+  'task.connection_checked':'Перевірка підключення задачі',
+  'task.pipeline_step_verified':'Перевірений етап передано наступному виконавцю',
+  'run.blocked':'Очікуємо уточнення вимог','run.clarified':'Уточнення збережено — роботу продовжено','task.blocked':'Задача очікує уточнення','agent.blocked':'Агент підготував матеріали й очікує уточнення','run.checkpoint_resumed':'Роботу продовжено після перезапуску',
   'run.access_retried':'Продовжено після відновлення доступу',
   'run.cancelled_resumed':'Скасований запуск продовжено',
   'run.budget_increased':'Бюджет запуску змінено',
@@ -15,7 +24,8 @@ const statusLabels={ 'run.started':'Запуск розпочато','run.paused
   'task.host_verification_started':'Локальні перевірки розпочато',
   'task.host_verified':'Результат прийнято після локальних перевірок',
   'task.host_verification_partial':'Збережено результати локальних перевірок',
-  'task.storefront_evidence_retry':'Повторно перевіряємо докази вітрини',
+  'task.storefront_evidence_retry':'Виправлення після браузерної перевірки',
+  'task.storefront_audit':'Незалежна браузерна перевірка вітрини',
   'task.host_verification_failed':'Локальна перевірка не пройшла',
   'task.host_verification_finished':'Локальна перевірка завершена',
   'workspace.resolving':'Узгодження змін файлів',
@@ -59,20 +69,52 @@ export function applyExecutionRun(project,run) {
   project.status=run.status;
   project.execution={mode:'real',id:run.id,status:run.status,draining:run.draining,canContinue:run.canContinue===true,canRetryAccess:run.canRetryAccess===true,canClarify:run.canClarify===true,brief:run.project.executionBrief??'',recovery:run.recovery,uiRevision:run.project.uiRevision,workspace:run.project.workspace,calls:run.calls,
     canResumeCancelled:run.canResumeCancelled===true,canIncreaseBudget:run.canIncreaseBudget===true,
-    canRetryBudget:run.canRetryBudget===true,canBalanceGemini:run.canBalanceGemini===true,hostChecking:run.hostChecking===true,maxCalls:run.project.limits?.maxCalls,testCompletion:run.testCompletion,
+    canRetryBudget:run.canRetryBudget===true,canBalanceGemini:run.canBalanceGemini===true,hostChecking:run.hostChecking===true,maxCalls:run.project.limits?.maxCalls,testCompletion:run.testCompletion,canRetryProjectReview:run.canRetryProjectReview===true,
     agents:run.project.agents.map(({id,name,model,provider,access,role,skills,billing,billingBoundary})=>({id,name,model,provider,access,role,skills,billing,billingBoundary})),tasks:mapped,files:run.files??[],createdAt:run.createdAt,
     usage:run.events.filter(e=>['agent.completed','agent.failed','agent.blocked','recovery.manager_completed'].includes(e.type)).reduce((sum,o)=>({input:sum.input+(Number(o.usage?.input_tokens??o.usage?.prompt_tokens)||0),output:sum.output+(Number(o.usage?.output_tokens??o.usage?.completion_tokens)||0)}),{input:0,output:0})};
-  project.events=run.events.slice(-300).reverse().map(e=>({at:e.at,real:true,text:
-    `${statusLabels[e.type]??(e.type==='agent.progress'?'':'Подія '+e.type)}${e.taskId?' · '+(run.tasks.find(t=>t.id===e.taskId)?.title??e.taskId):''}${e.agentId?' · '+(run.project.agents.find(a=>a.id===e.agentId)?.name??e.agentId):''}${e.message?'\n'+e.message:''}`}));
-  project.artifacts=run.tasks.filter(t=>t.result).map(t=>({id:t.id,taskId:t.id,name:`${t.title}.md`,text:t.result,real:true}));
+  project.events=run.events.slice(-300).reverse().map(e=>{
+    const seconds=ms=>`${(ms/1000).toFixed(1)} с`;
+    const timing=e.timing?.executionMs!==undefined?`Виконання: ${seconds(e.timing.executionMs)}`:
+      e.timing?.queueMs!==undefined?`Черга: ${seconds(e.timing.queueMs)} · Підготовка виклику: ${seconds(e.timing.preflightMs)}`:'';
+    return {at:e.at,real:true,text:
+      `${statusLabels[e.type]??(e.type==='agent.progress'?'':'Подія '+e.type)}${e.taskId?' · '+(run.tasks.find(t=>t.id===e.taskId)?.title??e.taskId):''}${e.agentId?' · '+(run.project.agents.find(a=>a.id===e.agentId)?.name??e.agentId):''}${e.message?'\n'+e.message:''}${timing?'\n'+timing:''}`};
+  });
+  project.artifacts=run.tasks.filter(t=>t.result).map(t=>({id:t.id,taskId:t.id,name:`${t.title}.md`,real:true,
+    text:t.result+(t.selfReviews?.length?'\n\n## Самоперевірка\n'+t.selfReviews.map(review=>{
+      const model=run.project.agents.find(agent=>agent.id===review.agentId)?.model??review.agentId;
+      return `- ${model} · ${review.approved?'Схвалено':'Потрібні правки'}\n  ${review.feedback}`;
+    }).join('\n'):'')}));
 }
 
 export function createExecutionClient({getState,setState,render,saveLocal,notify,modal,h,button,download}) {
   let token,revision=0,ready=false,timer,queue=Promise.resolve(),conflict=false,savingCount=0;
+  const notificationKey='orcestrator.notifications.seen.v1';
+  const desktopKey='orcestrator.notifications.desktop.v1';
+  let notificationTimer,seenNotifications=null;
+  const readPreference=key=>{try{return localStorage.getItem(key);}catch{return null;}};
+  const writePreference=(key,value)=>{try{localStorage.setItem(key,value);}catch{}};
+  try{
+    const saved=readPreference(notificationKey);
+    if(saved)seenNotifications=new Set(JSON.parse(saved));
+  }catch{}
   const streams=new Map();
   const routingStates=new Map();
   const resultRuns=new Map();
-  const client={ready:false,history:[],runtimes:[],saving:false,catalog:null,loadingCatalog:false,scanning:false,catalogError:null};
+  const client={ready:false,history:[],runtimes:[],saving:false,catalog:null,loadingCatalog:false,scanning:false,catalogError:null,get conflict(){return conflict;}};
+  client.desktopNotificationState=()=>{
+    const permission=globalThis.Notification?.permission;
+    if(!permission)return 'unavailable';
+    if(permission==='denied')return 'denied';
+    return permission==='granted'&&readPreference(desktopKey)==='on'?'enabled':'disabled';
+  };
+  client.toggleDesktopNotifications=async()=>{
+    const state=client.desktopNotificationState();
+    if(state==='enabled'){writePreference(desktopKey,'off');return false;}
+    if(state!=='disabled')return false;
+    const permission=Notification.permission==='granted'?'granted':await Notification.requestPermission();
+    if(permission==='granted'){writePreference(desktopKey,'on');return true;}
+    return false;
+  };
   function ensureRouting(projectId) {
     if(!routingStates.has(projectId))routingStates.set(projectId,{loading:false,proposing:false,error:null,proposal:null,stale:false,draftConfig:null,loadSeq:0,proposeSeq:0});
     return routingStates.get(projectId);
@@ -87,16 +129,58 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
     const response=await fetch(path,{method,signal,headers:{'X-Execution-Token':token??'',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
     const data=await response.json();if(!response.ok)throw new Error(data.error??'Помилка сервера');return data;
   }
+  client.projectChat=async(projectId,input)=>{
+    const data=await call(`/api/execution/project-chat?projectId=${encodeURIComponent(projectId)}`,
+      input?'POST':'GET',input,{signal:AbortSignal.timeout(10000)});
+    if(data?.messages?.some(m=>m.status==='completed')){
+      resultRuns.delete(projectId);
+      void history().catch(()=>{});
+    }
+    return data;
+  };
+  client.cancelChatRun=id=>call(`/api/execution/runs/${encodeURIComponent(id)}/cancel`,'POST',{});
+  async function pollNotifications(){
+    try{
+      const {items}=await call('/api/execution/notifications','GET',undefined,{signal:AbortSignal.timeout(6000)});
+      const stored=readPreference(notificationKey);
+      if(stored){
+        try{seenNotifications=new Set([...(seenNotifications??[]),...JSON.parse(stored)]);}catch{}
+      }
+      const fresh=seenNotifications?items.filter(item=>!seenNotifications.has(item.id)):[];
+      seenNotifications=new Set([...(seenNotifications??[]),...items.map(item=>item.id)].slice(-200));
+      writePreference(notificationKey,JSON.stringify([...seenNotifications]));
+      if(fresh.length){
+        const latest=fresh.at(-1);
+        notify(`${latest.title} · ${latest.body}${fresh.length>1?` (+${fresh.length-1})`:''}`);
+        if(client.desktopNotificationState()==='enabled'){
+          for(const item of fresh){
+            try{
+              const notice=new Notification(item.title,{body:item.body,tag:item.id});
+              notice.onclick=()=>{
+                window.focus();
+                if(getState().projects.some(project=>project.id===item.projectId)){
+                  getState().activeId=item.projectId;
+                  window.location.hash='project';
+                  render();
+                }
+                notice.close();
+              };
+            }catch{ /* The in-app message remains available. */ }
+          }
+        }
+      }
+    }catch{ /* Try again on the next poll. */ }
+  }
   function persist() {
     clearTimeout(timer);
     if(!ready || conflict)return queue;
-    const workspace=serializeWorkspaceState(getState());
     savingCount++;client.saving=true;
     const request=queue.then(async()=>{
       if(conflict)return;
+      const workspace=serializeWorkspaceState(getState());
       const stored=await call('/api/workspace','PUT',{revision,workspace});revision=stored.revision;
     });
-    queue=request.catch(error=>{if(error.message.includes('Конфлікт'))conflict=true;notify('Не вдалося зберегти на сервері: '+error.message);}).finally(()=>{if(--savingCount<=0){savingCount=0;client.saving=false;}});
+    queue=request.catch(error=>{if(error.message.includes('Конфлікт'))conflict=true;notify('Не вдалося зберегти на сервері: '+error.message);render();}).finally(()=>{if(--savingCount<=0){savingCount=0;client.saving=false;}});
     return request;
   }
   client.scheduleSave=()=>{if(ready&&!conflict){clearTimeout(timer);timer=setTimeout(()=>persist().catch(()=>{}),300);}};
@@ -135,7 +219,7 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
       const assignment=proposal?.assignments?.find(item=>item.taskId===task.id);
       return assignment?{...task,agentIds:assignment.routeIds}:task;
     });
-    const maxCalls=Math.min(MAX_RUN_CALLS,Math.max(p.maxCalls??0,recommendedCalls(planned)));
+    const maxCalls=Math.min(MAX_RUN_CALLS,Math.max(p.maxCalls??0,recommendedCalls(client.reviews?withReviewBudget(planned):planned)));
     const run=await call('/api/execution/runs','POST',{projectId:p.id,revision:p.revision,maxCalls,proposalId:proposal.id});
     stopStream(run.id);
     applyExecutionRun(p,run);watch(run);saveLocal();
@@ -197,13 +281,19 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
       if(seq===entry.proposeSeq){entry.proposing=false;render();}
     }
   };
-  client.scan=async()=>{
-    if(client.scanning)return;client.scanning=true;client.catalogError=null;render();
-    try {
-      client.catalog=await call('/api/connections/scan','POST',{});
-      const status=await call('/api/execution/status');client.runtimes=status.runtimes;
-      notify(`Перевірено підключення. Моделей у каталозі: ${client.catalog.routes.length}`);
-    }catch(error){client.catalogError=error.message;notify(error.message);}finally{client.scanning=false;render();}
+  let catalogScan;
+  client.scan=()=>{
+    if(catalogScan)return catalogScan;
+    client.scanning=true;client.catalogError=null;render();
+    catalogScan=(async()=>{
+      try {
+        client.catalog=await call('/api/connections/scan','POST',{});
+        const status=await call('/api/execution/status');client.runtimes=status.runtimes;
+        notify(`Перевірено підключення. Моделей у каталозі: ${client.catalog.routes.length}`);
+      }catch(error){client.catalogError=error.message;notify(error.message);}
+      finally{catalogScan=null;client.scanning=false;render();}
+    })();
+    return catalogScan;
   };
   async function history() { client.history=(await call('/api/execution/runs')).sort((a,b)=>b.createdAt.localeCompare(a.createdAt)); }
   client.resultsFor=p=>{
@@ -216,7 +306,7 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
   };
   client.loadResults=async p=>{
     if(p.execution?.mode==='real')return;
-    const latest=client.history.find(run=>run.uiProjectId===p.id);
+    const latest=client.history.find(run=>run.uiProjectId===p.id&&run.kind!=='project-chat');
     if(!latest||resultRuns.get(p.id)?.id===latest.id)return;
     const run=await call(`/api/execution/runs/${encodeURIComponent(latest.id)}`);
     resultRuns.set(p.id,run);
@@ -227,7 +317,9 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
     return entry?{status:entry.status,attempts:entry.attempts,error:entry.error}:null;
   };
   function watch(run) {
-    if(streams.has(run.id)||terminal(run.status)&&!run.draining&&!run.hostChecking)return;
+    const existing=streams.get(run.id);
+    if((existing&&existing.status!=='error')||terminal(run.status)&&!run.draining&&!run.hostChecking)return;
+    if(existing)existing.controller.abort();
     const controller=new AbortController(),entry={run,cursor:run.events?.length??0,controller,status:'connecting',attempts:0,error:null};streams.set(run.id,entry);
     void (async()=>{
       let completedRun=false;
@@ -263,7 +355,7 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
           await new Promise(resolve=>{const retry=setTimeout(resolve,Math.min(10000,entry.attempts*1000));controller.signal.addEventListener('abort',()=>{clearTimeout(retry);resolve();},{once:true});});
         }
       }
-      if(streams.get(run.id)===entry)streams.delete(run.id);
+      if(streams.get(run.id)===entry&&entry.status!=='error')streams.delete(run.id);
       if(completedRun){await history().catch(()=>{});render({executionOnly:true});}
     })();
   }
@@ -290,16 +382,23 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
       const assignment=preview.proposal?.assignments.find(item=>item.taskId===task.id);
       return assignment?{...task,agentIds:assignment.routeIds}:task;
     });
-    const minimum=plannedCalls(planned);
-    const suggested=Math.max(p.maxCalls??0,recommendedCalls(planned));
-    const budgetField=`<label>Ліміт викликів цього запуску<input type="number" name="maxCalls" min="${minimum}" max="${MAX_RUN_CALLS}" required value="${suggested}"></label><p class="muted text-small">За поточним планом потрібно щонайменше ${minimum} викликів. Додатковий запас покриває повтори та делегування.</p>`;
+    const budgetPlan=client.reviews?withReviewBudget(planned):planned;
+    const minimum=plannedCalls(budgetPlan);
+    const suggested=Math.max(p.maxCalls??0,recommendedCalls(budgetPlan));
+    const budgetField=`<label>Ліміт викликів цього запуску<input type="number" name="maxCalls" min="${minimum}" max="${MAX_RUN_CALLS}" required value="${suggested}"></label><p class="muted text-small">Щонайменше ${minimum} викликів${client.reviews?', включно із самоперевіркою кожного виконавця та окремим фінальним рев’ю':''}. Запас покриває повтори та делегування.</p>`;
     if(preview.proposal) {
       const proposal=preview.proposal;
       const allowed=proposal.assignments.every(a=>a.routeIds.every(id=>preview.runtimes.some(r=>r.routeId===id&&r.allowed&&r.access===(proposal.requirements[a.taskId]?.workspaceWrite===false?'read-only':'workspace-write'))));
       modal('Запуск AI-команди',`<form id="execution-form" data-project="${h(p.id)}" data-revision="${Number(p.revision)||1}" data-proposal="${h(proposal.id)}"><p>AI-пропозицію команди буде зафіксовано як фактичних виконавців цього запуску. Доступ і тарифи перевіряються повторно перед кожним викликом.</p><label>Робоча папка<input readonly value="${h(preview.workspace)}"></label>${proposal.assignments.map(a=>`<div class="info-note"><div><strong>${h(p.tasks.find(t=>t.id===a.taskId)?.title??a.taskId)}</strong><p>${a.routeIds.map(id=>{const rt=proposal.routes.find(r=>r.id===id);const b=formatBillingBadge(rt?.billing,rt?.billingBoundary);return `${h(rt?.model??id)} <span class="billing-pill ${b.tone}">${h(b.label)}</span>`;}).join(' → ')}</p><small>${h(a.reason)}</small></div></div>`).join('')}<p class="muted text-small">Незалежні задачі працюють в окремих worktree. Перевірені зміни інтегруються в папку проєкту; конфлікт зупиняє інтеграцію. Делегування: ${p.allowDelegation===false?'вимкнено':`до ${Number(p.maxDepth??2)||0} рівнів`}.</p>${budgetField}${!allowed?'<p class="route-blocked">Обраний маршрут зараз недоступний. Повторіть AI-підбір моделей.</p>':''}<div class="form-footer">${button('close-modal','Скасувати')}<button class="btn primary" type="submit" ${!allowed?'disabled':''}>Запустити AI-команду</button></div></form>`);
       return;
     }
-    modal('Реальний запуск',`<form id="execution-form" data-project="${h(p.id)}" data-revision="${Number(p.revision)||1}"><p>Агенти виконають прийнятий план у цій робочій папці. Файли попередніх запусків цього проєкту залишаються доступними.</p><label>Робоча папка<input readonly value="${h(preview.workspace)}"></label><div class="info-note">AI-пропозиція для цього плану відсутня або застаріла. Можна виконати AI-підбір у вкладці «Команда» або призначити фактичних виконавців вручну. ${!available.length?"Немає маршрутів із підтвердженим доступом без доплат. Перевірте розділ «Підключення».":""}</div>${ids.map(id=>{const a=getState().agents.find(a=>a.id===id);return `<label>${h(a?.name??id)} · профіль: ${h(a?.model)}<select name="binding-${h(id)}" required>${!preferredAgentRuntime(a,preview.runtimes)?'<option value="" selected disabled>Оберіть доступного виконавця</option>':''}${preview.runtimes.map(r=>{const b=formatBillingBadge(r.billing,r.billingBoundary);return `<option value="${h(r.id)}" ${!r.allowed?'disabled':''} ${r.id===preferredAgentRuntime(a,preview.runtimes)?'selected':''}>${h(r.name)} · ${h(r.model)} · ${h(r.access)} · ${h(b.shortLabel)}${!r.allowed?" · заблоковано":""}</option>`;}).join('')}</select></label>`;}).join('')}<p class="muted text-small">${p.tasks.length} задач · Незалежні задачі працюють в ізольованих worktree; перевірені зміни інтегруються автоматично. Ліміт не обмежує внутрішні звернення CLI. Запуск може змінювати файли; скасування не відкочує їх.</p>${budgetField}<div class="form-footer">${button('close-modal','Скасувати')}<button class="btn primary" type="submit" ${!available.length?"disabled":""}>Запустити команду</button></div></form>`);
+    modal('Реальний запуск',`<form id="execution-form" data-project="${h(p.id)}" data-revision="${Number(p.revision)||1}"><p>Агенти виконають прийнятий план у цій робочій папці. Файли попередніх запусків цього проєкту залишаються доступними.</p><label>Робоча папка<input readonly value="${h(preview.workspace)}"></label><div class="info-note">AI-пропозиція для цього плану відсутня або застаріла. Можна виконати AI-підбір у вкладці «План» або призначити фактичних виконавців вручну. ${!available.length?"Немає маршрутів із підтвердженим доступом без доплат. Перевірте розділ «Підключення».":""}</div>${ids.map(id=>{const a=getState().agents.find(a=>a.id===id);return `<label>${h(a?.name??id)} · профіль: ${h(a?.model)}<select name="binding-${h(id)}" required>${!preferredAgentRuntime(a,preview.runtimes)?'<option value="" selected disabled>Оберіть доступного виконавця</option>':''}${preview.runtimes.map(r=>{const b=formatBillingBadge(r.billing,r.billingBoundary);return `<option value="${h(r.id)}" ${!r.allowed?'disabled':''} ${r.id===preferredAgentRuntime(a,preview.runtimes)?'selected':''}>${h(r.name)} · ${h(r.model)} · ${h(r.access)} · ${h(b.shortLabel)}${!r.allowed?" · заблоковано":""}</option>`;}).join('')}</select></label>`;}).join('')}<p class="muted text-small">${p.tasks.length} задач · Незалежні задачі працюють в ізольованих worktree; перевірені зміни інтегруються автоматично. Ліміт не обмежує внутрішні звернення CLI. Запуск може змінювати файли; скасування не відкочує їх.</p>${budgetField}<div class="form-footer">${button('close-modal','Скасувати')}<button class="btn primary" type="submit" ${!available.length?"disabled":""}>Запустити команду</button></div></form>`);
+  };
+  client.chooseSubscriptionReview=p=>{
+    const run=p.execution;
+    const routes=run?.subscriptionReviewRoutes??[];
+    if(!ready||!run?.canRetryProjectReview||!routes.length)throw Error('Немає доступних моделей підписки для незалежного рев’ю');
+    modal('Перехід фінального рев’ю на підписку',`<form id="execution-review-subscription-form" data-project="${h(p.id)}" data-run="${h(run.id)}"><p>Проєкт виконувався в безкоштовному режимі (<code>free_tier</code>), але зараз друга сумісна безкоштовна модель недоступна. Перехід на підписку виконується лише за вашим явним підтвердженням.</p><label>Модель для незалежного фінального рев’ю<select name="routeId" required>${routes.map(r=>`<option value="${h(r.id)}">${h(r.model)} · ${h(r.backend)} · ${h(formatBillingBadge(r.billing,r.billingBoundary).shortLabel)}</option>`).join('')}</select></label><label class="checkline"><input type="checkbox" name="allowSubscription" required> Підтверджую одноразовий перехід фінального рев’ю цього запуску на квоту підписки</label><div class="form-footer">${button('close-modal','Залишити в очікуванні')}<button type="submit" class="btn primary">Запустити рев’ю з підпискою</button></div></form>`);
   };
   client.control=async(p,action,taskId)=>{
     const runId=p.execution.id;
@@ -325,7 +424,21 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
     const file=await call(`/api/execution/runs/${encodeURIComponent(p.execution.id)}/file?path=${encodeURIComponent(path)}`);
     download(file.path,file.text,'text/plain;charset=utf-8');
   };
-  document.addEventListener('submit',async event=>{
+  globalThis.document?.addEventListener('submit',async event=>{
+    if(event.target.id==='execution-review-subscription-form'){
+      event.preventDefault();const form=event.target,data=new FormData(form),submit=form.querySelector('[type=submit]');submit.disabled=true;
+      try{
+        await persist();
+        const p=getState().projects.find(project=>project.id===form.dataset.project);
+        if(!p)throw Error('Проєкт не знайдено');
+        const run=await call(`/api/execution/runs/${encodeURIComponent(form.dataset.run)}/retry-project-review`,'POST',
+          {routeId:String(data.get('routeId')??''),allowSubscription:data.has('allowSubscription')});
+        stopStream(run.id);
+        applyExecutionRun(p,run);watch(run);saveLocal();document.querySelector('#modal').close();await history().catch(()=>{});render();
+        notify('Фінальне рев’ю запущено з обраною моделлю підписки.');
+      }catch(error){notify(error.message);submit.disabled=false;}
+      return;
+    }
     if(event.target.id==='execution-budget-form'){
       event.preventDefault();const form=event.target,data=new FormData(form),submit=form.querySelector('[type=submit]');submit.disabled=true;
       try{
@@ -364,7 +477,7 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
   });
   client.init=async()=>{
     try {
-      const status=await call('/api/execution/status');token=status.token;client.runtimes=status.runtimes;
+      const status=await call('/api/execution/status');token=status.token;client.runtimes=status.runtimes;client.reviews=status.capabilities?.reviews===true;
       const stored=await call('/api/workspace');revision=stored.revision;
       if(stored.workspace)setState(stored.workspace);
       client.loadingCatalog=true;render();
@@ -372,11 +485,14 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
         client.catalog=await call('/api/connections');client.catalogError=null;
       }catch(error){client.catalogError=error.message;}finally{client.loadingCatalog=false;}
       ready=client.ready=true;
+      void pollNotifications();
+      notificationTimer=setInterval(pollNotifications,12000);
+      notificationTimer.unref?.();
       if(!stored.workspace)await persist();
       await history();
       const activeId=getState().activeId;
       for(const p of getState().projects) {
-        const latest=client.history.find(r=>r.uiProjectId===p.id&&r.uiRevision===p.revision);
+        const latest=client.history.find(r=>r.uiProjectId===p.id&&r.uiRevision===p.revision&&r.kind!=='project-chat');
         if(latest&&(p.execution?.mode==='real'||!terminal(latest.status)))await loadRun(latest.id);
       }
       getState().activeId=activeId;
@@ -385,6 +501,7 @@ export function createExecutionClient({getState,setState,render,saveLocal,notify
       if(!client.catalogError&&(!client.catalog?.checkedAt||client.catalog.routes.some(r=>!Number.isFinite(Date.parse(r.expiresAt))||Date.parse(r.expiresAt)<=Date.now())))void client.scan();
     }catch(error){notify('Серверне збереження недоступне: '+error.message);}
   };
-  window.addEventListener('beforeunload',()=>{client.stopAllStreams();});
+  client.close=()=>{clearInterval(notificationTimer);clearTimeout(timer);client.stopAllStreams();};
+  globalThis.window?.addEventListener('beforeunload',()=>client.close());
   return client;
 }

@@ -740,8 +740,11 @@ export function createSolarGL(canvas) {
   };
 
   let disposed = false;
+  let needsReinit = false;
   const onContextLost = event => { event.preventDefault(); };
+  const onContextRestored = () => { if (!disposed) needsReinit = true; };
   canvas.addEventListener('webglcontextlost', onContextLost);
+  canvas.addEventListener('webglcontextrestored', onContextRestored);
 
   const textureCache = new Map();
   const loadingState = new Map();
@@ -856,12 +859,17 @@ export function createSolarGL(canvas) {
 
   return {
     gl,
+    get needsReinit() { return needsReinit; },
+    isContextLost() { return gl.isContextLost(); },
     dispose() {
       if (disposed) return;
       disposed = true;
       canvas.removeEventListener('webglcontextlost', onContextLost);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
       if (!gl.isContextLost()) {
         for (const tex of textureCache.values()) gl.deleteTexture(tex);
+        for (const entry of Object.values(baseTextures)) gl.deleteTexture(entry.tex);
+        for (const tex of Object.values(hd4kTextures)) gl.deleteTexture(tex);
         gl.deleteTexture(fallbackFlatNormal);
         gl.deleteTexture(fallbackDark);
         for (const mesh of [highSphere, medSphere]) {

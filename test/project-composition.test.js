@@ -13,6 +13,8 @@ test('draft request preserves manager, worker billing and read-only requirements
   const d=draft(),input=draftRoutingInput(d);assert.equal(input.description,'Accepted concept');assert.equal(input.managerRouteId,'codex:manager');
   assert.equal(input.requirements.review.workspaceWrite,false);assert.equal(input.requirements.backend.workspaceWrite,true);
   assert.ok(Object.values(input.requirements).every(r=>r.billing==='free_tier'));assert.equal(input.maxAgentsPerTask,2);
+  d.workerRouteIds=['opencode:free'];
+  assert.ok(Object.values(draftRoutingInput(d).requirements).every(r=>r.allowedRouteIds[0]==='opencode:free'));
   d.freeWorkers=false;d.managerRouteId='';assert.equal(draftRoutingInput(d).managerRouteId,undefined);assert.equal(draftRoutingInput(d).requirements.review.billing,undefined);
 });
 

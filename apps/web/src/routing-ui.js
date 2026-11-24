@@ -56,16 +56,30 @@ export function defaultTaskModes(project, routingEntry) {
   return modes;
 }
 
+export function renderWorkerModelOptions(routes, selected, h, disabled = false) {
+  const allowed = routes.filter(route => route.decision?.allowed === true);
+  const choices = [...allowed, ...selected.filter(id => !allowed.some(route => route.id === id)).map(id => ({id}))];
+  const providerLabels = {codex:'Codex', antigravity:'Antigravity', opencode:'OpenCode'};
+  return `<p class="muted text-small">Позначте моделі, яким можна призначати задачі. Порожній вибір використовує весь доступний каталог.</p>
+    ${choices.length ? `<div class="worker-model-options">${choices.map(route => `<label class="worker-model-option">
+      <input type="checkbox" name="workerRouteId" value="${h(route.id)}" ${selected.includes(route.id)?'checked':''} ${disabled?'disabled':''}>
+      <span><strong>${h(route.model ?? route.name ?? route.id)}</strong><small>${route.backend?h(`${providerLabels[route.backend] ?? route.backend} · ${formatBillingBadge(route.billing, route.billingBoundary).shortLabel}`):'Доступ потрібно перевірити'}</small></span>
+    </label>`).join('')}</div>` : '<p class="muted text-small">У каталозі поки немає підтверджених моделей.</p>'}`;
+}
+
 export function buildRoutingPayload(project, draftConfig = {}) {
   const priority = mapWizardPriorityToRouting(draftConfig.priority ?? project?.planning?.priority);
   const maxAgentsPerTask = Math.max(1, Math.min(6, Number(draftConfig.maxAgentsPerTask ?? 1) || 1));
   const managerRouteId = draftConfig.managerRouteId ? String(draftConfig.managerRouteId) : undefined;
   const modes = draftConfig.requirements ?? {};
+  const freeWorkers = draftConfig.freeWorkers === true;
   const requirements = {};
   for (const t of project?.tasks ?? []) {
     if (t.parentId) continue;
     const writeNeeded = (modes[t.id] ?? 'write') !== 'text';
-    requirements[t.id] = { workspaceWrite: writeNeeded, tools: false };
+    requirements[t.id] = { workspaceWrite: writeNeeded, tools: false,
+      ...(freeWorkers ? { billing: 'free_tier' } : {}),
+      ...(draftConfig.workerRouteIds?.length ? {allowedRouteIds:draftConfig.workerRouteIds} : {}) };
   }
   return {
     projectId: project.id,
@@ -129,6 +143,13 @@ export function renderRoutingSection(project, routingEntry, catalog, { h, icon, 
   const selectedManager = routingEntry?.draftConfig?.managerRouteId ?? proposal?.provenance?.routeId ?? '';
   const modes = defaultTaskModes(project, routingEntry);
   const rootTasks = (project.tasks ?? []).filter(t => !t.parentId);
+  const proposalFreeOnly = proposal?.requirements && Object.keys(proposal.requirements).length > 0 &&
+    Object.values(proposal.requirements).every(req => req?.billing === 'free_tier');
+  const freeWorkers = Boolean(routingEntry?.draftConfig?.freeWorkers ?? (proposal ? proposalFreeOnly : project.planning?.freeWorkers));
+  const projectRev = Number(project.revision) || 1;
+  const proposalRev = Number(proposal?.revision) || 1;
+  const workerRouteIds = routingEntry?.draftConfig?.workerRouteIds ??
+    proposal?.requirements?.[rootTasks[0]?.id]?.allowedRouteIds ?? [];
   const routeMap = new Map((proposal?.routes ?? []).map(r => [r.id, r]));
 
   return `
@@ -160,7 +181,7 @@ export function renderRoutingSection(project, routingEntry, catalog, { h, icon, 
 
       ${loading || proposing ? `
         <div class="planning-busy" role="status">
-          ${proposing ? 'AI-директор оцінює задачі плану v' + project.revision + ' та підбирає точні маршрути…' : 'Завантажуємо збережену пропозицію маршрутизації…'}
+          ${proposing ? 'AI-директор оцінює задачі плану v' + projectRev + ' та підбирає точні маршрути…' : 'Завантажуємо збережену пропозицію маршрутизації…'}
         </div>
       ` : ''}
 
@@ -174,9 +195,9 @@ export function renderRoutingSection(project, routingEntry, catalog, { h, icon, 
         <div class="routing-stale-banner" role="status">
           <div>
             <strong>Пропозиція застаріла</strong>
-            <p class="text-small">План або команда змінились (ревізія плану v${project.revision}, пропозиція складена для v${proposal.revision}). Оновіть підбір перед орієнтацією на ці маршрути.</p>
+            <p class="text-small">План або команда змінились (ревізія плану v${projectRev}, пропозиція складена для v${proposalRev}). Оновіть підбір перед орієнтацією на ці маршрути.</p>
           </div>
-          <span class="badge pending"><i></i>Застаріла · v${proposal.revision} → v${project.revision}</span>
+          <span class="badge pending"><i></i>Застаріла · v${proposalRev} → v${projectRev}</span>
         </div>
       ` : ''}
 
@@ -198,6 +219,15 @@ export function renderRoutingSection(project, routingEntry, catalog, { h, icon, 
           </label>
         </div>
 
+        <label class="checkline">
+          <input type="checkbox" name="freeWorkers" ${freeWorkers ? 'checked' : ''} ${proposing ? 'disabled' : ''}>
+          Тільки безкоштовні виконавці (free_tier)
+        </label>
+
+        <details class="worker-model-picker" ${workerRouteIds.length ? 'open' : ''}>
+          <summary>Моделі виконавців</summary>
+          ${renderWorkerModelOptions(routes, workerRouteIds, h, proposing)}
+        </details>
         <div class="routing-reqs-head">
           <div>
             <strong>Вимоги до можливостей задач</strong>
@@ -222,7 +252,7 @@ export function renderRoutingSection(project, routingEntry, catalog, { h, icon, 
         </div>
 
         <div class="form-footer">
-          <span class="muted text-small">Запит зберігається на сервері для ревізії v${project.revision}.</span>
+          <span class="muted text-small">Запит зберігається на сервері для ревізії v${projectRev}.</span>
           <button type="submit" class="btn primary" ${proposing || locked ? 'disabled' : ''}>
             ${icon('spark')}${proposing ? 'Підбір триває…' : proposal ? 'Оновити AI-підбір моделей' : 'Підібрати точні моделі через AI'}
           </button>
@@ -232,8 +262,8 @@ export function renderRoutingSection(project, routingEntry, catalog, { h, icon, 
       ${proposal ? `
         <div class="routing-results ${stale ? 'is-stale' : ''}">
           <div class="routing-provenance">
-            <span class="badge ${stale ? 'pending' : 'done'}"><i></i>${stale ? 'Застаріла пропозиція' : 'Актуальна пропозиція · v' + proposal.revision}</span>
-            <span>Директор: <strong>${h(proposal.provenance?.model ?? proposal.provenance?.routeId)}</strong> (${h(proposal.provenance?.provider ?? 'ai')})</span>
+            <span class="badge ${stale ? 'pending' : 'done'}"><i></i>${stale ? 'Застаріла пропозиція' : 'Актуальна пропозиція · v' + proposalRev}</span>
+            ${proposal.provenance?.method==='rules'?'<span>Підбір за правилами · без виклику керівника</span>':`<span>Директор: <strong>${h(proposal.provenance?.model ?? proposal.provenance?.routeId)}</strong> (${h(proposal.provenance?.provider ?? 'ai')})</span>`}
             <span>Час: ${h(new Date(proposal.provenance?.at ?? Date.now()).toLocaleString('uk-UA'))}</span>
             ${proposal.provenance?.usage ? `<span>Токени: ${Number(proposal.provenance.usage.input_tokens) || 0} → ${Number(proposal.provenance.usage.output_tokens) || 0}</span>` : ''}
           </div>

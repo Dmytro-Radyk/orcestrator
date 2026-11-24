@@ -9,13 +9,23 @@ import {
   renderRoutingSection,
   formatBillingBadge
 } from '../apps/web/src/routing-ui.js';
-import { executionPanel } from '../apps/web/src/execution-ui.js';
-import { applyExecutionRun } from '../apps/web/src/execution.js';
+import { awaitingExecutionDetails, executionPanel, fileArtifacts } from '../apps/web/src/execution-ui.js';
+import { applyExecutionRun, serializeWorkspaceState } from '../apps/web/src/execution.js';
 
 const h = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const button = (action, text, _glyph, cls = 'btn', extra = '') => `<button data-action="${action}" class="${cls}" ${extra}>${text}</button>`;
 const icon = name => `<i data-icon="${name}"></i>`;
 const heading = (_e, title) => `<h1>${title}</h1>`;
+
+test('the cached reference to a real run renders before its executor details arrive', () => {
+  const project={execution:{mode:'real',id:'run-1',status:'blocked',agents:[],tasks:[],files:[]}};
+  const cached=serializeWorkspaceState({projects:[project]}).projects[0];
+  assert.equal(awaitingExecutionDetails(cached),true);
+  assert.match(executionPanel(cached,h,button),/Завантажуємо дані запуску/);
+  assert.equal(fileArtifacts(cached,h,button),'');
+  assert.equal(awaitingExecutionDetails(project),false);
+  assert.match(executionPanel(project,h,button),/Реальне виконання команди/);
+});
 
 test('anonymous OpenCode connection renders as working without login', () => {
   const openCodeAuth = describeConnectionAuth({
@@ -106,6 +116,7 @@ test('routing payload maps wizard priorities and per-task requirements correctly
     priority: 'cost',
     maxAgentsPerTask: 2,
     managerRouteId: 'opencode:opencode/big-pickle',
+    workerRouteIds: ['opencode:opencode/big-pickle'],
     requirements: { t1: 'text', t2: 'write' }
   });
   assert.deepEqual(payload, {
@@ -115,8 +126,8 @@ test('routing payload maps wizard priorities and per-task requirements correctly
     maxAgentsPerTask: 2,
     managerRouteId: 'opencode:opencode/big-pickle',
     requirements: {
-      t1: { workspaceWrite: false, tools: false },
-      t2: { workspaceWrite: true, tools: false }
+      t1: { workspaceWrite: false, tools: false, allowedRouteIds: ['opencode:opencode/big-pickle'] },
+      t2: { workspaceWrite: true, tools: false, allowedRouteIds: ['opencode:opencode/big-pickle'] }
     }
   });
 });

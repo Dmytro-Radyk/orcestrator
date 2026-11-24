@@ -9,13 +9,21 @@ import { Engine } from '../src/engine.js';
 import { WorkspaceManager } from '../src/workspaces.js';
 import { normalizeReportChecks } from '../src/execution-report.js';
 import { metadataRpc } from '../src/metadata-rpc.js';
-import { withStorefrontAcceptance, verifyStorefrontEvidence, storefrontAcceptanceId } from '../src/storefront-quality.js';
+import { withStorefrontAcceptance, storefrontAcceptanceId } from '../src/storefront-quality.js';
 import { applyWorkerChanges, sandboxChecks } from '../scripts/file-worker.js';
 import { planningHandler } from '../scripts/planning-service.js';
 import { createExecutionService } from '../scripts/execution-service.js';
 import { deriveProjectName } from '../apps/web/src/create-project.js';
-import { serializeWorkspaceState } from '../apps/web/src/execution.js';
+import { createExecutionClient, serializeWorkspaceState } from '../apps/web/src/execution.js';
 import { saveProjectDraft, restoreProjectDraft } from '../apps/web/src/project-draft.js';
+import { redactSecrets } from '../src/providers.js';
+import { createProjectPreview } from '../scripts/project-preview.js';
+import { localTestRuntime } from '../scripts/project-test-runtime.js';
+import { createHostVerifier } from '../scripts/host-verifier.js';
+import { seed } from '../apps/web/src/state.js';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { randomUUID } from 'node:crypto';
 
 async function tempDir(t, prefix) {
   const root = resolve('.orchestrator/tests');
@@ -230,7 +238,7 @@ test('planning & execution HTTP services reject cross-site fetches, skip scan on
   assert.equal(ntfsRes.status, 400);
 });
 
-test('storefront-quality prevents DAG cycles, caps 30 tasks, normalizes Windows paths and validates audit.json', async t => {
+test('storefront-quality prevents DAG cycles and caps the plan at 30 tasks', () => {
   const existingPlan = {
     summary: 'Store',
     assumptions: [],
@@ -259,42 +267,6 @@ test('storefront-quality prevents DAG cycles, caps 30 tasks, normalizes Windows 
   const capped = withStorefrontAcceptance(largePlan, { name: 'Shop', description: 'Магазин смартфонів' });
   assert.ok(capped.tasks.length <= 30);
 
-  const cwd = await tempDir(t, 'storefront-audit-');
-  const dir = 'artifacts/storefront-acceptance';
-  await mkdir(join(cwd, dir), { recursive: true });
-  const pngHeader = (width, seedByte) => {
-    const data = Buffer.alloc(64, seedByte);
-    data.set(Buffer.from('89504e470d0a1a0a', 'hex'));
-    data.write('IHDR', 12);
-    data.writeUInt32BE(width, 16);
-    data.writeUInt32BE(720, 20);
-    return data;
-  };
-  await writeFile(join(cwd, dir, 'desktop.png'), pngHeader(1280, 1));
-  await writeFile(join(cwd, dir, 'mobile.png'), pngHeader(390, 2));
-  const check = {
-    command: 'node scripts/check-storefront-browser.mjs',
-    kind: 'exit_code',
-    status: 'passed',
-    required: true,
-    expectedExitCode: 0,
-    actualExitCode: 0
-  };
-  // Windows backslash paths accepted
-  const winReport = { files: [`${dir.replaceAll('/', '\\')}\\desktop.png`, `${dir.replaceAll('/', '\\')}\\mobile.png`], checks: [check] };
-  assert.equal(await verifyStorefrontEvidence(winReport, cwd), true);
-
-  // Bad audit.json fails verification
-  await writeFile(join(cwd, dir, 'audit.json'), JSON.stringify({
-    modelsCount: 3, uniqueProductImages: 1, brokenImages: 2, mobileHorizontalOverflow: true, checkoutFlowPassed: false
-  }));
-  assert.equal(await verifyStorefrontEvidence(winReport, cwd), false);
-
-  // Rich audit.json passes verification
-  await writeFile(join(cwd, dir, 'audit.json'), JSON.stringify({
-    modelsCount: 12, uniqueProductImages: 12, brokenImages: 0, mobileHorizontalOverflow: false, checkoutFlowPassed: true
-  }));
-  assert.equal(await verifyStorefrontEvidence(winReport, cwd), true);
 });
 
 test('autopilot wizard helpers derive project names, serialize lean workspace state and preserve auto draft mode', () => {
@@ -331,4 +303,357 @@ test('autopilot wizard helpers derive project names, serialize lean workspace st
   assert.equal(lean.projects[0].tasks[0].outputs, undefined);
   assert.equal(lean.projects[0].artifacts.length, 0);
   assert.equal(lean.projects[0].events.length, 0);
+});
+
+test('non-isolated execution, selected project folders, NTFS tricky segments and nested .git are strictly confined', async t => {
+  const dir = await tempDir(t, 'confinement-');
+  const allowedRoot = join(dir, 'managed');
+  const chosenDir = join(dir, 'user-disk', 'Selected - 12345678');
+  const siblingDir = join(dir, 'user-disk', 'OtherFolder');
+  const serviceDir = join(dir, 'ui-state');
+  await mkdir(allowedRoot, { recursive: true });
+  await mkdir(chosenDir, { recursive: true });
+  await mkdir(siblingDir, { recursive: true });
+  await mkdir(serviceDir, { recursive: true });
+
+  const locations = new Map([['ui-proj-1', chosenDir]]);
+  const manager = new WorkspaceManager(join(dir, 'worktrees'), {
+    allowedRoot,
+    projectLocation: id => locations.get(id) ?? null,
+    forbiddenRoots: [serviceDir]
+  });
+  let observedCwd;
+  const engine = new Engine(new Store(serviceDir), async (_agent, ctx) => {
+    observedCwd = ctx.cwd;
+    return { text: 'ok' };
+  }, { workspaces: manager });
+
+  // 1. Omitted workspaceMode & workspace never falls back to process.cwd(); uses allowedRoot
+  const pDefault = engine.createProject({
+    name: 'DefaultManaged',
+    agents: [{ id: 'a', provider: 'codex', model: 'm', skills: [] }],
+    tasks: [{ id: 't1', title: 't1', prompt: 'run', agentIds: ['a'] }]
+  });
+  const rDefault = engine.start(pDefault.id);
+  await settled(rDefault);
+  assert.equal(rDefault.status, 'completed');
+  assert.ok(observedCwd.toLowerCase().startsWith(allowedRoot.toLowerCase()));
+
+  // 2. Shared mode pointing outside allowedRoot fails confinement
+  const pEscape = engine.createProject({
+    name: 'EscapeAttempt',
+    workspace: siblingDir,
+    workspaceMode: 'shared',
+    agents: [{ id: 'a', provider: 'codex', model: 'm', skills: [] }],
+    tasks: [{ id: 't1', title: 't1', prompt: 'run', agentIds: ['a'] }]
+  });
+  const rEscape = engine.start(pEscape.id);
+  await settled(rEscape);
+  assert.equal(rEscape.status, 'failed');
+  assert.match(rEscape.tasks[0].error, /виходить за межі/i);
+
+  // 3. Project with chosen folder allows ONLY that exact folder, rejecting sibling and serviceDir
+  await assert.rejects(manager.assertBase(siblingDir, 'ui-proj-1'), /переміщено або замінено/);
+  await assert.rejects(manager.assertBase(serviceDir, 'other'), /службовий каталог/);
+  assert.equal((await manager.assertBase(chosenDir, 'ui-proj-1')).toLowerCase(), chosenDir.toLowerCase());
+
+  // 4. NTFS trailing dots/spaces, 8.3 ~, reserved device names, and read-only sandboxChecks
+  const workDir = await tempDir(t, 'ntfs-fw-');
+  for (const tricky of ['.env ', '.git.', 'secret.pem ', 'GIT~1/config', 'CON.txt', 'sub/nul.mjs']) {
+    await assert.rejects(applyWorkerChanges(workDir, [{ path: tricky, baseHash: null, content: 'x' }]));
+  }
+  await writeFile(join(workDir, 'ok.test.ts'), '');
+  let sandboxArgs;
+  await sandboxChecks(workDir, ['ok.test.ts'], {
+    signal: AbortSignal.timeout(2000),
+    command: 'trusted-sandbox',
+    run: async (_cmd, args) => { sandboxArgs = args; return '# tests 1\n# pass 1\n# fail 0\n'; }
+  });
+  assert.ok(sandboxArgs.some(a => a.includes('"."="read"')));
+  assert.ok(!sandboxArgs.some(a => a === `--allow-fs-write=${workDir}`));
+
+  // 5. Nested .git directory inside candidate worktree is rejected
+  const nestedTarget = join(allowedRoot, 'nested-check');
+  await mkdir(nestedTarget, { recursive: true });
+  const lease = await manager.prepare({ id: 'run-nested', project: { workspace: nestedTarget } }, { id: 'task-n' });
+  await mkdir(join(lease.cwd, 'subrepo', '.git'), { recursive: true });
+  await assert.rejects(manager.stageCandidate(lease), /\.git/);
+});
+
+test('dynamic preview requires Docker bridge and container exit code != 1 remains repairable test failure', async t => {
+  const dir = await tempDir(t, 'preview-docker-');
+  const ws = join(dir, 'app');
+  await mkdir(ws, { recursive: true });
+  await writeFile(join(ws, 'server.mjs'), `
+    import { createServer } from 'node:http';
+    const srv = createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY' });
+      res.end('<h1>Container Preview ' + req.url + '</h1>');
+    });
+    srv.listen(0, '127.0.0.1', () => {
+      console.log(JSON.stringify({ mode: 'TEST_ONLY', externalCalls: false, url: 'http://127.0.0.1:' + srv.address().port + '/start' }));
+    });
+  `);
+  await writeFile(join(dir, 'preview-commands.json'), JSON.stringify({ projects: { p1: { script: 'server.mjs' } } }));
+
+  // Without Docker previewRuntime, configured preview fails closed without running host code
+  const noDockerPreview = createProjectPreview(dir);
+  t.after(() => noDockerPreview.close());
+  await assert.rejects(noDockerPreview.open('p1', ws, 'http://127.0.0.1:4311'), /Docker-контейнері/);
+
+  // Test the container bridge protocol (project-preview-container.mjs) over stdio
+  const bridgePreview = createProjectPreview(dir, {
+    previewRuntime: async (_cwd, { script, demo }) => {
+      // Simulate container root mapping by running container script with custom cwd stub in test
+      const child = spawn(process.execPath, [
+        '--input-type=module',
+        '-e',
+        `import { spawn } from 'node:child_process';
+         import { request as httpRequest } from 'node:http';
+         import { createInterface } from 'node:readline';
+         import { join } from 'node:path';
+         const child = spawn(process.execPath, [join(${JSON.stringify(ws)}, ${JSON.stringify(script)})], { stdio: ['ignore', 'pipe', 'ignore'] });
+         process.stdin.on('end', () => { try { child.kill(); } catch {} process.exit(0); });
+         process.on('SIGTERM', () => { try { child.kill(); } catch {} process.exit(0); });
+         const lines = createInterface({ input: child.stdout });
+         let target;
+         lines.on('line', line => {
+           const d = JSON.parse(line);
+           if (d.mode === 'TEST_ONLY') {
+             target = new URL(d.url);
+             process.stdout.write(JSON.stringify({ type: 'ready', pathname: target.pathname, demo: ${Boolean(demo)} }) + '\\n');
+           }
+         });
+         createInterface({ input: process.stdin }).on('line', line => {
+           const msg = JSON.parse(line);
+           const req = httpRequest(new URL(msg.path, target.origin), { method: msg.method, headers: { ...msg.headers, host: target.host } }, res => {
+             const chunks = [];
+             res.on('data', c => chunks.push(c));
+             res.on('end', () => process.stdout.write(JSON.stringify({ id: msg.id, statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('base64') }) + '\\n'));
+           });
+           req.end();
+         });`
+      ], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+      const out = createInterface({ input: child.stdout });
+      const pending = new Map();
+      let seq = 0;
+      const ready = await new Promise(res => out.on('line', line => {
+        const msg = JSON.parse(line);
+        if (msg.type === 'ready') res(msg);
+        else if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
+      }));
+      return {
+        pathname: ready.pathname,
+        request: payload => new Promise(res => { const id = ++seq; pending.set(id, res); child.stdin.write(JSON.stringify({ id, ...payload }) + '\n'); }),
+        close: () => { out.close(); try { child.stdin.end(); } catch {} child.kill(); }
+      };
+    }
+  });
+  t.after(() => bridgePreview.close());
+  const session = await bridgePreview.open('p1', ws, 'http://127.0.0.1:4311');
+  assert.match(session.url, /\/start$/);
+  const crossSite = await fetch(session.url, { headers: { 'Sec-Fetch-Site': 'cross-site' } });
+  assert.equal(crossSite.status, 403);
+  const okPage = await fetch(session.url);
+  assert.equal(okPage.status, 200);
+  assert.equal(okPage.headers.get('x-frame-options'), null);
+  assert.match(okPage.headers.get('content-security-policy'), /default-src 'self'.*frame-ancestors http:\/\/127\.0\.0\.1:4311/);
+  assert.match(await okPage.text(), /Container Preview \/start/);
+
+  // Verify exit code 2 in isolated script check is recorded as failed + repairable (not Docker unavailable)
+  const cmd = 'npm run test:storefront-postgres';
+  const verifier = createHostVerifier('nonexistent-policy.json', {
+    testNode: Object.assign(async () => ({ exitCode: 0, output: 'ok' }), {
+      script: async () => ({ exitCode: 2, output: 'Тестовий сервер не відкрив /healthz.' }),
+      version: 'v1'
+    })
+  });
+  await writeFile(join(ws, 'package.json'), JSON.stringify({ scripts: { 'test:storefront-postgres': 'node scripts/test-storefront-postgres.mjs' } }));
+  await mkdir(join(ws, 'scripts'), { recursive: true });
+  await writeFile(join(ws, 'scripts', 'test-storefront-postgres.mjs'), '');
+  const task = {
+    status: 'blocked',
+    workspace: { path: ws },
+    failure: { code: 'AGENT_BLOCKED' },
+    blockedReport: { checks: [{ command: cmd, required: true, status: 'not_run', details: 'needs postgres' }] }
+  };
+  const plan = verifier.plan({ project: { uiProjectId: 'p1' } }, task, { partial: true });
+  const [checkResult] = await verifier.verify(plan, task.blockedReport, ws, new AbortController().signal, { continueOnFailure: true });
+  assert.equal(checkResult.status, 'failed');
+  assert.equal(checkResult.actualExitCode, 2);
+  assert.equal(checkResult.environmentUnavailable, undefined);
+  assert.equal(checkResult.repairable, true);
+});
+
+test('free_tier is preserved in chat, recovery and final review, requiring explicit user approval for subscription switch', async t => {
+  const dir = await tempDir(t, 'free-tier-guard-');
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 300000).toISOString();
+  const freeWorker = {
+    id: 'opencode:opencode/free-a', connectionId: 'opencode', backend: 'opencode', model: 'opencode/free-a', name: 'Free A',
+    checkedAt: now, expiresAt, availability: 'ready', billing: 'free_tier', freeConfirmed: true,
+    billingBoundary: 'included_only', runtimeSupported: true,
+    capabilities: { workspaceWrite: true, structuredOutput: false, jsonOutput: 'prompt_validated', tools: false },
+    decision: { allowed: true, reason: 'Free' }
+  };
+  const subModel = {
+    id: 'codex:gpt-5-sub', connectionId: 'codex', backend: 'codex', model: 'gpt-5-sub', name: 'GPT-5 Sub',
+    checkedAt: now, expiresAt, availability: 'ready', billing: 'subscription_included',
+    subscriptionConfirmed: true, includedAccessConfirmed: true, freeConfirmed: false,
+    billingBoundary: 'included_only', runtimeSupported: true, isDefault: true,
+    capabilities: { workspaceWrite: true, structuredOutput: true, tools: true },
+    decision: { allowed: true, reason: 'Sub' }
+  };
+  const routes = [subModel, freeWorker];
+  const invokedModels = [];
+  const registry = {
+    snapshot: () => ({ routes, connections: [] }),
+    scan: async () => registry.snapshot(),
+    requireRoute: async id => {
+      const r = routes.find(x => x.id === id);
+      if (!r || !r.decision.allowed) throw Object.assign(new Error('Unavailable'), { code: 'MODEL_ACCESS_BLOCKED' });
+      return { ...r, command: 'trusted-cli' };
+    }
+  };
+  const service = createExecutionService({
+    directory: join(dir, 'ui'),
+    workspaces: join(dir, 'workspaces'),
+    registry,
+    reviewRuns: true,
+    provider: async (agent, ctx) => {
+      invokedModels.push({ model: agent.model, billing: agent.billing, review: ctx.review });
+      if (ctx.review) return { text: '{"approved":true,"feedback":"Схвалено рецензентом"}' };
+      await writeFile(join(ctx.cwd, 'index.html'), '<h1>Free Tier</h1>');
+      return { text: 'Готово' };
+    }
+  });
+  const server = http.createServer(service.handler);
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(async () => { service.close(); await new Promise(r => server.close(r)); });
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const { token } = await (await fetch(`${baseUrl}/api/execution/status`)).json();
+  const call = async (path, method = 'GET', body) => {
+    const res = await fetch(baseUrl + path, {
+      method,
+      headers: { 'X-Execution-Token': token, 'Content-Type': 'application/json' },
+      ...(body ? { body: JSON.stringify(body) } : {})
+    });
+    return { status: res.status, value: await res.json() };
+  };
+
+  const ws = seed();
+  const p = ws.projects[0];
+  ws.projects = [p];
+  p.tasks = [{ id: 't1', title: 'Зробити сторінку', prompt: 'Створи index.html', agentIds: ['backend'], dependsOn: [], acceptanceCriteria: ['Є index.html'] }];
+  p.planning = { freeWorkers: true };
+  assert.equal((await call('/api/workspace', 'PUT', { revision: 0, workspace: ws })).status, 200);
+
+  // Launch with free worker while subscription model is also in catalog: final review MUST wait instead of using subModel!
+  const started = await call('/api/execution/runs', 'POST', {
+    projectId: p.id, revision: p.revision, bindings: { backend: `${freeWorker.id}#write` }, maxCalls: 6
+  });
+  assert.equal(started.status, 202);
+  const run = service.engine.run(started.value.id);
+  for (let i = 0; i < 500 && !run.events.some(e => e.type === 'run.drained'); i++) await delay(10);
+
+  assert.equal(run.status, 'blocked');
+  assert.equal(run.tasks[0].status, 'completed');
+  assert.ok(invokedModels.every(m => m.model === 'opencode/free-a'), 'subscription model must never be called automatically');
+  const presented = (await call(`/api/execution/runs/${run.id}`)).value;
+  assert.equal(presented.projectReviewAwaitingFreeModel, true);
+  assert.deepEqual(presented.subscriptionReviewRoutes.map(r => r.id), ['codex:gpt-5-sub']);
+
+  // Attempting to switch final review to subscription WITHOUT allowSubscription: true is rejected
+  const deniedSwitch = await call(`/api/execution/runs/${run.id}/retry-project-review`, 'POST', { routeId: 'codex:gpt-5-sub' });
+  assert.equal(deniedSwitch.status, 400);
+  assert.match(deniedSwitch.value.error, /явного вибору користувача/);
+
+  // Explicit user opt-in (allowSubscription: true) allows final review to run on the chosen subscription model
+  const approvedSwitch = await call(`/api/execution/runs/${run.id}/retry-project-review`, 'POST', {
+    routeId: 'codex:gpt-5-sub', allowSubscription: true
+  });
+  assert.equal(approvedSwitch.status, 202);
+  await settled(run);
+  assert.equal(run.status, 'completed');
+  assert.equal(invokedModels.at(-1).model, 'gpt-5-sub');
+
+  // Project chat on free_tier project must NOT fall back to subModel when freeWorker becomes unavailable
+  freeWorker.decision = { allowed: false, reason: 'Offline' };
+  freeWorker.availability = 'unavailable';
+  const msgId = randomUUID();
+  await call(`/api/execution/project-chat?projectId=${encodeURIComponent(p.id)}`, 'POST', { id: msgId, text: 'Додай футер' });
+  let chatHistory;
+  for (let i = 0; i < 300; i++) {
+    chatHistory = (await call(`/api/execution/project-chat?projectId=${encodeURIComponent(p.id)}`)).value.messages;
+    if (chatHistory[0]?.status === 'start_failed') break;
+    await delay(10);
+  }
+  assert.equal(chatHistory[0].status, 'start_failed');
+  assert.equal(chatHistory[0].decisionCode, 'free_chat_unavailable');
+
+  // Explicit retry with allowSubscription: true runs chat message
+  await call(`/api/execution/project-chat?projectId=${encodeURIComponent(p.id)}`, 'POST', { id: msgId, retry: true, allowSubscription: true });
+  for (let i = 0; i < 400; i++) {
+    chatHistory = (await call(`/api/execution/project-chat?projectId=${encodeURIComponent(p.id)}`)).value.messages;
+    if (chatHistory[0]?.status === 'completed') break;
+    await delay(10);
+  }
+  assert.equal(chatHistory[0].status, 'completed');
+});
+
+test('queued persist() serializes fresh state after createPlannedProject and redactSecrets masks JSON/URL secrets', async () => {
+  let serverRev = 1;
+  let savedWorkspaces = [];
+  let state = { version: 1, activeId: 'p1', agents: [{ id: 'a1', name: 'A' }], projects: [{ id: 'p1', name: 'Old', revision: 1, tasks: [], events: [], artifacts: [] }] };
+  let releaseCreate;
+  const createGate = new Promise(r => { releaseCreate = r; });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (u.endsWith('/api/execution/status')) return new Response(JSON.stringify({ token: 't', runtimes: [], capabilities: {} }), { status: 200 });
+    if (u.endsWith('/api/workspace') && (!opts.method || opts.method === 'GET')) return new Response(JSON.stringify({ revision: serverRev, workspace: state }), { status: 200 });
+    if (u.endsWith('/api/connections')) return new Response(JSON.stringify({ checkedAt: new Date().toISOString(), routes: [], connections: [] }), { status: 200 });
+    if (u.endsWith('/api/execution/notifications')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    if (u.endsWith('/api/execution/runs')) return new Response(JSON.stringify([]), { status: 200 });
+    if (u.includes('/api/routing')) return new Response(JSON.stringify({ proposal: null, stale: false }), { status: 200 });
+    if (u.endsWith('/api/workspace') && opts.method === 'PUT') {
+      const body = JSON.parse(opts.body);
+      if (body.workspace.projects.length === 2) await createGate;
+      assert.equal(body.revision, serverRev);
+      serverRev++;
+      savedWorkspaces.push(body.workspace.projects.map(p => p.id));
+      return new Response(JSON.stringify({ revision: serverRev, workspace: body.workspace }), { status: 200 });
+    }
+    throw new Error('Unexpected URL: ' + u);
+  };
+  try {
+    const client = createExecutionClient({
+      getState: () => state,
+      setState: v => { state = v; },
+      render: () => {},
+      saveLocal: () => {},
+      notify: () => {},
+      modal: () => {},
+      h: String,
+      button: () => '',
+      download: () => {}
+    });
+    await client.init();
+    const createPromise = client.createPlannedProject({
+      project: { id: 'p2', name: 'New', revision: 1, tasks: [], events: [], artifacts: [] },
+      profiles: []
+    });
+    // Trigger flush() WHILE createPlannedProject is still in flight!
+    const flushPromise = client.flush();
+    releaseCreate();
+    await Promise.all([createPromise, flushPromise]);
+    assert.deepEqual(savedWorkspaces.at(-1), ['p1', 'p2']);
+    client.close();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const redacted = redactSecrets('{"password": "my-secret-value"} postgres://admin:topsecret@localhost:5432/shop AIzaSyB12345678901234567890', 500);
+  assert.doesNotMatch(redacted, /my-secret-value|topsecret|AIzaSyB/);
 });

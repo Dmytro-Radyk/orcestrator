@@ -29,7 +29,7 @@ async function fixture(t,{routingGate,routingResult,afterPlan}={}){
   const registry={snapshot:()=>({routes:routes.map(route=>({...route,decision:routeDecision(route)})),connections:[]}),scan:async()=>registry.snapshot(),requireRoute:async id=>{
     const route=routes.find(r=>r.id===id);assert.ok(route);return {...route,command:'fixture-only'};
   }};
-  const service=createExecutionService({directory:join(directory,'state'),workspaces:join(directory,'workspaces'),registry,provider:async(agent,ctx)=>{
+  const service=createExecutionService({directory:join(directory,'state'),workspaces:join(directory,'workspaces'),registry,reviewRuns:false,provider:async(agent,ctx)=>{
     calls.push({model:agent.model,access:agent.access,prompt:ctx.prompt});
     if(ctx.prompt.includes('PlannerSelectionBrief:')){
       const brief=JSON.parse(ctx.prompt.split('PlannerSelectionBrief: ')[1]);
@@ -57,8 +57,8 @@ async function fixture(t,{routingGate,routingResult,afterPlan}={}){
   const call=async(path,method='GET',body,{signal}={})=>{const res=await fetch(base+path,{method,signal,headers:{'Content-Type':'application/json',
     'X-Execution-Token':execution.token,'X-Planning-Token':planner.token},...(body?{body:JSON.stringify(body)}:{})});return{status:res.status,value:await res.json()};};
   const workspace=seed();assert.equal((await call('/api/workspace','PUT',{revision:0,workspace})).status,200);
-  async function prepared({idea=false,automatic=false}={}){
-    const draft={...brief,mode:idea?'idea':'ready',priority:'economy',managerRouteId:automatic?'':'codex:manager',freeWorkers:true,maxAgentsPerTask:1,requirements:{review:'text'}};
+  async function prepared({idea=false,automatic=false,workerRouteIds}={}){
+    const draft={...brief,mode:idea?'idea':'ready',priority:'economy',managerRouteId:automatic?'':'codex:manager',freeWorkers:true,maxAgentsPerTask:1,requirements:{review:'text'},workerRouteIds};
     const pin=draft.managerRouteId?{managerRouteId:draft.managerRouteId}:{};
     if(idea){const res=await call('/api/planning','POST',{kind:'idea',input:brief,...pin});assert.equal(res.status,200);draft.idea=res.value.value;draft.ideaSource=res.value.provenance;}
     const planned=await call('/api/planning','POST',{kind:'plan',input:{...brief,idea:draft.idea},...pin});assert.equal(planned.status,200);draft.plan=planned.value.value;draft.planSource=planned.value.provenance;
@@ -71,7 +71,8 @@ async function fixture(t,{routingGate,routingResult,afterPlan}={}){
 }
 
 test('one composition flow pins the manager from idea through exact free workers and starts without routing again',async t=>{
-  const f=await fixture(t),p=await f.prepared({idea:true});
+  const workerRouteIds=['opencode:free-worker','opencode:free-review'];
+  const f=await fixture(t),p=await f.prepared({idea:true,workerRouteIds});
   assert.equal((await f.call('/api/workspace')).value.workspace.projects.length,f.workspace.projects.length);
   const stored=await f.call('/api/workspace','PUT',p.input);assert.equal(stored.status,200);
   const id=p.composed.project.id,routing=(await f.call(`/api/routing?projectId=${id}`)).value;
@@ -80,6 +81,7 @@ test('one composition flow pins the manager from idea through exact free workers
   const started=await f.call('/api/execution/runs','POST',{projectId:id,revision:1,proposalId:p.draft.proposal.id});assert.equal(started.status,202);
   const run=f.service.engine.run(started.value.id);for(let n=0;n<1000&&['running','paused'].includes(run.status);n++)await delay(10);
   assert.equal(run.status,'completed');assert.equal(run.calls,2);assert.equal(run.project.recovery.managerRouteId,'codex:manager');
+  assert.deepEqual(run.project.routingRequirements.write.allowedRouteIds,workerRouteIds);
   assert.deepEqual(f.calls.map(c=>c.model),['manager','manager','manager','free-worker','free-review']);
   assert.equal(f.calls.at(-1).access,'read-only');assert.equal(await readFile(join(run.project.workspace,'result.txt'),'utf8'),'composed');
   const replay=await f.call('/api/workspace','PUT',{...p.input,revision:2});assert.equal(replay.status,400);

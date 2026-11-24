@@ -3,7 +3,34 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { planningHandler } from '../scripts/planning-service.js';
-import { demoPlan } from '../apps/web/src/planning.js';
+import { demoIdea, demoPlan } from '../apps/web/src/planning.js';
+
+test('the interview asks first and sends accepted answers into concept and plan generation',async t=>{
+  const brief={name:'Книгарня',description:'Книгарня'};
+  const question={topic:'design',question:'Яке враження має справити вітрина на читача?'};
+  const answer={...question,answer:'Дизайн літературного журналу з великими обкладинками.'};
+  const operations=[];
+  const server=createServer(planningHandler({configured:true,label:'fixture',provider:'responses',agent:{}},async(_agent,{prompt,maxOutputTokens})=>{
+    const op=prompt.match(/Операція: (\w+)/)[1];operations.push(op);
+    if(op==='questions'){
+      assert.equal(maxOutputTokens,2000);assert.match(prompt,/перед створенням концепції/);
+      return {text:JSON.stringify({questions:[question]})};
+    }
+    assert.ok(prompt.includes(answer.answer));
+    assert.match(prompt,/Відповіді користувача в interview є вимогами/);
+    assert.ok(!prompt.includes('пріоритет має компактний статичний прототип'));
+    return {text:JSON.stringify(op==='idea'?demoIdea(brief):demoPlan(brief))};
+  }));
+  server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+  const base=`http://127.0.0.1:${server.address().port}`;
+  const {token}=await (await fetch(`${base}/api/planning/status`)).json();
+  const send=(kind,input)=>fetch(`${base}/api/planning`,{method:'POST',headers:{'Content-Type':'application/json','X-Planning-Token':token},body:JSON.stringify({kind,input})});
+  assert.deepEqual((await (await send('questions',brief)).json()).value.questions,[question]);
+  assert.equal((await send('idea',{...brief,interview:[answer,answer]})).status,400);
+  const concept=await send('idea',{...brief,interview:[answer]});assert.equal(concept.status,200);
+  assert.equal((await send('plan',{...brief,interview:[answer],idea:(await concept.json()).value})).status,200);
+  assert.deepEqual(operations,['questions','idea','plan']);
+});
 
 test('planning HTTP enforces same-origin/token and returns validated AI output',async t=>{
   let calls=0;

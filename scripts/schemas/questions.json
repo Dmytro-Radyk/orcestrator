@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["questions"],
+  "properties": {
+    "questions": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["topic", "question"],
+        "properties": {
+          "topic": {"type": "string", "enum": ["audience", "goal", "design", "structure", "features", "content"]},
+          "question": {"type": "string"}
+        }
+      }
+    }
+  }
+}

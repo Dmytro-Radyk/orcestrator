@@ -1002,7 +1002,12 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
 
     const gridSegments = uiState.showGrid ? buildGridAndOrbitLines(planetPositions, maxOrbit) : new Float32Array(0);
 
-    if (glEngine) {
+    if (glEngine?.needsReinit) {
+      glEngine.dispose();
+      glEngine = createSolarGL(glCanvas);
+    }
+
+    if (glEngine && !glEngine.isContextLost()) {
       glEngine.render({
         width, height, dpr, eye, viewProj,
         yaw: uiState.camera.yaw, pitch: uiState.camera.pitch, time: uiState.simTime,
@@ -1016,7 +1021,7 @@ export function renderSolarStage(container, project, agents, labels, callbacks =
     hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     hctx.clearRect(0, 0, width, height);
 
-    if (!glEngine) {
+    if (!glEngine || glEngine.isContextLost()) {
       hctx.fillStyle = '#040914';
       hctx.fillRect(0, 0, width, height);
       hctx.fillStyle = 'rgba(155, 194, 232, 0.72)';
